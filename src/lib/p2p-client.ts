@@ -2,14 +2,10 @@ import { responseJson, type DesignRecord } from "./designs-store";
 
 export const P2P_EVENT = "merchflow:p2p-updated";
 export const P2P_BATCH_KEY = "merchflow:current-p2p-batch";
+// Client-mandated binary target-background toggle — exactly two choices, no grey area.
 export const COLOUR_SWATCHES = [
-  { label: "Grey", hex: "#808080" },
-  { label: "Black", hex: "#000000" },
-  { label: "Cream", hex: "#FDFBF7" },
-  { label: "Navy", hex: "#0A192F" },
-  { label: "Maroon", hex: "#6B1D2F" },
-  { label: "Forest Green", hex: "#1B4332" },
-  { label: "Orange", hex: "#E65100" },
+  { label: "⚫ Pitch Black (#000000)", hex: "#000000" },
+  { label: "⚪ Pure White (#FFFFFF)", hex: "#FFFFFF" },
 ] as const;
 export interface PixelInput { id: string; file: File; url: string }
 export interface PixelJob {

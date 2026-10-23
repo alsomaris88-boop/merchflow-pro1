@@ -30,7 +30,8 @@ with tempfile.TemporaryDirectory(prefix="merchflow-p2p-browser-") as temp:
 
     class TestProvider:
         def generate_image(self, prompt, images):
-            assert prompt.startswith("Recreate this exact uploaded image in ultra-high quality")
+            assert prompt.startswith("Recreate this exact uploaded graphic artwork in ultra-high resolution, 8K crisp print definition")
+            assert "Do NOT add variations, do NOT change the subject" in prompt
             assert len(images) == 1
             time.sleep(1)  # leave time to navigate to History before completion
             return images[0][0]

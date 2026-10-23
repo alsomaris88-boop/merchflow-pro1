@@ -140,7 +140,7 @@ def test_dynamic_batches_archive_every_real_print_before_success_and_without_bro
 def test_exact_prompt_and_single_reference_are_sent_to_each_provider(worker):
     client, module, pool, metrics = worker
     finish(client, create_upload_start(client, 2, colour="#FDFBF7"))
-    expected = "Recreate this exact uploaded image in ultra-high quality, 8K resolution, and high definition. Maintain 100% fidelity to the original composition, overall style, colors, characters, fonts, and graphic elements. Enhance all textures, sharpen blurry lines, clean up low-resolution artifacts, and make it look like a crisp, professional graphic design ready for high-quality printing. Do not alter or change the elements, just upgrade the visual clarity, sharpness, and quality. Render the clean artwork on a solid background of: #FDFBF7."
+    expected = "Recreate this exact uploaded graphic artwork in ultra-high resolution, 8K crisp print definition. Maintain 100% fidelity to the original composition, typography, characters, and graphic elements. Do NOT add variations, do NOT change the subject. Remove all background wrinkles/mockups and render the clean artwork strictly on a solid #FDFBF7 background."
     for _, prompt, references in metrics["calls"]:
         assert prompt == expected
         assert len(references) == 1 and references[0][0] == reference_png()

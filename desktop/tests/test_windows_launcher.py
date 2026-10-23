@@ -37,9 +37,12 @@ def test_existing_venv_always_gets_a_requirements_refresh():
 def test_powershell_date_is_an_expression_not_a_get_date_parameter():
     assert "if ((Get-Date) -gt $deadline)" in READY
     assert "Get-Date -gt" not in LAUNCHER
-    assert "/api/health" in READY
-    assert "$health.ok -and $health.connected -and $health.unified" in READY
-    assert READY.index("$env:ENGINE_EXIT_FILE") < READY.index("Invoke-RestMethod")
+    # Readiness = a real HTTP 200 from the engine's /docs page (the server can
+    # only answer AFTER pyvips/rembg imports finish) — never a bare TCP connect.
+    assert "http://127.0.0.1:8000/docs" in READY
+    assert "Invoke-WebRequest" in READY and "$response.StatusCode -eq 200" in READY
+    assert ".AddSeconds(30)" in READY
+    assert READY.index("$env:ENGINE_EXIT_FILE") < READY.index("Invoke-WebRequest")
 
 
 def test_crash_output_is_logged_exit_status_is_preserved_and_console_stays_open():
@@ -104,35 +107,41 @@ def test_all_embedded_powershell_commands_parse(powershell, tmp_path, command):
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-def test_powershell_ready_health_succeeds_and_date_comparison_executes(powershell, tmp_path):
-    mock = "function Invoke-RestMethod { [pscustomobject]@{ok=$true; connected=$true; unified=$true} }"
+def test_powershell_ready_docs_succeeds_and_date_comparison_executes(powershell, tmp_path):
+    mock = "function Invoke-WebRequest { [pscustomobject]@{StatusCode=200} }"
     result = run_ps(powershell, READY, tmp_path, mock)
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+def test_powershell_ready_never_accepts_a_non_200_answer(powershell, tmp_path):
+    mock = "function Invoke-WebRequest { Set-Content -LiteralPath $env:ENGINE_EXIT_FILE -Value 1; [pscustomobject]@{StatusCode=503} }"
+    result = run_ps(powershell, READY, tmp_path, mock)
+    assert result.returncode == 1, result.stdout + result.stderr
+
+
 def test_powershell_old_date_binding_is_a_real_regression(powershell, tmp_path):
     old = READY.replace("if ((Get-Date) -gt $deadline)", "if (Get-Date -gt $deadline)")
-    mock = "function Invoke-RestMethod { [pscustomobject]@{ok=$true; connected=$true; unified=$true} }"
+    mock = "function Invoke-WebRequest { [pscustomobject]@{StatusCode=200} }"
     result = run_ps(powershell, old, tmp_path, mock)
     assert result.returncode != 0
     assert "gt" in result.stderr
 
 
-def test_powershell_crashed_child_aborts_before_any_health_request(powershell, tmp_path):
+def test_powershell_crashed_child_aborts_before_any_docs_request(powershell, tmp_path):
     (tmp_path / "engine boot.exit").write_text("1\n")
-    result = run_ps(powershell, READY, tmp_path, "function Invoke-RestMethod { throw 'Health must not be requested after a crash' }")
+    result = run_ps(powershell, READY, tmp_path, "function Invoke-WebRequest { throw 'Docs must not be requested after a crash' }")
     assert result.returncode == 1
-    assert "Health must not" not in result.stderr
+    assert "Docs must not" not in result.stderr
 
 
 def test_powershell_expired_deadline_returns_failure(powershell, tmp_path):
-    expired = READY.replace(".AddSeconds(45)", ".AddSeconds(-1)")
-    result = run_ps(powershell, expired, tmp_path, "function Invoke-RestMethod { throw 'Health must not be requested after the deadline' }")
+    expired = READY.replace(".AddSeconds(30)", ".AddSeconds(-1)")
+    result = run_ps(powershell, expired, tmp_path, "function Invoke-WebRequest { throw 'Docs must not be requested after the deadline' }")
     assert result.returncode == 1
-    assert "Health must not" not in result.stderr
+    assert "Docs must not" not in result.stderr
 
 
-def test_powershell_unrelated_service_is_not_accepted_as_the_worker(powershell, tmp_path):
-    mock = "function Invoke-RestMethod { Set-Content -LiteralPath $env:ENGINE_EXIT_FILE -Value 1; [pscustomobject]@{ok=$true; connected=$false; unified=$false} }"
+def test_powershell_late_http_200_never_masks_a_crashed_engine(powershell, tmp_path):
+    mock = "function Invoke-WebRequest { Set-Content -LiteralPath $env:ENGINE_EXIT_FILE -Value 1; [pscustomobject]@{StatusCode=200} }"
     result = run_ps(powershell, READY, tmp_path, mock)
     assert result.returncode == 1, result.stdout + result.stderr

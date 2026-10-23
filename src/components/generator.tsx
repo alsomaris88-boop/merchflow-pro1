@@ -98,7 +98,7 @@ export default function Generator() {
             </Btn>
           </div>
         </Card>
-        <Card className="p-4 text-xs text-white/40 leading-relaxed">Every fusion job sends both references to the provider paired with the mandatory <em>Style × Niche Complete Fusion</em> directive verbatim — IMAGE 1 niche subject fully re-drawn inside IMAGE 2's visual DNA, 8K apparel quality, pitch-black (#000000) background unless an operator override below relaxes it. The provider determines render quality, text accuracy, account limits and costs. Successful files are saved under <code>{bridge.outDir ?? "output/"}</code> and archived before the UI reports completion. An unavailable provider, empty response or failed disk write is a failed job.</Card>
+        <Card className="p-4 text-xs text-white/40 leading-relaxed">Every fusion job sends both references to the provider paired with the mandatory <em>Style × Niche Complete Fusion</em> directive verbatim — IMAGE 1 niche subject fully re-drawn inside IMAGE 2&rsquo;s visual DNA, 8K apparel quality, pitch-black (#000000) background unless an operator override below relaxes it. The provider determines render quality, text accuracy, account limits and costs. Successful files are saved under <code>{bridge.outDir ?? "output/"}</code> and archived before the UI reports completion. An unavailable provider, empty response or failed disk write is a failed job.</Card>
       </div>
       <div className="xl:col-span-2"><ProductionQueue jobs={generation.jobs} logs={generation.logs} /></div>
     </div>

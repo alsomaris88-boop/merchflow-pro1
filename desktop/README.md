@@ -96,9 +96,13 @@ The PNGs in the ZIP are the exact bytes on disk, including DPI and alpha.
 The new `src/components/modules/pixel-to-pixel.tsx` accepts **1, 5, 20, 50, 100+
 images**, with no fixed batch-count cap. The counter and Generate label reflect
 exactly N files. Each thumbnail has Remove; Clear all releases object URLs.
-Background swatches are Grey `#808080`, **Black `#000000` (default)**, Cream
-`#FDFBF7`, Navy `#0A192F`, Maroon `#6B1D2F`, Forest Green `#1B4332`, Orange
-`#E65100`, and validated Custom Hex.
+The target background is a crystal-clear binary toggle: **⚫ Pitch Black
+`#000000` (default)** or **⚪ Pure White `#FFFFFF`**.
+
+Every run is a strict 1:1 operation: ONE input produces EXACTLY ONE design —
+never 3 variations — saved directly to `output/` and registered in Designs
+History as a single high-res asset, with a one-click
+**Send to Prepare Designs Lab** action on every archived result.
 
 `gemini_pool.DONEPIXEL_PROMPT` contains the exact requested 8K multimodal prompt,
 with only `{Selected_Color_Hex}` substituted. Every call sends one original

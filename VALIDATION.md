@@ -16,7 +16,7 @@ Final checks for this update:
   handoff and fresh identities when regenerating retained files; existing
   SSE/download protections remain covered.
 - **16 Chromium browser tests passed, 1 separately opt-in legacy Prepare test
-  skipped** (1.0min), against the built static desktop UI served by FastAPI. Exact swatches/default Black/custom hex and dynamic
+  skipped** (1.0min), against the built static desktop UI served by FastAPI. Binary ⚫ Pitch Black (#000000) default / ⚪ Pure White (#FFFFFF) toggle and dynamic
   ingestion/removal/Clear for 1/5/20/101 pass. Deep integration verifies real SSE
   archive events, physical print files, optional streaming ZIP, selected real-ID
   Listing save and durable History. Reload testing restores an already queued
@@ -83,8 +83,11 @@ also passed.
 Executable PowerShell checks used **PowerShell 7.6.8 on Linux** with isolated
 health-response test doubles; no production listener or engine was launched by
 these tests. Native `cmd.exe` and Windows PowerShell 5.1 were not available, so
-this is not a Windows startup smoke test. The launcher now waits for the actual
-worker `/api/health` fields (`ok`, `connected`, `unified`), which match the API.
+this is not a Windows startup smoke test. The launcher now polls
+`http://127.0.0.1:8000/docs` for a real HTTP 200 (30-second deadline, early
+abort on the engine-exit marker) so uvicorn's pyvips/rembg imports always finish
+before the browser opens — `ERR_CONNECTION_REFUSED` can no longer race the boot.
+A crashed engine prints the exact contents of `desktop\engine_boot.log`.
 That launcher-only follow-up did not change the frontend or image pipeline;
 its prior validation results are retained above. The Donepixel update now
 re-runs those launcher/image regressions as part of the 60-test passing suite.

@@ -15,8 +15,10 @@ function storage() {
   return { getItem: (key: string) => data.get(key) ?? null, setItem: (key: string, value: string) => data.set(key, value), removeItem: (key: string) => data.delete(key) };
 }
 
-test("Donepixel swatches use exact requested hexes and dynamic labels do not cap N", () => {
-  assert.deepEqual(COLOUR_SWATCHES.map((s) => s.hex), ["#808080", "#000000", "#FDFBF7", "#0A192F", "#6B1D2F", "#1B4332", "#E65100"]);
+test("Donepixel target background is a binary toggle anchored on the mandated defaults", () => {
+  assert.deepEqual(COLOUR_SWATCHES.map((s) => s.hex), ["#000000", "#FFFFFF"]);
+  assert.equal(COLOUR_SWATCHES[0].label, "⚫ Pitch Black (#000000)");
+  assert.equal(COLOUR_SWATCHES[1].label, "⚪ Pure White (#FFFFFF)");
   for (const n of [1, 5, 20, 50, 101, 217]) assert.equal(generationLabel(n), `${n} designs in, ${n} back on your colour. ▷ Generate`);
   assert.equal(normaliseHex("#aBcDeF"), "#ABCDEF");
   assert.throws(() => normaliseHex("#ABC"));

@@ -63,9 +63,11 @@ REM Do not minimize it or use an unqualified uvicorn executable from PATH.
 start "MerchFlow Engine (uvicorn :8000)" "%ComSpec%" /d /s /k ""%~f0" --engine"
 if errorlevel 1 goto :launch_failed
 
-REM Wait for the actual worker health API, not merely any open TCP port.
+REM Race-condition fix: uvicorn only accepts connections AFTER heavy imports
+REM (pyvips, rembg, opencv) finish, so the browser must wait for a real HTTP
+REM 200 from the engine — never merely an open TCP port or a timed guess.
 REM The exit marker aborts the wait immediately when the engine process exits.
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$deadline = (Get-Date).AddSeconds(45); while ($true) { if (Test-Path -LiteralPath $env:ENGINE_EXIT_FILE) { exit 1 }; if ((Get-Date) -gt $deadline) { exit 1 }; try { $health = Invoke-RestMethod -Uri 'http://127.0.0.1:8000/api/health' -TimeoutSec 1 -ErrorAction Stop; if ($health.ok -and $health.connected -and $health.unified) { if (Test-Path -LiteralPath $env:ENGINE_EXIT_FILE) { exit 1 }; exit 0 } } catch { }; Start-Sleep -Milliseconds 400 }"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$deadline = (Get-Date).AddSeconds(30); while ($true) { if (Test-Path -LiteralPath $env:ENGINE_EXIT_FILE) { exit 1 }; if ((Get-Date) -gt $deadline) { exit 1 }; try { $response = Invoke-WebRequest -Uri 'http://127.0.0.1:8000/docs' -UseBasicParsing -TimeoutSec 1 -ErrorAction Stop; if ($response.StatusCode -eq 200) { if (Test-Path -LiteralPath $env:ENGINE_EXIT_FILE) { exit 1 }; exit 0 } } catch { }; Start-Sleep -Milliseconds 400 }"
 if errorlevel 1 goto :engine_not_ready
 echo   Engine online.
 
@@ -154,7 +156,7 @@ set "BOOT_ERROR=Could not open the engine console. See the boot log below."
 goto :boot_failed
 
 :engine_not_ready
-set "BOOT_ERROR=Engine exited or did not become healthy within 45 seconds. See the startup error below."
+set "BOOT_ERROR=Engine crashed or did not return HTTP 200 at /docs within 30 seconds. The real traceback is in the log below."
 goto :boot_failed
 
 :boot_failed
