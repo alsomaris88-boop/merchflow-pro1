@@ -15,6 +15,7 @@ import {
   WandSparkles,
 } from "lucide-react";
 import { Btn, Card, CharMeter, Chip, CopyBtn, Field, Input, PageHead, Section, Select, cx } from "@/components/ui";
+import { clearListingHandoff, getDesigns, listingHandoff, responseJson, type DesignRecord } from "@/lib/designs-store";
 import type { ShieldResult } from "@/lib/trademark-engine";
 
 const ADJECTIVES = ["Retro", "Vintage", "Groovy", "Funny", "Aesthetic", "Kawaii", "Distressed", "Classic", "Bold", "Cozy"];
@@ -64,9 +65,28 @@ export default function ListingHub() {
   const [busy, setBusy] = useState(false);
   const [saved, setSaved] = useState<SavedRow[]>([]);
   const [saveOk, setSaveOk] = useState(false);
+  const [designs, setDesigns] = useState<DesignRecord[]>([]);
+  const [activeDesign, setActiveDesign] = useState<DesignRecord | null>(null);
+  const [error, setError] = useState("");
+  const chooseDesign = useCallback((design: DesignRecord) => {
+    setActiveDesign(design); setNiche(design.niche || design.name);
+    setStyleNote(design.style); setBuilt(null); setShield(null); setSaveOk(false);
+  }, []);
 
   useEffect(() => {
-    fetch("/api/listings")
+    let alive = true;
+    const ids = listingHandoff();
+    if (ids.length) void getDesigns(ids).then((records) => {
+      if (!alive) return;
+      setDesigns(records);
+      if (records[0]) chooseDesign(records[0]);
+      else setError("The selected History records are no longer available. Their original PNG files were not deleted.");
+    }).catch((e) => { if (alive) setError(e instanceof Error ? e.message : "Could not load selected designs"); });
+    return () => { alive = false; };
+  }, [chooseDesign]);
+
+  useEffect(() => {
+    fetch("/api/bridge/listings")
       .then((r) => r.json())
       .then((d) => {
         if (Array.isArray(d.items)) {
@@ -153,21 +173,23 @@ export default function ListingHub() {
   const save = useCallback(async () => {
     if (!built) return;
     try {
-      const r = await fetch("/api/listings", {
+      const r = await fetch("/api/bridge/listings", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ...built, tags: built.tags.join(", "), riskScore: shield?.score ?? 0 }),
+        body: JSON.stringify({ ...built, designId: activeDesign?.id ?? "", tags: built.tags.join(", "), riskScore: shield?.score ?? 0 }),
       });
-      const d = await r.json();
+      const d = await responseJson<{ item: Omit<SavedRow, "tags"> & { tags: string } }>(r);
+      if (!d.item || !Number.isFinite(d.item.id)) throw new Error("Listing was not confirmed by SQLite");
       if (d.item) {
         setSaved((s) => [{ ...d.item, tags: String(d.item.tags ?? "").split(", ").filter(Boolean) }, ...s].slice(0, 30));
       }
       setSaveOk(true);
       setTimeout(() => setSaveOk(false), 1600);
-    } catch {
-      /* offline */
+      setError("");
+    } catch (e) {
+      setSaveOk(false); setError(e instanceof Error ? e.message : "Listing could not be saved");
     }
-  }, [built, shield]);
+  }, [activeDesign, built, shield]);
 
   const garmentFlag = (s: string) => /\b(t-?shirt|tee|hoodie|sweatshirt|apparel|tank top)\b/i.test(s);
 
@@ -180,6 +202,15 @@ export default function ListingHub() {
         right={<Chip tone="violet"><Store size={11} /> MBA + TeePublic</Chip>}
       />
 
+      {error && <div role="alert" className="mb-4 rounded-xl border border-red-400/30 bg-red-500/10 p-4 text-sm text-red-200">{error}</div>}
+      {designs.length > 0 && <Card className="p-4 mb-4">
+        <div className="flex justify-between items-center gap-3 mb-3"><div><div className="text-sm font-semibold">{designs.length} designs from History</div><p className="text-xs text-white/40 mt-1">Choose a winning design to build its listing. Selection survives module navigation; saving links the listing to its real PNG.</p></div><Btn variant="ghost" onClick={() => { clearListingHandoff(); setDesigns([]); setActiveDesign(null); }}>Clear design batch</Btn></div>
+        <div className="flex gap-2 overflow-x-auto pb-2">{designs.map((design) => <button key={design.id} aria-label={`List ${design.name}`} aria-pressed={activeDesign?.id === design.id} onClick={() => chooseDesign(design)} className={cx("w-28 shrink-0 rounded-xl border p-2 text-left", activeDesign?.id === design.id ? "border-[#c9f24b]/60 bg-[#c9f24b]/10" : "border-white/10")}>
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img src={design.previewUrl} alt={design.name} className="w-full h-24 object-contain" /><span className="block text-[10px] truncate mt-1">{design.name}</span>
+        </button>)}</div>
+        {activeDesign && <div className="text-[10px] text-white/45 mt-2 break-all">{activeDesign.w} × {activeDesign.h} · {activeDesign.dpi} DPI · <a className="text-[#b9a8ff] underline" href={activeDesign.fileUrl} target="_blank" rel="noopener noreferrer">Inspect physical PNG</a><div className="mt-1">{activeDesign.path}</div></div>}
+      </Card>}
       <div className="grid grid-cols-1 xl:grid-cols-3 gap-4">
         {/* inputs */}
         <Card className="p-5">
@@ -235,7 +266,7 @@ export default function ListingHub() {
                     <Chip tone="amber">A9 mobile-tuned</Chip>
                   </div>
                   <Btn variant="ghost" className="py-1.5 px-3" onClick={() =>
-                    downloadCsv("productor-mba.csv", ["Brand", "Title", "Bullet Point 1", "Bullet Point 2"], [[built.brand, built.title, built.bullet1, built.bullet2]])
+                    downloadCsv("productor-mba.csv", ["Design File", "Brand", "Title", "Bullet Point 1", "Bullet Point 2"], [[activeDesign?.path.split(/[\\/]/).pop() ?? "", built.brand, built.title, built.bullet1, built.bullet2]])
                   }>
                     <ArrowDownToLine size={13} /> Productor CSV
                   </Btn>

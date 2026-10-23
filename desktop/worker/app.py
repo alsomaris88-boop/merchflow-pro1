@@ -19,6 +19,7 @@ Run:  uvicorn worker.app:app --host 127.0.0.1 --port 8000
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 import base64
 import json
 import os
@@ -35,9 +36,9 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Streamin
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import browser, db, elite_tools, gemini_pool, image_lab, output_store, trademark_shield, trends_local
+from . import browser, db, elite_tools, gemini_pool, image_lab, output_store, p2p_batches, trademark_shield, trends_local
 
-WORKER_VERSION = "2.2.0-disk-backed"
+WORKER_VERSION = "2.3.0-donepixel"
 
 OUT_DIR = Path(os.environ.get("MERCHFLOW_OUT") or (Path(__file__).resolve().parents[2] / "output")).resolve()
 OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -51,7 +52,13 @@ STATIC_CANDIDATES = [
 ]
 STATIC_DIR = next((p for p in STATIC_CANDIDATES if p and (p / "index.html").exists()), None)
 
-app = FastAPI(title="MerchFlow Local Engine", version=WORKER_VERSION)
+@asynccontextmanager
+async def lifespan(_app):
+    await asyncio.to_thread(p2p_batches.recover, OUT_DIR)
+    yield
+
+
+app = FastAPI(title="MerchFlow Local Engine", version=WORKER_VERSION, lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False,
                    allow_methods=["*"], allow_headers=["*"])
 app.add_middleware(GZipMiddleware, minimum_size=1024)
@@ -69,7 +76,7 @@ async def health() -> dict:
         "engine": f"gemini-headless-batchexecute + {image_lab.ENGINE_NAME}",
         "libvips": image_lab.HAS_VIPS, "mock": gemini_pool.MOCK, "headless": True,
         "outDir": str(OUT_DIR), "profiles": gemini_pool.profile_cards(),
-        "capabilities": {**elite_tools.CAPABILITIES, "rembg": image_lab.HAS_REMBG, "opencv": image_lab.HAS_CV, "streamZip": True, "diskHistory": True},
+        "capabilities": {**elite_tools.CAPABILITIES, "rembg": image_lab.HAS_REMBG, "opencv": image_lab.HAS_CV, "streamZip": True, "diskHistory": True, "historyEvents": True, "donepixelBatch": image_lab.HAS_VIPS},
     }
 
 
@@ -199,6 +206,7 @@ async def api_license(req: LicenseReq) -> JSONResponse:
 
 # ---------------------------------------------------------------- listings
 @app.get("/api/listings")
+@app.get("/api/bridge/listings")
 async def api_listings() -> dict:
     return {"items": db.list_listings()}
 
@@ -214,12 +222,20 @@ class ListingReq(BaseModel):
     mainTag: str = ""
     tags: str = ""
     riskScore: int = 0
+    designId: str = Field(default="", max_length=100)
 
 
 @app.post("/api/listings")
+@app.post("/api/bridge/listings")
 async def api_listings_post(req: ListingReq) -> JSONResponse:
     try:
-        return JSONResponse(db.add_listing(req.model_dump()))
+        payload = req.model_dump()
+        if req.designId:
+            design = await asyncio.to_thread(output_store.get_design, OUT_DIR, req.designId)
+            payload["designPath"] = design["path"]
+        return JSONResponse(await asyncio.to_thread(db.add_listing, payload))
+    except FileNotFoundError as e:
+        raise HTTPException(404, str(e)) from e
     except Exception as e:
         return JSONResponse({"error": "listing insert failed", "detail": str(e)}, status_code=500)
 
@@ -497,7 +513,7 @@ class EliteReq(BaseModel):
 @app.get("/elite/capabilities")
 @app.get("/api/bridge/elite/capabilities")
 async def elite_caps() -> dict:
-    return {"ok": True, "capabilities": {**elite_tools.CAPABILITIES, "rembg": image_lab.HAS_REMBG, "opencv": image_lab.HAS_CV, "streamZip": True, "diskHistory": True}, "products": elite_tools.PRODUCTS}
+    return {"ok": True, "capabilities": {**elite_tools.CAPABILITIES, "rembg": image_lab.HAS_REMBG, "opencv": image_lab.HAS_CV, "streamZip": True, "diskHistory": True, "historyEvents": True, "donepixelBatch": image_lab.HAS_VIPS}, "products": elite_tools.PRODUCTS}
 
 
 async def _elite_decode(req: EliteReq) -> bytes:
@@ -566,6 +582,9 @@ async def elite_split(req: EliteReq) -> JSONResponse:
         return JSONResponse({"ok": True, **res})
     except Exception as e:
         return JSONResponse({"ok": False, "reason": str(e)}, status_code=500)
+
+
+p2p_batches.install_routes(app, lambda: OUT_DIR)
 
 
 # ===========================================================================

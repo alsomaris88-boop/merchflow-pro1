@@ -150,7 +150,7 @@ export function Shell({
               </span>
               <span className="font-mono2 text-[10px] text-[#c9f24b]">PNG</span>
             </div>
-            <div className="mt-2 text-[10px] text-white/30 leading-tight">Sequential processing · verified files · streaming ZIP</div>
+            <div className="mt-2 text-[10px] text-white/30 leading-tight">Parallel Pro dispatch · verified files · streaming ZIP</div>
           </div>
         </div>
       </aside>
@@ -167,7 +167,7 @@ export function Shell({
             </div>
             <div className="hidden md:flex glass rounded-xl px-3.5 py-2 items-center gap-2">
               <Activity size={12} className="text-[#b9a8ff]" />
-              <span className="font-mono2 text-[11px] text-white/60">sequential raster queue</span>
+              <span className="font-mono2 text-[11px] text-white/60">bounded raster queue</span>
             </div>
             <div
               className={cx(

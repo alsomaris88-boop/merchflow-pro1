@@ -25,6 +25,14 @@ export interface DesignRecord {
   createdAt: number;
   fileUrl: string;
   previewUrl: string;
+  previewPath?: string;
+  batchId?: string;
+  jobId?: string;
+  lossless?: boolean;
+  encoder?: string;
+  nativeW?: number;
+  nativeH?: number;
+  upscaled?: boolean;
 }
 export type DesignMeta = DesignRecord;
 export type DesignInput = Pick<DesignRecord, "name" | "source"> & Partial<Pick<DesignRecord, "niche" | "style" | "aspect" | "background" | "prompt" | "account" | "w" | "h" | "ms">>;
@@ -36,8 +44,8 @@ export function isSavedDesign(value: unknown): value is DesignRecord {
     && Number(d.w) > 0 && Number(d.h) > 0 && Number(d.bytes) > 8 && Number(d.dpi) === 300;
 }
 
-export function announceDesignsChanged(): void {
-  if (typeof window !== "undefined") window.dispatchEvent(new CustomEvent(DESIGNS_EVENT));
+export function announceDesignsChanged(design?: DesignRecord): void {
+  if (typeof window !== "undefined") window.dispatchEvent(new CustomEvent(DESIGNS_EVENT, { detail: design }));
 }
 
 export async function responseJson<T>(res: Response): Promise<T> {
@@ -155,4 +163,21 @@ export function timeAgo(ts: number): string {
   if (minutes < 60) return `${minutes}m ago`;
   const hours = Math.round(minutes / 60);
   return hours < 24 ? `${hours}h ago` : `${Math.round(hours / 24)}d ago`;
+}
+
+
+const LISTING_HANDOFF_KEY = "merchflow:listing-designs";
+
+/** Keep selected real record IDs across module navigation and reloads. */
+export function sendToListing(ids: string[]): void {
+  if (typeof window !== "undefined" && ids.length) sessionStorage.setItem(LISTING_HANDOFF_KEY, JSON.stringify(ids));
+}
+export function listingHandoff(): string[] {
+  try {
+    const ids: unknown = JSON.parse(sessionStorage.getItem(LISTING_HANDOFF_KEY) ?? "[]");
+    return Array.isArray(ids) ? ids.filter((id): id is string => typeof id === "string") : [];
+  } catch { return []; }
+}
+export function clearListingHandoff(): void {
+  sessionStorage.removeItem(LISTING_HANDOFF_KEY);
 }

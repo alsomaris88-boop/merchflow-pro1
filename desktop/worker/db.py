@@ -14,7 +14,7 @@ import time
 from pathlib import Path
 
 DB_PATH = Path(os.environ.get("MERCHFLOW_DB") or (Path.home() / "MerchFlow" / "merchflow.db"))
-_lock = threading.Lock()
+_lock = threading.RLock()
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS accounts (
@@ -52,6 +52,8 @@ CREATE TABLE IF NOT EXISTS listings (
   main_tag TEXT NOT NULL DEFAULT '',
   tags TEXT NOT NULL DEFAULT '',
   risk_score INTEGER NOT NULL DEFAULT 0,
+  design_id TEXT NOT NULL DEFAULT '',
+  design_path TEXT NOT NULL DEFAULT '',
   created_at REAL
 );
 CREATE TABLE IF NOT EXISTS licenses (
@@ -121,6 +123,10 @@ def conn() -> sqlite3.Connection:
 def init() -> None:
     with _lock, conn() as c:
         c.executescript(SCHEMA)
+        columns = {row["name"] for row in c.execute("PRAGMA table_info(listings)")}
+        for name in ("design_id", "design_path"):
+            if name not in columns:
+                c.execute(f"ALTER TABLE listings ADD COLUMN {name} TEXT NOT NULL DEFAULT ''")
         n = c.execute("SELECT COUNT(*) AS n FROM accounts").fetchone()["n"]
         if n == 0:
             for label, email, provider, status, used, total in SEED_ACCOUNTS:
@@ -211,16 +217,19 @@ def add_listing(b: dict) -> dict:
     s = lambda v, n: str(v if v is not None else "")[:n]
     with _lock, conn() as c:
         cur = c.execute(
-            "INSERT INTO listings (niche,brand,title,bullet1,bullet2,tp_title,tp_description,main_tag,tags,risk_score,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO listings (niche,brand,title,bullet1,bullet2,tp_title,tp_description,main_tag,tags,risk_score,design_id,design_path,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 s(b.get("niche"), 120), s(b.get("brand"), 60), s(b.get("title"), 120),
                 s(b.get("bullet1"), 512), s(b.get("bullet2"), 512), s(b.get("tpTitle"), 120),
                 s(b.get("tpDescription"), 640), s(b.get("mainTag"), 80), s(b.get("tags"), 640),
-                min(100, max(0, int(b.get("riskScore", 0) or 0))), time.time(),
+                min(100, max(0, int(b.get("riskScore", 0) or 0))),
+                s(b.get("designId"), 100), s(b.get("designPath"), 2000), time.time(),
             ),
         )
-        row = _rows("SELECT * FROM listings WHERE id=?", (cur.lastrowid,))
-        return {"ok": True, "item": row[0] if row else {}}
+        row = c.execute("SELECT * FROM listings WHERE id=?", (cur.lastrowid,)).fetchone()
+        return {"ok": True, "item": {**dict(row), "riskScore": row["risk_score"],
+                "tpTitle": row["tp_title"], "tpDescription": row["tp_description"],
+                "mainTag": row["main_tag"], "createdAt": row["created_at"]}}
 
 
 def license_verify(key: str, hwid: str) -> dict | None:

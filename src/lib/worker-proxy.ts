@@ -11,11 +11,13 @@ export async function proxyWorker(req: NextRequest, path: string, timeoutMs?: nu
         "Content-Type": req.headers.get("content-type") ?? "application/json",
         Accept: req.headers.get("accept") ?? "*/*",
         "Accept-Encoding": "identity",
+        ...(req.headers.has("last-event-id") ? { "Last-Event-ID": req.headers.get("last-event-id")! } : {}),
       },
-      body: ["GET", "HEAD"].includes(req.method) ? undefined : await req.text(),
+      body: ["GET", "HEAD"].includes(req.method) ? undefined : req.body,
+      duplex: "half",
       cache: "no-store",
       signal: timeoutMs ? AbortSignal.timeout(timeoutMs) : req.signal,
-    });
+    } as RequestInit & { duplex: "half" });
     const headers = new Headers({ "Cache-Control": "no-store, no-transform", "X-Accel-Buffering": "no" });
     for (const name of ["content-type", "content-disposition"]) {
       const value = upstream.headers.get(name);

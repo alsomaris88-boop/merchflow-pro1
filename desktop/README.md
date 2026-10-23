@@ -91,22 +91,63 @@ chunks, stores already-compressed PNGs without recompression, and disambiguates
 duplicate filenames. Neither browser nor Next.js holds an archive-sized Blob.
 The PNGs in the ZIP are the exact bytes on disk, including DPI and alpha.
 
-### Pixel to Pixel
+### Dynamic Donepixel Pixel to Pixel
 
-`src/components/modules/pixel-to-pixel.tsx` calls the connected image provider to
-**recreate** each uploaded concept. It is not the old 900px HSL palette-transfer
-preview. Background choices are:
+The new `src/components/modules/pixel-to-pixel.tsx` accepts **1, 5, 20, 50, 100+
+images**, with no fixed batch-count cap. The counter and Generate label reflect
+exactly N files. Each thumbnail has Remove; Clear all releases object URLs.
+Background swatches are Grey `#808080`, **Black `#000000` (default)**, Cream
+`#FDFBF7`, Navy `#0A192F`, Maroon `#6B1D2F`, Forest Green `#1B4332`, Orange
+`#E65100`, and validated Custom Hex.
 
-- **Transparent:** neural alpha matting and a 1px export-space choke.
-- **Solid Black:** matte the foreground, then composite onto exact RGB 0,0,0.
-- **Solid White:** matte the foreground, then composite onto exact RGB 255,255,255.
-- **Keep Original:** ask the provider to preserve the reference backdrop and
-  retain the recreated backdrop without segmentation. Generative results can
-  differ from source pixels.
+`gemini_pool.DONEPIXEL_PROMPT` contains the exact requested 8K multimodal prompt,
+with only `{Selected_Color_Hex}` substituted. Every call sends one original
+uploaded reference to the real image provider. Available authenticated Pro
+sessions get exclusive, least-recently-used leases: one render per account,
+across accounts in parallel. The default ceiling is eight concurrent provider
+calls, configurable with `MERCHFLOW_P2P_PARALLEL` (1–32). Auth-required,
+cooldown, exhausted and unverified/non-Pro sessions are excluded. Flash
+model-degradation failures are not accepted as Pro successes. Existing fusion
+scheduling keeps its ordered account strategy and shares the exclusive leases.
+There is no promised render throughput or provider quota bypass.
 
-**8K means 8192px on the longest edge**, preserving the rendered aspect ratio,
-with 300 DPI metadata. Provider-native dimensions and any Lanczos upscaling are
-shown; a smaller model render is never advertised as native 8K generation.
+**Uploads are bounded, not one enormous base64 JSON:** create a manifest, upload
+original files independently as binary (two at a time), then start the durable
+batch. Inputs are spooled in `output/.p2p-inputs/`; they are removed after their
+jobs/batch finish. Keep the browser open during upload. **Once queued, generation
+is server-owned** and continues through module navigation, reloads and SSE
+disconnections. The last batch can be reopened from Pixel to Pixel. An abandoned
+pre-generation upload can be discarded explicitly.
+
+As each real provider image arrives, a bounded **native libvips streaming** graph
+aspect-fits it onto **4500 × 5400**, using the selected background for padding,
+without cropping. Native dimensions/upscaling are disclosed. The prompt requests
+8K clarity, but provider-native 8K is not guaranteed and the new final print
+canvas is 4500 × 5400—not an advertised native 8K export. No matting, palette
+reduction or recolouring substitute is applied to the provider artwork.
+
+The master is a **lossless RGBA PNG, 300 DPI**, written directly to disk as
+`output/p2p_<filename>_<UTC timestamp>_<collision suffix>.png`. Compression does
+not quantize colours or remove alpha. Per the clarified requirement, **4 MB is
+not a rejection threshold**: files below **25,000,000 bytes** are accepted.
+A larger lossless file fails visibly rather than degrading pixels silently.
+The generator's creative changes/resampling are distinct from lossless encoding;
+there is no promise that a generative provider reproduces source pixels exactly.
+
+The PNG and thumbnail must verify before a SQLite transaction inserts `designs`,
+marks the persistent batch job successful and writes its durable SSE outbox
+entry. The browser **does not initiate a download** on completion. History gets
+per-image live updates even when Pixel is unmounted; users can inspect and
+multi-select, stream an optional ZIP, or **Send to Listing Hub**. Listing handoff
+persists real record IDs across navigation and saving a listing stores its
+verified design ID/path in SQLite. Partial failures leave successful files
+archived. Worker-restart recovery marks uncertain unfinished work failed without
+silently reissuing paid renders; existing archives remain intact.
+
+The older `/api/bridge/pixel-to-pixel` 8192px-longest-edge recreation API remains
+available with Transparent, Black, White and Keep Original backgrounds. It is
+not used by the new Donepixel print-batch UI; those legacy paths remain covered
+by backend regressions.
 
 ### Genuine saving and Designs History
 
@@ -140,7 +181,14 @@ application. Live provider generation is separate from the local raster tests.
 |---|---|---|
 | POST | `/api/bridge/process` | Sequential caller → cutout/print/save, returning verified record/report |
 | POST | `/api/bridge/generate` | Provider style fusion, SSE events |
-| POST | `/api/bridge/pixel-to-pixel` | Provider concept recreation, SSE events |
+| POST | `/api/bridge/pixel-to-pixel` | Legacy 8192px recreation API, SSE events |
+| POST | `/api/bridge/p2p/batches` | Create dynamic manifest with background hex |
+| POST | `/api/bridge/p2p/batches/{id}/items/{job}` | Stream one original binary upload (40 MB max) |
+| POST | `/api/bridge/p2p/batches/{id}/start` | Idempotently enqueue server-owned parallel generation |
+| GET | `/api/bridge/p2p/batches/{id}` | Persistent batch/job states and verified design records |
+| POST | `/api/bridge/p2p/batches/{id}/discard` | Discard an unfinished pre-generation upload |
+| GET | `/api/bridge/events` | Durable live archive/job SSE, replay via Last-Event-ID |
+| GET / POST | `/api/bridge/listings` | SQLite listings linked to verified design IDs/paths |
 | GET / POST / DELETE | `/api/bridge/designs` | Durable History, verified browser-derived raster save, remove entries |
 | GET | `/api/bridge/designs/{id}` | Actual PNG; `?preview=1` for its thumbnail |
 | POST | `/api/bridge/export` | Validate IDs and issue short-lived ZIP ticket |
@@ -157,13 +205,16 @@ unauthenticated public multi-user service.
 | `MERCHFLOW_OUT` | `<repository>/output` | PNGs, previews and durable History |
 | `MERCHFLOW_DB` | `~/MerchFlow/merchflow.db` | Existing account/job/listing database |
 | `MERCHFLOW_WORKER_URL` | `http://127.0.0.1:8000` | Next.js → worker proxy |
+| `MERCHFLOW_P2P_PARALLEL` | `8` | Parallel P2P provider calls, capped to eligible account count (1–32) |
 | `MERCHFLOW_REMBG_MODEL` | `u2net` | Default model for direct pipeline callers |
 | `U2NET_HOME` | rembg default | Model weights cache directory |
 | `OMP_NUM_THREADS` | runtime default | ONNX CPU thread tuning |
 | `MERCHFLOW_MOCK_ENGINE` | off | Must be off for production generation |
 
-libvips is optional; the pipeline accurately identifies its Pillow Lanczos
-fallback when the native runtime is not installed. Neural background removal
+Native libvips is mandatory for Donepixel's streamed print export. The
+`pyvips[binary]` requirement supplies it on supported platforms; an unavailable
+runtime blocks Donepixel visibly. Other image tools retain their identified
+Pillow fallback. Neural background removal
 still requires rembg, ONNX Runtime and OpenCV. SVG vector export requires vtracer.
 
 ## Validation
@@ -196,10 +247,29 @@ MERCHFLOW_E2E_REAL_WORKER=1 npm run test:e2e
 The real-worker browser case queues **55 valid files plus one invalid file**,
 checks only one processing request is in flight, downloads one ZIP, verifies all
 55 PNG dimensions/DPI and unique filenames, and checks History/handoff/reload.
-Other browser cases stub **authentication failure only**, confirming the four
-background values reach the recreation endpoint and failed generation does not
-fall back to a fabricated image. Deterministic Python provider fixtures test
-SSE/save ordering without using paid services or account cookies; they are not a
-claim of live-provider validation. Tests run on Linux; the actual Windows app
-window and live authenticated provider must also be smoke-tested on the target
-machine.
+Other browser cases check all seven swatches/custom hex, default Black, dynamic
+1/5/20/101 ingestion, and genuine authentication failure without fake success.
+
+Donepixel browser integration has an explicit **test-only provider harness**:
+
+```sh
+# Build the actual static desktop UI before starting the test harness.
+npm run build:desktop
+# Terminal 1: fixture provider, actual libvips/SQLite/SSE/files, temporary data
+VIPS_CONCURRENCY=2 python tests/support/donepixel_worker.py
+# Terminal 2: validate the shipped static UI + FastAPI API routes
+MERCHFLOW_E2E_BASE_URL=http://127.0.0.1:8123 MERCHFLOW_E2E_P2P=1 npm run test:e2e
+
+# Alternatively, validate Next proxy wiring with a separate dev server:
+# MERCHFLOW_WORKER_URL=http://127.0.0.1:8123 npm run dev -- --hostname 0.0.0.0
+# MERCHFLOW_E2E_P2P=1 npm run test:e2e
+```
+
+The harness is never imported by production. It uses no paid account/cookies,
+and must be stopped after validation. Tests verify live History arrival,
+optional ZIP only, navigation/reload recovery, and real Listing Hub file
+association, including regenerating the same retained files on another colour
+with fresh job identities. Python provider fixtures exercise genuine 1/5/20/101 disk archives
+and exact-pixel lossless RGBA roundtrip above 4 MB. These are not a claim of
+successful live Gemini rendering. Linux validation does not replace an actual
+Windows/native-package and authenticated-provider smoke test.

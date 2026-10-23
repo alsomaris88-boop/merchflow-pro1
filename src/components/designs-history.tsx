@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   CheckSquare,
   Download,
@@ -24,6 +24,8 @@ import {
   formatBytes,
   downloadDesignsZip,
   listDesigns,
+  isSavedDesign,
+  sendToListing,
   sendToPrepare,
   timeAgo,
   type DesignRecord,
@@ -43,10 +45,13 @@ export default function DesignsHistory({ setView }: { setView: (v: ViewKey) => v
   const [confirmClear, setConfirmClear] = useState(false);
   const [preview, setPreview] = useState<Row | null>(null);
   const [error, setError] = useState("");
+  const loadVersion = useRef(0);
 
   const load = useCallback(async () => {
+    const version = ++loadVersion.current;
     try {
       const records = await listDesigns();
+      if (version !== loadVersion.current) return;
       const mapped = records.map((record) => ({ ...record, url: record.previewUrl }));
       setRows(mapped);
       setSel((previous) => new Set([...previous].filter((id) => mapped.some((row) => row.id === id))));
@@ -57,9 +62,17 @@ export default function DesignsHistory({ setView }: { setView: (v: ViewKey) => v
 
   useEffect(() => {
     const initial = setTimeout(() => void load(), 0);
-    const onChange = () => void load();
+    const onChange = (event?: Event) => {
+      const design = event instanceof CustomEvent ? event.detail : undefined;
+      if (isSavedDesign(design)) {
+        setRows((previous) => [{ ...design, url: design.previewUrl }, ...previous.filter((row) => row.id !== design.id)]
+          .sort((a, b) => b.createdAt - a.createdAt));
+        setLoading(false);
+      }
+      void load();
+    };
     window.addEventListener(DESIGNS_EVENT, onChange);
-    const timer = setInterval(onChange, 10000);
+    const timer = setInterval(() => onChange(), 10000);
     return () => { clearTimeout(initial); clearInterval(timer); window.removeEventListener(DESIGNS_EVENT, onChange); };
   }, [load]);
 
@@ -67,7 +80,7 @@ export default function DesignsHistory({ setView }: { setView: (v: ViewKey) => v
     const term = q.trim().toLowerCase();
     if (!term) return rows;
     return rows.filter((r) =>
-      [r.name, r.niche, r.style, r.aspect, r.account].filter(Boolean).join(" ").toLowerCase().includes(term)
+      [r.name, r.niche, r.style, r.aspect, r.account, r.batchId, r.background].filter(Boolean).join(" ").toLowerCase().includes(term)
     );
   }, [q, rows]);
 
@@ -120,7 +133,7 @@ export default function DesignsHistory({ setView }: { setView: (v: ViewKey) => v
       <PageHead
         kicker="MODULE 02 · DESIGNS LIBRARY & HISTORY"
         title="Every render, one batch away"
-        desc="Designs auto-archive here the moment they finish generating. Multi-select, then hand the whole batch straight to the Prepare Lab, stream a ZIP, or remove history entries without deleting your PNG files."
+        desc="Designs auto-archive here the moment they finish generating. Multi-select, then hand the whole batch to the Prepare Lab or Listing Hub, stream a ZIP, or remove history entries without deleting your PNG files."
         right={
           <div className="flex items-center gap-2">
             <Chip tone="violet"><HardDrive size={11} /> {formatBytes(totalBytes)} on disk</Chip>
@@ -174,6 +187,9 @@ export default function DesignsHistory({ setView }: { setView: (v: ViewKey) => v
           <div className="flex items-center gap-2 ml-auto">
             <Btn variant="lime" onClick={handoff} disabled={!filtered.length}>
               <Rocket size={14} /> Send to Prepare {sel.size ? `(${sel.size})` : "(all)"}
+            </Btn>
+            <Btn variant="primary" disabled={!filtered.length} onClick={() => { sendToListing(working().map((row) => row.id)); setView("listing"); }}>
+              <Rocket size={14} /> Send to Listing Hub {sel.size ? `(${sel.size})` : "(all)"}
             </Btn>
             <Btn variant="primary" onClick={() => void downloadZip()} disabled={!filtered.length || zipping}>
               {zipping ? <Loader2 size={14} className="animate-spin" /> : <Package size={14} />}
@@ -293,6 +309,7 @@ export default function DesignsHistory({ setView }: { setView: (v: ViewKey) => v
               <Btn variant="ghost" onClick={() => { const a = document.createElement("a"); a.href = preview.fileUrl; a.download = `${preview.name}.png`; a.click(); }}>
                 <Download size={13} /> Download PNG
               </Btn>
+              <Btn variant="primary" onClick={() => { sendToListing([preview.id]); setPreview(null); setView("listing"); }}>Send to Listing Hub</Btn>
               <Btn variant="lime" onClick={() => { sendToPrepare([preview.id]); setPreview(null); setView("prepare"); }}>
                 <Rocket size={13} /> Send to Prepare
               </Btn>

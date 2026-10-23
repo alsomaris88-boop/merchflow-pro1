@@ -14,9 +14,11 @@ import TrendRadar from "@/components/trend-radar";
 import Mockup from "@/components/mockup";
 import Accounts from "@/components/accounts";
 import Licensing from "@/components/licensing";
+import { useDesignEvents } from "@/lib/use-design-events";
 
 export default function Page() {
   const [view, setView] = useState<ViewKey>("dashboard");
+  useDesignEvents();
 
   const render = () => {
     switch (view) {
@@ -27,7 +29,7 @@ export default function Page() {
       case "history":
         return <DesignsHistory setView={setView} />;
       case "recolor":
-        return <PixelToPixel />;
+        return <PixelToPixel setView={setView} />;
       case "prepare":
         return <PrepareLab />;
       case "trademark":

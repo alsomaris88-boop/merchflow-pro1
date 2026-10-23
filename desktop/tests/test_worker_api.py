@@ -36,7 +36,7 @@ def events(response):
 
 def fake_provider(module, monkeypatch):
     account = SimpleNamespace(id=1, label="Test fixture provider")
-    pool = SimpleNamespace(accounts=[account], acquire=lambda: account, _wait_jitter=lambda a: None, note_render=lambda i: False)
+    pool = SimpleNamespace(accounts=[account], acquire=lambda: account, release=lambda i: None, _wait_jitter=lambda a: None, note_render=lambda i: False)
     raw = base64.b64decode(image_data().split(",")[1])
     provider = SimpleNamespace(generate_image=lambda prompt, references: raw)
     monkeypatch.setattr(module.gemini_pool, "POOL", pool)

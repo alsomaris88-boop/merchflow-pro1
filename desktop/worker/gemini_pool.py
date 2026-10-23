@@ -1,24 +1,8 @@
-"""
-MerchFlow Pro — Gemini Advanced (18-Month Pro) SEQUENTIAL EXHAUSTION pool.
+"""Real Gemini provider pool with exclusive per-account render leases.
 
-The Donepixel / PodTitan infinite loop. Gemini Advanced Pro accounts do not use
-a 24-hour daily cap — they use an empirical 5-HOUR ROLLING COMPUTE WINDOW
-(~60 high-res Imagen 3 Pro renders). Strategy:
-
-  1. Every job goes to Account 1 until it reaches its Pro window capacity (~60).
-  2. It enters a 5h cooldown (or the Flash-degradation sensor forces it early)
-     and the entire workload shifts to Account 2.
-  3. → Account 3 → 4 → 5 … By the time the tail accounts finish, Account 1's
-     window has RESET and it comes back 🟢 Ready.
-  4. Result: an uninterrupted 24/7 pipeline producing 500+ designs/day across
-     5–10 accounts at $0 token cost.
-
-  Degradation sensor: gemini_client raises ModelDegradedError the instant the
-  response metadata advertises a -flash model → cooldown_until = now + 5h and
-  the job reroutes immediately.
-
-  MERCHFLOW_MOCK_ENGINE=1 shortens windows so the full sequential cycle is
-  demonstrable without cookies.
+Pixel-to-Pixel distributes work across verified, available Pro sessions in
+parallel. Legacy fusion keeps lowest-slot scheduling. Provider limits, auth
+failures and model degradation are respected; mock production is blocked.
 """
 from __future__ import annotations
 
@@ -27,9 +11,10 @@ import csv
 import json
 import os
 import random
+import re
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
@@ -69,7 +54,18 @@ Background: {BG}. Additional direction: {DIRECTION}.
 The application will export the real render at 8192px on its longest edge."""
 
 
+DONEPIXEL_PROMPT = "Recreate this exact uploaded image in ultra-high quality, 8K resolution, and high definition. Maintain 100% fidelity to the original composition, overall style, colors, characters, fonts, and graphic elements. Enhance all textures, sharpen blurry lines, clean up low-resolution artifacts, and make it look like a crisp, professional graphic design ready for high-quality printing. Do not alter or change the elements, just upgrade the visual clarity, sharpness, and quality. Render the clean artwork on a solid background of: {Selected_Color_Hex}."
+
+
+def donepixel_prompt(colour: str) -> str:
+    if not re.fullmatch(r"#[0-9a-fA-F]{6}", colour):
+        raise ValueError("Background must be a six-digit hex colour, such as #000000")
+    return DONEPIXEL_PROMPT.replace("{Selected_Color_Hex}", colour.upper())
+
+
 def _build_prompt(payload: dict) -> str:
+    if payload.get("task") == "donepixel":
+        return donepixel_prompt(payload["background"])
     if payload.get("task") == "recreate":
         bg = {
             "transparent": "isolate the artwork on a simple backdrop for neural alpha matting",
@@ -140,7 +136,9 @@ class AccountState:
 
 class AccountPool:
     def __init__(self) -> None:
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
+        self.condition = threading.Condition(self.lock)
+        self._busy: set[int] = set()
         self.accounts: list[AccountState] = []
         self._load()
         self._warm_clients()
@@ -175,21 +173,24 @@ class AccountPool:
         self.accounts.sort(key=lambda a: a.id)
 
     def save(self) -> None:
-        rows = [
-            {
-                "id": a.id, "label": a.label, "email": a.email, "provider": a.provider,
-                "secure_1psid": a.secure_1psid, "secure_1psidts": a.secure_1psidts,
-                "window_usage": a.window_usage, "window_started": a.window_started,
-                "cooldown_until": a.cooldown_until, "is_pro": a.is_pro,
-                "daily_used": a.daily_used, "weekly_used": a.weekly_used,
-                "total_generated": a.total_generated,
-            }
-            for a in self.accounts
-        ]
-        try:
-            CONFIG_PATH.write_text(json.dumps({"jitter_seconds": [65, 85], "window_cap": WINDOW_CAP, "accounts": rows}, indent=2), encoding="utf-8")
-        except Exception:
-            pass
+        with self.lock:
+            rows = [
+                {
+                    "id": a.id, "label": a.label, "email": a.email, "provider": a.provider,
+                    "secure_1psid": a.secure_1psid, "secure_1psidts": a.secure_1psidts,
+                    "window_usage": a.window_usage, "window_started": a.window_started,
+                    "cooldown_until": a.cooldown_until, "is_pro": a.is_pro,
+                    "daily_used": a.daily_used, "weekly_used": a.weekly_used,
+                    "total_generated": a.total_generated,
+                }
+                for a in self.accounts
+            ]
+            try:
+                temp = CONFIG_PATH.with_suffix(".json.part")
+                temp.write_text(json.dumps({"jitter_seconds": [65, 85], "window_cap": WINDOW_CAP, "accounts": rows}, indent=2), encoding="utf-8")
+                os.replace(temp, CONFIG_PATH)
+            except Exception:
+                pass
 
     def _warm_clients(self) -> None:
         for a in self.accounts:
@@ -256,30 +257,52 @@ class AccountPool:
         return self.register_session(account_id, psid, psidts, email, provider, label)
 
     # ------------------------------ SEQUENTIAL EXHAUSTION scheduling
-    def acquire(self) -> AccountState:
-        """
-        Slot order only — never round-robin. The first Pro account with window
-        capacity takes the ENTIRE workload until exhausted.
-        """
+    def ready_pro_count(self) -> int:
         with self.lock:
             self._reset_expired_locked()
-            if MOCK:
-                healthy = [a for a in self.accounts if a.status in ("ready", "active") and client_for(a.id) is not None] or list(self.accounts)
-                healthy = [a for a in healthy if a.window_usage < WINDOW_CAP]
-            else:
-                healthy = [
-                    a for a in self.accounts
-                    if a.status in ("ready", "active")
-                    and a.window_usage < WINDOW_CAP
-                    and client_for(a.id) is not None
-                ]
-            if not healthy:
-                raise RuntimeError("pool exhausted — every Pro account is in its 5h cooldown; they reset automatically")
-            a = healthy[0]  # lowest slot = head of the exhaustion chain
-            a.status = "active"
-            if not a.window_started:
-                a.window_started = time.time()
-            return a
+            return sum(a.is_pro and a.status in {"ready", "active"}
+                       and a.window_usage < WINDOW_CAP and client_for(a.id) is not None
+                       for a in self.accounts)
+
+    def acquire(self, *, parallel: bool = False, require_pro: bool = False,
+                exclude: set[int] | None = None, timeout: float = 300) -> AccountState:
+        """Reserve one session exclusively; wait only for busy eligible accounts.
+
+        Cooldown/auth-required/Flash-degraded accounts are never dispatched.
+        Parallel scheduling favours the least-recently-used free account.
+        """
+        deadline = time.monotonic() + timeout
+        with self.condition:
+            while True:
+                self._reset_expired_locked()
+                eligible = [a for a in self.accounts
+                            if a.status in {"ready", "active"}
+                            and a.window_usage < WINDOW_CAP
+                            and (not require_pro or a.is_pro)
+                            and a.id not in (exclude or set())
+                            and client_for(a.id) is not None]
+                free = [a for a in eligible if a.id not in self._busy]
+                if free:
+                    a = min(free, key=lambda a: (a.last_used, a.id)) if parallel else free[0]
+                    self._busy.add(a.id)
+                    a.status = "active"
+                    if not a.window_started:
+                        a.window_started = time.time()
+                    return a
+                if not eligible:
+                    raise RuntimeError("No available authenticated Pro account; check Account Pool, provider limits and cooldowns")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError("Timed out waiting for an available Pro account; check Account Pool")
+                self.condition.wait(min(remaining, 1.0))
+
+    def release(self, account_id: int) -> None:
+        with self.condition:
+            self._busy.discard(account_id)
+            a = next((a for a in self.accounts if a.id == account_id), None)
+            if a and a.status == "active":
+                a.status = "ready"
+            self.condition.notify_all()
 
     def note_render(self, account_id: int) -> bool:
         """Record a successful render. Returns True if the window just filled → cooldown."""
@@ -298,6 +321,7 @@ class AccountPool:
                 self.save()
                 return True
             a.status = "ready"
+            self.save()
             return False
 
     def degrade(self, account_id: int) -> None:
@@ -429,6 +453,7 @@ def run_batch(payload: dict, push: Callable[[dict], None], out_dir: Path) -> dic
         t0 = time.perf_counter()
         acct = None
         for _ in range(max(1, min(3, len(POOL.accounts)))):
+            acct = None
             try:
                 acct = POOL.acquire()
                 push({"type": "dispatch", "job": job_id, "name": name, "account": acct.label})
@@ -456,6 +481,9 @@ def run_batch(payload: dict, push: Callable[[dict], None], out_dir: Path) -> dic
             except Exception as exc:
                 last_err = exc
                 break
+            finally:
+                if acct is not None:
+                    POOL.release(acct.id)
         if raw is None or acct is None:
             push({"type": "failed", "job": job_id, "name": name, "reason": str(last_err or "No authenticated account available")[:400]})
             continue
@@ -485,3 +513,50 @@ def run_batch(payload: dict, push: Callable[[dict], None], out_dir: Path) -> dic
     if rows and not recreate:
         _write_manifests(rows, out_dir, push)
     return {"completed": len(rows), "failed": len(niche_items) - len(rows)}
+
+
+def render_donepixel(reference: bytes, colour: str, dispatch: Callable[[str], None]) -> tuple[bytes, str, str]:
+    """Real multimodal recreation, one concurrent render per verified account.
+
+    Disk/encoder failures happen outside this function, so they never consume a
+    second provider render or mark a healthy account as faulty.
+    """
+    if MOCK:
+        raise RuntimeError("Mock generation is disabled for design production")
+    prompt = donepixel_prompt(colour)
+    tried: set[int] = set()
+    last_error: Exception | None = None
+    for _ in range(max(1, len(POOL.accounts))):
+        account = None
+        try:
+            account = POOL.acquire(parallel=True, require_pro=True, exclude=tried)
+            tried.add(account.id)
+            dispatch(account.label)
+            POOL._wait_jitter(account)
+            client = client_for(account.id)
+            if client is None:
+                raise GeminiAuthError("Provider session expired; reconnect in Account Pool")
+            raw = client.generate_image(prompt, [(reference, "concept-reference.png")])
+            if not raw:
+                raise GeminiRenderError("Provider returned no image")
+            POOL.note_render(account.id)
+            return raw, account.label, prompt
+        except ModelDegradedError as exc:
+            last_error = exc
+            if account is not None:
+                POOL.degrade(account.id)
+        except GeminiAuthError as exc:
+            last_error = exc
+            if account is not None:
+                POOL.fault(account.id, auth=True)
+        except GeminiRenderError as exc:
+            last_error = exc
+            if account is not None:
+                POOL.fault(account.id)
+        except Exception as exc:
+            last_error = exc
+            break
+        finally:
+            if account is not None:
+                POOL.release(account.id)
+    raise RuntimeError(str(last_error or "No authenticated Pro account available"))

@@ -14,6 +14,7 @@ import type { NextConfig } from "next";
 const isDesktopExport = process.env.DESKTOP_EXPORT === "1";
 
 const nextConfig: NextConfig = {
+  allowedDevOrigins: ["localhost", "127.0.0.1", "*.e2b.app"],
   ...(isDesktopExport
     ? {
         output: "export",

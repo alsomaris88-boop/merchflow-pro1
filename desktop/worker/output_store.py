@@ -38,6 +38,7 @@ def _connect(out_dir: Path):
             conn.execute("PRAGMA busy_timeout=30000")
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("CREATE TABLE IF NOT EXISTS designs (id TEXT PRIMARY KEY, created REAL NOT NULL, data TEXT NOT NULL)")
+            conn.execute("CREATE TABLE IF NOT EXISTS design_events (id INTEGER PRIMARY KEY AUTOINCREMENT, data TEXT NOT NULL)")
             yield conn
             conn.commit()
         except Exception:
@@ -105,6 +106,7 @@ def save_image(
         }
         with _connect(out_dir) as conn:
             conn.execute("INSERT INTO designs VALUES (?, ?, ?)", (design_id, record["createdAt"], json.dumps(record)))
+            publish_event(conn, {"type": "design.saved", "design": record})
         return png, record
     except Exception:
         temp.unlink(missing_ok=True)
@@ -155,6 +157,7 @@ def delete_records(out_dir: Path, ids: list[str] | None = None) -> None:
             conn.execute("DELETE FROM designs")
         else:
             conn.executemany("DELETE FROM designs WHERE id = ?", [(i,) for i in ids])
+        publish_event(conn, {"type": "designs.changed"})
 
 
 class _ZipSink:
@@ -202,3 +205,96 @@ def stream_zip(out_dir: Path, records: Iterable[dict]) -> Iterator[bytes]:
                     yield from sink.drain()
             yield from sink.drain()
     yield from sink.drain()
+
+
+# The event outbox is committed in the same SQLite transaction as History.
+# SSE consumers can reconnect without depending on a mounted Pixel component.
+def publish_event(conn: sqlite3.Connection, event: dict) -> None:
+    conn.execute("INSERT INTO design_events (data) VALUES (?)", (json.dumps(event),))
+
+
+def latest_event_id(out_dir: Path) -> int:
+    with _connect(out_dir) as conn:
+        return conn.execute("SELECT COALESCE(MAX(id), 0) FROM design_events").fetchone()[0]
+
+
+def read_events(out_dir: Path, after: int) -> list[tuple[int, dict]]:
+    with _connect(out_dir) as conn:
+        rows = conn.execute("SELECT id, data FROM design_events WHERE id > ? ORDER BY id LIMIT 200", (after,)).fetchall()
+    return [(event_id, json.loads(data)) for event_id, data in rows]
+
+
+P2P_MAX_BYTES = 25_000_000
+
+
+def save_vips_print(image, out_dir: Path, name: str, metadata: dict, *, ms: int = 0) -> dict:
+    """Stream an RGBA libvips graph straight to an atomic lossless print PNG.
+
+    No palette, quantization, full-image memory buffer, or 4 MB rejection.
+    The 25 MB ceiling is checked before registration; oversize files never
+    degrade silently. The PNG and small preview must both verify successfully.
+    """
+    import pyvips
+    from datetime import datetime, timezone
+
+    save_started = time.perf_counter()
+    out_dir = out_dir.resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    design_id = uuid.uuid4().hex
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    path = out_dir / f"p2p_{safe_name(Path(name).stem)}_{stamp}_{design_id[:8]}.png"
+    temp = path.with_suffix(".png.part")
+    thumb = out_dir / ".previews" / f"{design_id}.png"
+    thumb_temp = thumb.with_suffix(".png.part")
+    try:
+        image = image.copy(xres=DPI / 25.4, yres=DPI / 25.4)
+        image.pngsave(str(temp), compression=9, interlace=False, palette=False,
+                      bitdepth=16 if image.format == "ushort" else 8, filter=248)
+        size = temp.stat().st_size
+        if size >= P2P_MAX_BYTES:
+            raise ValueError("Lossless PNG exceeds the 25 MB limit; no colours were reduced and nothing was archived")
+        with temp.open("r+b") as fp:
+            os.fsync(fp.fileno())
+        with Image.open(temp) as check:
+            if check.format != "PNG" or check.size != (4500, 5400) or check.mode != "RGBA":
+                raise OSError("Print PNG must be genuine 4500 x 5400 RGBA")
+            if any(abs(d - DPI) > 0.1 for d in check.info.get("dpi", (0, 0))):
+                raise OSError("Print PNG DPI verification failed")
+            check.verify()
+        thumb.parent.mkdir(exist_ok=True)
+        # Decode a separate sequential source, never re-read a consumed graph.
+        small = pyvips.Image.thumbnail(str(temp), 384, height=384, size="down")
+        small.pngsave(str(thumb_temp), compression=6, palette=False)
+        del small  # release the source file before Windows atomic renames
+        with Image.open(thumb_temp) as check:
+            check.verify()
+        os.replace(temp, path)
+        os.replace(thumb_temp, thumb)
+        record = {
+            "id": design_id, "name": Path(name).stem[:160], "niche": Path(name).stem[:160],
+            "source": "pixel-to-pixel", "style": "Donepixel recreation", "aspect": "5:6",
+            "background": metadata["background"], "prompt": metadata["prompt"],
+            "account": metadata["account"], "w": 4500, "h": 5400, "dpi": DPI,
+            "bytes": size, "ms": ms + round((time.perf_counter() - save_started) * 1000), "saved": True, "path": str(path),
+            "previewPath": str(thumb), "createdAt": round(time.time() * 1000),
+            "fileUrl": f"/api/bridge/designs/{design_id}",
+            "previewUrl": f"/api/bridge/designs/{design_id}?preview=1",
+            "lossless": True, "mode": "RGBA", "encoder": "libvips-png",
+            **{key: metadata[key] for key in ("batchId", "jobId", "nativeW", "nativeH", "upscaled") if key in metadata},
+        }
+        with _connect(out_dir) as conn:
+            conn.execute("INSERT INTO designs VALUES (?, ?, ?)", (design_id, record["createdAt"], json.dumps(record)))
+            if metadata.get("batchId") and metadata.get("jobId"):
+                updated = conn.execute(
+                    "UPDATE p2p_jobs SET state='succeeded', design_id=?, ms=? WHERE id=? AND batch_id=? AND state='saving'",
+                    (design_id, ms, metadata["jobId"], metadata["batchId"]),
+                )
+                if updated.rowcount != 1:
+                    raise RuntimeError("Batch job state changed before archive; transaction rolled back")
+                publish_event(conn, {"type": "p2p.updated", "batchId": metadata["batchId"]})
+            publish_event(conn, {"type": "design.saved", "design": record})
+        return record
+    except Exception:
+        for file in (temp, path, thumb_temp, thumb):
+            file.unlink(missing_ok=True)
+        raise

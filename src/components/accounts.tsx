@@ -276,8 +276,8 @@ export default function Accounts() {
     return { tone: "neutral" as const, dot: "bg-white/25", text: "Not signed in" };
   };
 
-  // Sequential exhaustion: head of the chain receives every job until its
-  // 5h window fills.
+  // Legacy fusion targets the first available slot. Donepixel instead uses
+  // exclusive parallel Pro leases; its actual dispatches appear per job.
   const dispatchTargetId = useMemo(() => {
     const sorted = [...items].sort((x, y) => x.id - y.id);
     const head = sorted.find((a) => {
@@ -317,8 +317,8 @@ export default function Accounts() {
           {[
             ["Signed in (Pro)", `${readyCount}/${items.length || readyCount}`],
             ["5H windows live", `${items.reduce((s, a) => s + (a.windowUsage ?? 0), 0)}/${items.reduce((s, a) => s + (a.windowCap ?? 60), 0)} renders`],
-            ["Daily throughput", `${200 + items.reduce((s, a) => s + (a.windowCap ?? 60), 0)}+ designs`],
-            ["Loop mode", "sequential"],
+            ["Dispatch safety", "1 render / account"],
+            ["Pixel to Pixel", "parallel Pro pool"],
           ].map(([k, v]) => (
             <div key={k} className="rounded-xl bg-white/[0.03] border border-white/[0.06] px-4 py-3">
               <div className="font-mono2 text-[17px] font-semibold text-[#c9f24b]">{v}</div>

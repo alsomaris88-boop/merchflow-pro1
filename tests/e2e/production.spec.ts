@@ -10,7 +10,8 @@ async function mockNoProvider(page: Page) {
   await page.route("**/api/**", async (route) => {
     const url = new URL(route.request().url());
     if (url.pathname === "/api/bridge") return route.fulfill({ json: { connected: true, mock: false, outDir: "output/", profiles: [] } });
-    if (["/api/bridge/generate", "/api/bridge/pixel-to-pixel"].includes(url.pathname)) {
+    if (url.pathname === "/api/bridge/events") return route.fulfill({ contentType: "text/event-stream", body: 'retry: 60000\ndata: {"type":"sync"}\n\n' });
+    if (["/api/bridge/generate", "/api/bridge/pixel-to-pixel", "/api/bridge/p2p/batches"].includes(url.pathname)) {
       return route.fulfill({ status: 409, json: { detail: "No authenticated image-provider account. Connect one in Account Pool." } });
     }
     return route.fulfill({ json: { items: [], source: "test fixture", jobCount: 0, listingCount: 0 } });
@@ -92,19 +93,36 @@ test("provider authentication errors stay failed; there is no simulated generato
   await expect(page.getByText("failed", { exact: true })).toBeVisible();
 });
 
-for (const [label, key] of [["Transparent", "transparent"], ["Solid Black", "black"], ["Solid White", "white"], ["Keep Original", "original"]]) {
-  test(`Pixel to Pixel sends the ${label} background to the real recreation endpoint`, async ({ page }) => {
+for (const [label, hex] of [["Grey", "#808080"], ["Black", "#000000"], ["Cream", "#FDFBF7"], ["Navy", "#0A192F"], ["Maroon", "#6B1D2F"], ["Forest Green", "#1B4332"], ["Orange", "#E65100"], ["Custom Hex", "#123ABC"]]) {
+  test(`Pixel to Pixel sends the exact ${label} colour and never fakes an authenticated render`, async ({ page }) => {
     await mockNoProvider(page);
     await page.goto("/");
     await page.getByRole("button", { name: "Pixel to Pixel", exact: true }).click();
+    await expect(page.getByRole("radio", { name: "Black", exact: true })).toHaveAttribute("aria-checked", "true");
     await page.locator("#p2p-files").setInputFiles(fixture);
-    const option = page.getByRole("button", { name: label, exact: true });
-    await option.click(); await expect(option).toHaveAttribute("aria-pressed", "true");
-    const payload = page.waitForRequest((req) => new URL(req.url()).pathname === "/api/bridge/pixel-to-pixel");
-    const run = page.getByRole("button", { name: "Recreate in 8K (1)", exact: true });
+    const option = page.getByRole("radio", { name: label, exact: true });
+    await option.click(); await expect(option).toHaveAttribute("aria-checked", "true");
+    if (label === "Custom Hex") await page.getByRole("textbox", { name: "Custom background hex" }).fill(hex);
+    const payload = page.waitForRequest((req) => new URL(req.url()).pathname === "/api/bridge/p2p/batches");
+    const run = page.getByRole("button", { name: "1 designs in, 1 back on your colour. ▷ Generate", exact: true });
     await expect(run).toBeEnabled(); await run.click();
-    expect((await payload).postDataJSON().background).toBe(key);
+    expect((await payload).postDataJSON().background).toBe(hex);
     await expect(page.getByRole("alert").filter({ hasText: "No authenticated image-provider account" })).toContainText("No authenticated image-provider account");
-    await expect(page.getByText("Saved designs · 1", { exact: true })).toHaveCount(0);
+    await expect(page.getByText("Saved to disk + Designs History", { exact: true })).toHaveCount(0);
+  });
+}
+
+for (const n of [1, 5, 20, 101]) {
+  test(`dynamic ingestion retains all ${n} images, updates the action, and supports remove/clear`, async ({ page }) => {
+    await mockNoProvider(page); await page.goto("/");
+    await page.getByRole("button", { name: "Pixel to Pixel", exact: true }).click();
+    const buffer = await readFile(fixture);
+    await page.locator("#p2p-files").setInputFiles(Array.from({ length: n }, (_, i) => ({ name: `input-${i}.png`, mimeType: "image/png", buffer })));
+    await expect(page.getByTestId("p2p-upload-count")).toHaveText(`${n} designs uploaded`);
+    await expect(page.getByRole("button", { name: `${n} designs in, ${n} back on your colour. ▷ Generate`, exact: true })).toBeEnabled();
+    await page.getByRole("button", { name: "Remove input-0.png", exact: true }).click();
+    await expect(page.getByTestId("p2p-upload-count")).toHaveText(`${n - 1} designs uploaded`);
+    if (n > 1) await page.getByRole("button", { name: "Clear all", exact: true }).click();
+    await expect(page.getByTestId("p2p-upload-count")).toHaveText("0 designs uploaded");
   });
 }
