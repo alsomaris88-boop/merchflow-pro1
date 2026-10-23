@@ -1,0 +1,21 @@
+# MerchFlow Pro — local engine dependencies (Python 3.11+)
+fastapi>=0.115
+uvicorn[standard]>=0.30
+pydantic>=2.7
+httpx>=0.27
+websockets>=12.0
+numpy>=1.26
+pillow>=10.3
+# Native libvips binding. Requires the libvips runtime on Windows:
+#   winget install --id libvips.libvips   (or the official installer)
+# If unavailable, the engine auto-falls back to Pillow Lanczos.
+pyvips>=2.2.3
+# Excel manifest export (optional but recommended)
+openpyxl>=3.1
+
+# ---- Elite design production tools ----
+# Offline raster→SVG vectorizer (Rust wheel, no system deps)
+vtracer>=0.6.11
+# In-graphic OCR trademark sentry. Also install the Tesseract binary:
+#   winget install --id UB-Mannheim.TesseractOCR
+pytesseract>=0.3.13
