@@ -83,11 +83,11 @@ const providerLabel = (p?: string) =>
   p === "brave" ? "Brave" : p === "edge" ? "Microsoft Edge" : "Google Chrome";
 
 export default function Accounts() {
-  const [items, setItems] = useState<Account[]>([]);
+  const [localItems, setItems] = useState<Account[]>([]);
   const [loading, setLoading] = useState(true);
   const [bridge, setBridge] = useState<BridgeStatus>({ connected: false });
   const [workers, setWorkers] = useState<Map<number, WorkerCard>>(new Map());
-  const [tick, setTick] = useState(0);
+  const [now, setNow] = useState<number | null>(null);
 
   // login modal
   const [open, setOpen] = useState(false);
@@ -123,15 +123,16 @@ export default function Accounts() {
   }, []);
 
   useEffect(() => {
-    void loadLocal();
+    const initial = setTimeout(() => { void loadLocal(); setNow(Date.now()); }, 0);
     const probe = () => probeBridge().then(setBridge).catch(() => setBridge({ connected: false }));
     void probe().then(loadWorkers);
     const poll = setInterval(() => {
       void loadLocal();
       void probe().then(loadWorkers);
     }, 12000);
-    const beat = setInterval(() => setTick((t) => t + 1), 1000);
+    const beat = setInterval(() => setNow(Date.now()), 1000);
     return () => {
+      clearTimeout(initial);
       clearInterval(poll);
       clearInterval(beat);
       if (pollRef.current) clearInterval(pollRef.current);
@@ -139,10 +140,8 @@ export default function Accounts() {
   }, [loadLocal, loadWorkers]);
 
   /** Merge engine cards into the local rows so new sign-ins appear instantly. */
-  useEffect(() => {
-    if (!workers.size) return;
-    setItems((prev) => {
-      const next = [...prev];
+  const items = useMemo(() => {
+      const next = [...localItems];
       for (const [id, w] of workers) {
         if (!w.email && !w.hasCookies) continue;
         const i = next.findIndex((n) => n.id === id);
@@ -168,8 +167,7 @@ export default function Accounts() {
         else next[i] = { ...next[i], ...merged };
       }
       return next;
-    });
-  }, [workers]);
+  }, [localItems, workers]);
 
   /* ---------------------------- login flow control ---------------------------- */
   const stopPolling = useCallback(() => {
@@ -268,8 +266,8 @@ export default function Accounts() {
   };
 
   const stateOf = (a: Account) => {
-    const left = a.status === "cooldown" && a.cooldownUntil
-      ? Math.max(0, Math.round(a.cooldownUntil - Date.now() / 1000))
+    const left = a.status === "cooldown" && a.cooldownUntil && now !== null
+      ? Math.max(0, Math.round(a.cooldownUntil - now / 1000))
       : a.cooldownRemaining ?? 0;
     if (a.status === "cooldown") return { tone: "amber" as const, dot: "bg-amber-400", text: left > 0 ? `Cooldown · ${fmtLeft(left)}` : "Cooldown" };
     if (a.status === "active") return { tone: "violet" as const, dot: "bg-viol-500 pulse-dot", text: "Active" };
@@ -556,7 +554,7 @@ export default function Accounts() {
                 </div>
 
                 <div className="mt-4 flex items-center justify-center gap-2 font-mono2 text-[9.5px] text-white/25">
-                  <Sparkles size={10} /> zero-prompt Imagen 3 · {tick % 2 ? "pool ready" : "pool idle"}
+                  <Sparkles size={10} /> image provider · {authed} authenticated account(s)
                 </div>
               </>
             )}

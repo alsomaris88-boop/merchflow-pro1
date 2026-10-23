@@ -18,10 +18,13 @@ import math
 import os
 import re
 import time
+import uuid
 from pathlib import Path
 
 import numpy as np
 from PIL import Image
+
+from . import output_store
 
 try:
     import pyvips
@@ -154,12 +157,13 @@ def adapt_to_products(
             arr[..., 3] *= mask
             canvas = Image.fromarray(arr.clip(0, 255).astype(np.uint8), "RGBA")
 
-        path = out_dir / f"{safe}_{key}_{W}x{H}.png"
-        canvas.save(path, "PNG", optimize=True)
+        _, design = output_store.save_image(canvas, out_dir, f"{base_name}-{key}", {"source": "prepare", "style": spec["label"]})
+        path = Path(design["path"])
         buf = io.BytesIO()
         canvas.resize((max(1, W // 6), max(1, H // 6)), Image.LANCZOS).save(buf, "PNG")
         results.append(
             {
+                "design": design,
                 "product": key,
                 "label": spec["label"],
                 "w": W, "h": H,
@@ -287,13 +291,13 @@ def vectorize_svg(raw: bytes, out_dir: Path, base_name: str = "design", mode: st
     t0 = time.perf_counter()
     out_dir.mkdir(parents=True, exist_ok=True)
     safe = re.sub(r"[^a-z0-9_-]+", "-", base_name.lower())[:48] or "design"
-    svg_path = out_dir / f"{safe}.svg"
+    svg_path = out_dir / f"{safe}_{uuid.uuid4().hex}.svg"
 
     if not HAS_VTRACER:
         return {"ok": False, "available": False,
                 "reason": "vtracer not installed — pip install vtracer (Rust wheel)"}
 
-    tmp_png = out_dir / f".{safe}_trace_src.png"
+    tmp_png = out_dir / f".{safe}_{uuid.uuid4().hex}_trace_src.png"
     tmp_png.write_bytes(raw)
     try:
         vtracer.convert_image_to_svg_py(
@@ -502,9 +506,8 @@ def generate_dark_light_split(
     safe = re.sub(r"[^a-z0-9_-]+", "-", base_name.lower())[:48] or "design"
     report = analyze_contrast(raw)
 
-    light_path = out_dir / f"{safe}_light_garments.png"
-    light_path.write_bytes(raw)
-    out = {"analysis": report, "light": {"path": str(light_path), "bytes": len(raw)}}
+    _, light = output_store.save_raw(raw, out_dir, f"{base_name}-light-garments", {"source": "prepare", "style": "Light garment"})
+    out = {"analysis": report, "light": light}
 
     needs = report.get("lowContrast") or strategy in {"stroke", "cream"}
     if not needs:
@@ -548,9 +551,8 @@ def generate_dark_light_split(
         result = layer
         applied = f"{radius}px outer stroke"
 
-    dark_path = out_dir / f"{safe}_dark_garments.png"
-    result.save(dark_path, "PNG", optimize=True)
-    out["dark"] = {"path": str(dark_path), "bytes": dark_path.stat().st_size}
+    _, dark = output_store.save_image(result, out_dir, f"{base_name}-dark-garments", {"source": "prepare", "style": "Dark garment"})
+    out["dark"] = dark
     out["applied"] = applied
     return out
 

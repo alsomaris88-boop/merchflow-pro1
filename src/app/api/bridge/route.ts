@@ -17,8 +17,8 @@ export async function GET() {
   } catch {
     return NextResponse.json({
       connected: false,
-      engine: "simulated-browser-preview",
-      hint: "Start the local engine: desktop/run_windows.bat (uvicorn on 127.0.0.1:8000)",
+      engine: "offline",
+      hint: "Start run_windows.bat to connect the local engine. Processing never falls back to simulated results.",
     });
   }
 }

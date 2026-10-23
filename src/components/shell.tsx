@@ -74,15 +74,14 @@ export function Shell({
   children: React.ReactNode;
 }) {
   const clock = useClock();
-  const [mem, setMem] = useState(52);
+  // Connection state is probed; memory and online status are never invented.
   const [engineOn, setEngineOn] = useState(false);
 
   useEffect(() => {
-    const i = setInterval(() => setMem(48 + Math.round(Math.random() * 11)), 2600);
     const probe = () => probeBridge().then((s) => setEngineOn(!!s.connected)).catch(() => setEngineOn(false));
     void probe();
     const p = setInterval(probe, 15000);
-    return () => { clearInterval(i); clearInterval(p); };
+    return () => clearInterval(p);
   }, []);
 
   return (
@@ -147,17 +146,11 @@ export function Shell({
           <div className="glass-deep rounded-2xl p-3.5">
             <div className="flex items-center justify-between mb-2">
               <span className="font-mono2 text-[9px] tracking-[0.22em] text-white/35 flex items-center gap-1.5">
-                <Cpu size={11} className="text-[#b9a8ff]" /> VIPPS PIPELINE
+                <Cpu size={11} className="text-[#b9a8ff]" /> PRINT PIPELINE
               </span>
-              <span className="font-mono2 text-[10px] text-[#c9f24b]">{mem} MB</span>
+              <span className="font-mono2 text-[10px] text-[#c9f24b]">PNG</span>
             </div>
-            <div className="h-1 rounded-full bg-white/[0.07] overflow-hidden">
-              <div
-                className="h-full rounded-full bg-gradient-to-r from-viol-500 to-[#c9f24b] transition-all duration-700"
-                style={{ width: `${(mem / 60) * 100}%` }}
-              />
-            </div>
-            <div className="mt-2 text-[10px] text-white/30 leading-tight">Memory-streamed · zero thermal load</div>
+            <div className="mt-2 text-[10px] text-white/30 leading-tight">Sequential processing · verified files · streaming ZIP</div>
           </div>
         </div>
       </aside>
@@ -168,24 +161,24 @@ export function Shell({
         <header className="h-[60px] border-b border-white/[0.06] bg-ink-950/60 backdrop-blur-xl flex items-center justify-between px-6 sticky top-0 z-20">
           <div className="flex items-center gap-3">
             <div className="glass rounded-xl px-3.5 py-2 flex items-center gap-2.5">
-              <span className="h-[7px] w-[7px] rounded-full bg-[#c9f24b] pulse-dot" />
-              <span className="text-[12px] font-semibold text-white/80 tracking-tight">Engine Online</span>
-              <span className="font-mono2 text-[10px] text-white/30">v2.4.1</span>
+              <span className={cx("h-[7px] w-[7px] rounded-full", engineOn ? "bg-[#c9f24b]" : "bg-white/25")} />
+              <span className="text-[12px] font-semibold text-white/80 tracking-tight">{engineOn ? "Engine connected" : "Engine offline"}</span>
+              <span className="font-mono2 text-[10px] text-white/30">disk-backed</span>
             </div>
             <div className="hidden md:flex glass rounded-xl px-3.5 py-2 items-center gap-2">
               <Activity size={12} className="text-[#b9a8ff]" />
-              <span className="font-mono2 text-[11px] text-white/60">dispatcher · 65–85s human jitter</span>
+              <span className="font-mono2 text-[11px] text-white/60">sequential raster queue</span>
             </div>
             <div
               className={cx(
                 "hidden lg:flex glass rounded-xl px-3.5 py-2 items-center gap-2 transition-all",
                 engineOn && "border-[#c9f24b]/40"
               )}
-              title={engineOn ? "Local Python engine connected at 127.0.0.1:8000" : "Run desktop/run_windows.bat to connect the local engine"}
+              title={engineOn ? "Local Python engine connected at 127.0.0.1:8000" : "Run run_windows.bat to connect the local engine"}
             >
               <PlugZap size={12} className={engineOn ? "text-[#c9f24b]" : "text-white/30"} />
               <span className={cx("font-mono2 text-[11px]", engineOn ? "text-[#c9f24b]" : "text-white/35")}>
-                {engineOn ? "ENGINE: LOCAL" : "ENGINE: SIM"}
+                {engineOn ? "ENGINE: LOCAL" : "ENGINE: OFFLINE"}
               </span>
             </div>
           </div>

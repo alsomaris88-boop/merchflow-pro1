@@ -6,8 +6,8 @@ import { Shell, type ViewKey } from "@/components/shell";
 import Dashboard from "@/components/dashboard";
 import Generator from "@/components/generator";
 import DesignsHistory from "@/components/designs-history";
-import Recolor from "@/components/recolor";
-import PrepareLab from "@/components/prepare-lab";
+import PixelToPixel from "@/components/modules/pixel-to-pixel";
+import PrepareLab from "@/components/modules/prepare-lab";
 import Trademark from "@/components/trademark";
 import ListingHub from "@/components/listing-hub";
 import TrendRadar from "@/components/trend-radar";
@@ -27,7 +27,7 @@ export default function Page() {
       case "history":
         return <DesignsHistory setView={setView} />;
       case "recolor":
-        return <Recolor />;
+        return <PixelToPixel />;
       case "prepare":
         return <PrepareLab />;
       case "trademark":

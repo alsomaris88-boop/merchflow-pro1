@@ -4,3 +4,15 @@ desktop/.venv*
 .next* 
 output/ 
 *.zip
+__pycache__/
+*.py[cod]
+*.tsbuildinfo
+.env*
+!.env.example
+.pytest_cache/
+.desktop-api-backup/
+artifacts/
+playwright-report/
+test-results/
+out/
+next-env.d.ts

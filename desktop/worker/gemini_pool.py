@@ -29,7 +29,6 @@ import os
 import random
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -57,11 +56,28 @@ IMAGE B is the NICHE SUBJECT: render this exact subject with perfect fidelity,
 redrawn 100% in the extracted style of Image A.
 {TEXT_RULE}
 Composition: single centred subject, clean silhouette edges, apparel design,
-isolated on a plain white background, no frames, no watermarks, no mockups.
+no frames, no watermarks, no mockups.
 Aspect ratio {ASPECT}. Background instruction: {BG}."""
 
 
+RECREATION_PROMPT = """Recreate the uploaded design concept as fresh, high-detail artwork.
+Preserve its subject, composition, visual style, palette, and any legible text.
+Refine contours, small details and typography. Do not merely recolour the input.
+Keep the reference aspect ratio. Return ONE artwork image, not a comparison,
+mockup, photograph of a garment, contact sheet, or watermarked preview.
+Background: {BG}. Additional direction: {DIRECTION}.
+The application will export the real render at 8192px on its longest edge."""
+
+
 def _build_prompt(payload: dict) -> str:
+    if payload.get("task") == "recreate":
+        bg = {
+            "transparent": "isolate the artwork on a simple backdrop for neural alpha matting",
+            "black": "solid pure black, RGB 0 0 0",
+            "white": "solid pure white, RGB 255 255 255",
+            "original": "retain the reference background, including its colours and texture",
+        }[payload.get("background", "transparent")]
+        return RECREATION_PROMPT.format(BG=bg, DIRECTION=payload.get("instructions") or "faithful concept recreation")
     text = (payload.get("textOverride") or "").strip()
     text_rule = (
         f'TEXT OVERRIDE: render exactly the string "{text}" inside the design, '
@@ -71,7 +87,7 @@ def _build_prompt(payload: dict) -> str:
         "numbers or garbled pseudo-text anywhere in the image."
     )
     bg = {
-        "transparent": "subject on solid white (keyed out later — keep edges clean)",
+        "transparent": "subject isolated on a plain backdrop for neural alpha matting; clean edges",
         "white": "solid white",
         "black": "solid black",
     }.get(payload.get("background") or "transparent", "solid white")
@@ -387,101 +403,85 @@ def _write_manifests(rows: list[dict], out_dir: Path, push: Callable[[dict], Non
         pass
 
 
-def run_batch(payload: dict, push: Callable[[dict], None], out_dir: Path) -> None:
-    style_name = payload.get("styleName") or "style"
-    style_bytes = _b64_of(payload["styleImage"])
+def run_batch(payload: dict, push: Callable[[dict], None], out_dir: Path) -> dict:
+    """Only real provider images may enter the save/History pipeline."""
+    if MOCK:
+        raise RuntimeError("Mock generation is disabled for design production. Unset MERCHFLOW_MOCK_ENGINE and connect a real account.")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    recreate = payload.get("task") == "recreate"
+    style_name = payload.get("styleName") or ("8K recreation" if recreate else "style")
+    style_bytes = b"" if recreate else _b64_of(payload["styleImage"])
     niche_items = payload.get("nicheImages") or []
     prompt = _build_prompt(payload)
-
     rows: list[dict] = []
-    rows_lock = threading.Lock()
-    workers = max(1, min(4, len(POOL.accounts)))  # sequential pool, bounded concurrency
-
-    def run_one(item: dict) -> None:
+    # A sequential raster queue prevents several full print/8K canvases and
+    # neural mattes from exhausting a normal desktop PC's memory.
+    for item in niche_items:
         job_id = item["id"]
         name = item.get("name") or job_id
-        niche_bytes = _b64_of(item["image"])
-
-        attempts = 0
-        last_err: Exception | None = None
-        max_attempts = max(1, min(3, len(POOL.accounts)))
-        while attempts < max_attempts:
-            attempts += 1
+        try:
+            niche_bytes = _b64_of(item["image"])
+        except Exception as exc:
+            push({"type": "failed", "job": job_id, "name": name, "reason": f"Invalid reference image: {exc}"})
+            continue
+        raw = None
+        last_err = None
+        t0 = time.perf_counter()
+        acct = None
+        for _ in range(max(1, min(3, len(POOL.accounts)))):
             try:
                 acct = POOL.acquire()
-            except RuntimeError as e:
-                push({"type": "failed", "job": job_id, "name": name, "reason": str(e)})
-                return
-            push({"type": "dispatch", "job": job_id, "name": name, "account": acct.label})
-            t0 = time.time()
-            try:
+                push({"type": "dispatch", "job": job_id, "name": name, "account": acct.label})
                 POOL._wait_jitter(acct)
-                push({
-                    "type": "progress", "job": job_id, "pct": 30,
-                    "msg": f"[{acct.label}] window {acct.window_usage}/{WINDOW_CAP} · uploading refs → batchexecute (Pro flag on)",
-                })
-                if MOCK:
-                    raw = image_lab.mock_render(
-                        style_bytes, niche_bytes,
-                        payload.get("aspect") or "4:5",
-                        payload.get("background") or "transparent",
-                        payload.get("textOverride") or "",
-                    )
-                    time.sleep(random.uniform(1.5, 3.0))
-                else:
-                    client = client_for(acct.id)
-                    if client is None:
-                        raise GeminiAuthError("no live session — sign the account in once via the login window")
-                    raw = client.generate_image(
-                        prompt,
-                        [(style_bytes, "style_ref.png"), (niche_bytes, f"niche_{job_id}.png")],
-                    )
-                push({"type": "progress", "job": job_id, "pct": 82, "msg": f"[{acct.label}] libvips keep-holes → 4500×5400 lanczos3"})
-                png, report = image_lab.postprocess_generate(raw, payload, out_dir, name)
-                ms = int((time.time() - t0) * 1000)
-                push(
-                    {
-                        "type": "image", "job": job_id, "name": name, "account": acct.label,
-                        "ms": ms, "png": base64.b64encode(png).decode(),
-                        "path": report["path"], "w": report["w"], "h": report["h"],
-                    }
-                )
-                with rows_lock:
-                    niche_txt = name.replace("_", " ").strip().title()
-                    rows.append(
-                        {
-                            "file": Path(report["path"]).name,
-                            "brand": f"{niche_txt} Culture Co"[:30],
-                            "title": f"Retro {niche_txt} Design"[:60],
-                            "bullet1": f"Striking {style_name} {niche_txt.lower()} artwork, headless-rendered and print-prepared.",
-                            "bullet2": "Pairs effortlessly with denim, joggers or a flannel layer.",
-                            "main_tag": niche_txt.lower(),
-                            "tags": ", ".join(sorted({niche_txt.lower(), f"{niche_txt.lower()} lover", f"{style_name.lower()} art"})),
-                        }
-                    )
-                if POOL.note_render(acct.id):
-                    push({"type": "log", "msg": f"[{acct.label}] Pro window full ({WINDOW_CAP}) → 5h cooldown, workload shifts to next account"})
-                return
-            except ModelDegradedError as e:
-                last_err = e
-                POOL.degrade(acct.id)
-                push({"type": "progress", "job": job_id, "pct": 12, "msg": f"[{acct.label}] ⚠ Flash downgrade detected → 5h cooldown, rerouting job"})
-            except GeminiAuthError as e:
-                last_err = e
-                POOL.fault(acct.id, auth=True)
-                push({"type": "progress", "job": job_id, "pct": 12, "msg": f"[{acct.label}] session expired → auth-required, rerouting"})
-            except GeminiRenderError as e:
-                last_err = e
-                POOL.fault(acct.id)
-                push({"type": "progress", "job": job_id, "pct": 12, "msg": f"[{acct.label}] cooldown — rerouting job"})
-            except Exception as e:  # pragma: no cover
-                last_err = e
-                POOL.fault(acct.id)
-                push({"type": "progress", "job": job_id, "pct": 12, "msg": f"[{acct.label}] worker error — rerouting job"})
-        push({"type": "failed", "job": job_id, "name": name, "reason": str(last_err)[:220]})
-
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        list(ex.map(run_one, niche_items))
-
-    if rows:
+                client = client_for(acct.id)
+                if client is None:
+                    raise GeminiAuthError("No live provider session; connect an account in Account Pool")
+                push({"type": "progress", "job": job_id, "pct": 25, "msg": f"[{acct.label}] sending reference to the image provider"})
+                references = [(niche_bytes, "concept-reference.png")] if recreate else [(style_bytes, "style_ref.png"), (niche_bytes, f"niche_{job_id}.png")]
+                raw = client.generate_image(prompt, references)
+                POOL.note_render(acct.id)
+                break
+            except ModelDegradedError as exc:
+                last_err = exc
+                if acct:
+                    POOL.degrade(acct.id)
+            except GeminiAuthError as exc:
+                last_err = exc
+                if acct:
+                    POOL.fault(acct.id, auth=True)
+            except GeminiRenderError as exc:
+                last_err = exc
+                if acct:
+                    POOL.fault(acct.id)
+            except Exception as exc:
+                last_err = exc
+                break
+        if raw is None or acct is None:
+            push({"type": "failed", "job": job_id, "name": name, "reason": str(last_err or "No authenticated account available")[:400]})
+            continue
+        try:
+            push({"type": "progress", "job": job_id, "pct": 80, "msg": "Provider returned an image; processing and verifying the PNG on disk"})
+            png, report = image_lab.postprocess_generate(raw, {**payload, "prompt": prompt, "account": acct.label}, out_dir, name)
+            del png, raw
+            ms = round((time.perf_counter() - t0) * 1000)
+            # The saved record exists before success is emitted, even if the
+            # browser closes immediately and never receives this event.
+            push({
+                "type": "image", "job": job_id, "name": name, "account": acct.label,
+                "ms": ms, "path": report["path"], "w": report["w"], "h": report["h"],
+                "saved": report["saved"], "bytes": report["bytes"], "fileUrl": report["fileUrl"],
+                "design": report["design"], "nativeW": report.get("nativeW"), "nativeH": report.get("nativeH"),
+                "upscaled": report.get("upscaled", False),
+            })
+            rows.append({
+                "file": Path(report["path"]).name,
+                "brand": "", "title": name[:60], "bullet1": "", "bullet2": "",
+                "main_tag": name.replace("_", " ").lower(), "tags": style_name,
+            })
+        except Exception as exc:
+            # Matting/disk errors are NOT provider account faults and must not
+            # trigger another costly generation or a fake 'done' event.
+            push({"type": "failed", "job": job_id, "name": name, "reason": str(exc)[:600]})
+    if rows and not recreate:
         _write_manifests(rows, out_dir, push)
+    return {"completed": len(rows), "failed": len(niche_items) - len(rows)}

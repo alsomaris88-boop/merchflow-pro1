@@ -1,331 +1,274 @@
-"""
-MerchFlow Pro — native print pipeline (Prepare Designs Lab, server grade).
+"""Neural cutout and genuine print/8K PNG pipelines.
 
-Pipeline order:
-  1. Keep-holes background removal — BFS flood strictly from the 4 canvas
-     borders, so enclosed letter counters (O, A, D, B, P, R, 4, 8) stay solid.
-  2. 1–3px edge defringe + neighbor decontamination (kills halos on dark tees).
-  3. Micro-dot despeckle (connected-component sweep at 4× downscale).
-  4. Lanczos3 upscale to the 4500×5400 @ 300 DPI canvas (pyvips when present,
-     streaming encode — no uncompressed 24.3M-px arrays persist in RAM).
-  5. Optional authentic spot-color halftone (45° rosette, hard alpha).
-  6. Lossless PNG write to C:/MerchFlow/Output (or $MERCHFLOW_OUT).
+There is intentionally NO colour-key fallback. Missing rembg/model weights or
+an inference/write error fails the job visibly rather than faking success.
+The 1–2 px alpha choke runs at EXPORT resolution, not on tiny source artwork.
 """
 from __future__ import annotations
 
-import base64
 import io
 import math
 import os
+import threading
 import time
-from collections import deque
 from pathlib import Path
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps
 
-try:  # native libvips (recommended: winget install libvips)
+from . import output_store
+
+try:
+    import cv2
+except ImportError:
+    cv2 = None
+
+try:
+    from rembg import new_session as _rembg_new_session
+    from rembg import remove as _rembg_remove
+except ImportError:
+    _rembg_new_session = _rembg_remove = None
+
+try:
     import pyvips
-
     HAS_VIPS = True
-except Exception:  # pragma: no cover - fallback environment
+except (ImportError, OSError):
     HAS_VIPS = False
 
+HAS_REMBG = _rembg_remove is not None
+HAS_CV = cv2 is not None
 EXPORT_W, EXPORT_H = 4500, 5400
-ENGINE_NAME = "pyvips-lanczos3" if HAS_VIPS else "pillow-lanczos (pyvips not installed)"
+ENGINE_NAME = "pyvips-lanczos3" if HAS_VIPS else "pillow-lanczos"
+REMBG_MODELS = {"u2net": "u2net", "birefnet": "birefnet-general", "birefnet-general": "birefnet-general"}
+_SESSIONS: dict[str, object] = {}
+_SESSION_LOCK = threading.Lock()
+# Bounded memory on ordinary Windows PCs, including concurrent HTTP requests.
+PIPELINE_LOCK = threading.RLock()
 
 
-# ---------------------------------------------------------------- keep-holes
-def _border_bgrm(arr: np.ndarray, tol: int) -> None:
-    h, w = arr.shape[:2]
-    a = arr[..., 3].astype(np.int16)
-    rgb = arr[..., :3].astype(np.int16)
-    opaque = a >= 40
-    border = np.zeros((h, w), bool)
-    border[0, :] = border[-1, :] = True
-    border[:, 0] = border[:, -1] = True
-    bp = rgb[border & opaque]
-    if bp.size == 0:
-        return
-    bg = bp.mean(axis=0)
-    d2 = ((rgb - bg) ** 2).sum(axis=2)
-    near = d2 <= (tol * tol * 3)
-
-    visited = np.zeros((h, w), bool)
-    dq: deque[tuple[int, int]] = deque()
-    ys, xs = np.nonzero(border & (~opaque | near))
-    for y, x in zip(ys.tolist(), xs.tolist()):
-        if not visited[y, x]:
-            visited[y, x] = True
-            a[y, x] = 0
-            dq.append((y, x))
-    while dq:
-        y, x = dq.popleft()
-        for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
-            if 0 <= ny < h and 0 <= nx < w and not visited[ny, nx]:
-                if (not opaque[ny, nx]) or near[ny, nx]:
-                    visited[ny, nx] = True
-                    a[ny, nx] = 0
-                    dq.append((ny, nx))
-    arr[..., 3] = a
+def _session(model: str):
+    if not HAS_REMBG:
+        raise RuntimeError("Neural cutout requires rembg: pip install -r desktop/requirements.txt")
+    if model not in REMBG_MODELS:
+        raise ValueError("Cutout model must be u2net or birefnet-general")
+    name = REMBG_MODELS[model]
+    with _SESSION_LOCK:
+        if name not in _SESSIONS:
+            # Keep only one model resident: BiRefNet and U2Net together are large.
+            _SESSIONS.clear()
+            _SESSIONS[name] = _rembg_new_session(name, providers=["CPUExecutionProvider"])
+        return _SESSIONS[name]
 
 
-# ----------------------------------------------------------------- defringe
-def _box3(x: np.ndarray) -> np.ndarray:
-    s = x.copy()
-    s[:, 1:] += x[:, :-1]
-    s[:, :-1] += x[:, 1:]
-    s[1:, :] += x[:-1, :]
-    s[:-1, :] += x[1:, :]
-    return s
+def decode_image(raw: bytes) -> Image.Image:
+    with Image.open(io.BytesIO(raw)) as opened:
+        opened.load()
+        return ImageOps.exif_transpose(opened).convert("RGBA")
 
 
-def _defringe(arr: np.ndarray, px: int) -> None:
-    a = arr[..., 3].astype(np.float32)
-    rgb = arr[..., :3].astype(np.float32)
-    for _ in range(max(0, int(px))):
-        mn = a.copy()
-        mn[:, 1:] = np.minimum(mn[:, 1:], a[:, :-1])
-        mn[:, :-1] = np.minimum(mn[:, :-1], a[:, 1:])
-        mn[1:, :] = np.minimum(mn[1:, :], a[:-1, :])
-        mn[:-1, :] = np.minimum(mn[:-1, :], a[1:, :])
-        boundary = (a > 0) & (mn == 0)
-        if not boundary.any():
-            break
-        full = (a >= 250).astype(np.float32)
-        cnt = _box3(full)
-        valid = cnt > 0
-        inv = np.where(valid, 1.0 / np.maximum(cnt, 1), 0)
+def _decontaminate_edges(image: Image.Image) -> Image.Image:
+    """Replace mixed edge RGB with nearby confident foreground, never a bg key.
+
+    Soft hair with no opaque neighbour is left to rembg's foreground matting.
+    Original transparent counters remain transparent; we never fill holes.
+    """
+    if cv2 is None:
+        raise RuntimeError("Alpha cleanup requires opencv-python-headless")
+    arr = np.array(image)
+    alpha = arr[..., 3]
+    solid = (alpha >= 245).astype(np.float32)
+    weight = cv2.boxFilter(solid, -1, (3, 3), normalize=False)
+    edge = (alpha > 0) & (alpha < 245) & (weight > 0)
+    if edge.any():
         for ch in range(3):
-            avg = _box3(rgb[..., ch] * full) * inv
-            mix = np.where(boundary & valid[..., None][..., 0], 0.3 * rgb[..., ch] + 0.7 * avg, rgb[..., ch])
-            rgb[..., ch] = mix
-        a = np.where(boundary, np.maximum(0.0, a - 140.0), a)
-    arr[..., :3] = np.clip(rgb, 0, 255).astype(np.uint8)
-    arr[..., 3] = a.astype(np.uint8)
+            colour = cv2.boxFilter(arr[..., ch].astype(np.float32) * solid, -1, (3, 3), normalize=False)
+            colour /= np.maximum(weight, 1)
+            arr[..., ch][edge] = np.clip(colour[edge], 0, 255).astype(np.uint8)
+    arr[..., :3][alpha == 0] = 0
+    return Image.fromarray(arr)
 
 
-# ---------------------------------------------------------------- despeckle
-def _despeckle(arr: np.ndarray, min_size: int = 24) -> int:
-    h, w = arr.shape[:2]
-    bin_ = arr[..., 3] > 16
-    f = 4
-    H, W = (h + f - 1) // f, (w + f - 1) // f
-    pad = np.zeros((H * f, W * f), bool)
-    pad[:h, :w] = bin_
-    small = pad.reshape(H, f, W, f).max(axis=(1, 3))
-    visited = np.zeros_like(small)
-    specks = np.zeros_like(small)
-    for sy in range(H):
-        for sx in range(W):
-            if not small[sy, sx] or visited[sy, sx]:
-                continue
-            dq = deque([(sy, sx)])
-            visited[sy, sx] = True
-            cells: list[tuple[int, int]] = []
-            while dq:
-                y, x = dq.popleft()
-                cells.append((y, x))
-                for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
-                    if 0 <= ny < H and 0 <= nx < W and small[ny, nx] and not visited[ny, nx]:
-                        visited[ny, nx] = True
-                        dq.append((ny, nx))
-            if len(cells) < max(1, min_size // (f * f)):
-                for y, x in cells:
-                    specks[y, x] = True
-    if not specks.any():
-        return 0
-    up = np.repeat(np.repeat(specks, f, axis=0), f, axis=1)[:h, :w]
-    arr[..., 3][up] = 0
-    return int(up.sum())
+def remove_background(image: Image.Image, model: str = "u2net") -> Image.Image:
+    """Universal semantic matting for orange/navy/photographic/textured backdrops."""
+    session = _session(model)
+    try:
+        result = _rembg_remove(
+            image, session=session, alpha_matting=True,
+            alpha_matting_foreground_threshold=240,
+            alpha_matting_background_threshold=10,
+            alpha_matting_erode_size=3,
+            post_process_mask=False,  # closing/smoothing can erase small lettering
+        )
+        cutout = result.convert("RGBA") if isinstance(result, Image.Image) else decode_image(result)
+        # rembg must never resurrect transparent pixels in an uploaded PNG.
+        alpha = np.minimum(np.asarray(image.getchannel("A")), np.asarray(cutout.getchannel("A")))
+        cutout.putalpha(Image.fromarray(alpha))
+        if not cutout.getchannel("A").getbbox():
+            raise ValueError("The cutout model returned an empty foreground; try the other model")
+        return _decontaminate_edges(cutout)
+    except Exception as exc:
+        raise RuntimeError(f"rembg {model} matting failed (no colour-key fallback): {exc}") from exc
 
 
-# ----------------------------------------------------------------- halftone
+def choke_alpha(image: Image.Image, pixels: int = 1) -> Image.Image:
+    """A real 1–2 export-pixel cv2.erode; no repeated source-resolution shrinking."""
+    if cv2 is None:
+        raise RuntimeError("Alpha choke requires opencv-python-headless")
+    pixels = max(1, min(2, int(pixels)))
+    alpha = np.asarray(image.getchannel("A"))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (pixels * 2 + 1, pixels * 2 + 1))
+    eroded = cv2.erode(alpha, kernel, iterations=1, borderType=cv2.BORDER_CONSTANT, borderValue=0)
+    image.putalpha(Image.fromarray(eroded))
+    return image
+
+
+def _despeckle(image: Image.Image, min_size: int = 4) -> tuple[Image.Image, int]:
+    if cv2 is None:
+        raise RuntimeError("Micro-dot cleanup requires opencv-python-headless")
+    alpha = np.array(image.getchannel("A"))
+    count, labels, stats, _ = cv2.connectedComponentsWithStats((alpha > 16).astype(np.uint8), connectivity=8)
+    small = np.zeros(count, dtype=bool)
+    small[1:] = stats[1:, cv2.CC_STAT_AREA] < max(1, min_size)
+    removed = small[labels]
+    pixels = int(np.count_nonzero(removed & (alpha > 0)))
+    alpha[removed] = 0
+    image.putalpha(Image.fromarray(alpha))
+    return image, pixels
+
+
 def _halftone(src: Image.Image, lpi: int, ink_hex: str, out_w: int, out_h: int) -> Image.Image:
+    from PIL import ImageDraw
     sw, sh = src.size
-    small = src.resize((1400, int(sh * 1400 / sw)), Image.BILINEAR) if sw > 1400 else src.copy()
-    arr = np.asarray(small).astype(np.float32)
-    H2, W2 = arr.shape[:2]
+    small = src.resize((1400, max(1, round(sh * 1400 / sw))), Image.Resampling.BILINEAR) if sw > 1400 else src
+    arr = np.asarray(small)
+    h, w = arr.shape[:2]
     lum = (0.299 * arr[..., 0] + 0.587 * arr[..., 1] + 0.114 * arr[..., 2]) / 255.0
     alpha = arr[..., 3] / 255.0
-
-    px_per_inch = out_w / 12.0
-    pitch_out = max(3.0, px_per_inch / max(20, lpi))
-    factor = out_w / W2
+    pitch_out = max(3.0, 300 / max(20, min(100, lpi)))
+    factor = out_w / w
     pitch = pitch_out / factor
-    ang = math.radians(45.0)
-    cos_a, sin_a = math.cos(ang), math.sin(ang)
-
-    out = Image.new("RGBA", (out_w, out_h), (0, 0, 0, 0))
-    from PIL import ImageDraw
-
-    drw = ImageDraw.Draw(out)
-    ink = tuple(int(ink_hex.lstrip("#")[i : i + 2], 16) for i in (0, 2, 4)) + (255,)
-    bound = int(math.hypot(W2, H2) / pitch) + 2
+    angle = math.radians(45)
+    cos_a, sin_a = math.cos(angle), math.sin(angle)
+    out = Image.new("RGBA", (out_w, out_h))
+    draw = ImageDraw.Draw(out)
+    ink = tuple(int(ink_hex.lstrip("#")[i:i + 2], 16) for i in (0, 2, 4)) + (255,)
+    bound = int(math.hypot(w, h) / pitch) + 2
     for gy in range(-bound, bound + 1):
-        ry = gy * pitch
         for gx in range(-bound, bound + 1):
-            rx = gx * pitch
-            x = rx * cos_a - ry * sin_a + W2 / 2
-            y = rx * sin_a + ry * cos_a + H2 / 2
+            x = gx * pitch * cos_a - gy * pitch * sin_a + w / 2
+            y = gx * pitch * sin_a + gy * pitch * cos_a + h / 2
             xi, yi = int(round(x)), int(round(y))
-            if xi < 0 or yi < 0 or xi >= W2 or yi >= H2:
+            if not (0 <= xi < w and 0 <= yi < h) or alpha[yi, xi] < 0.12:
                 continue
-            a = alpha[yi, xi]
-            if a < 0.12:
-                continue
-            t = (1.0 - lum[yi, xi]) * a
-            r = (pitch_out / 2) * 0.94 * math.sqrt(t)
-            if r < pitch_out * 0.075:  # micro-dot cleanup
+            radius = pitch_out * 0.47 * math.sqrt((1 - lum[yi, xi]) * alpha[yi, xi])
+            if radius < pitch_out * 0.075:
                 continue
             cx, cy = x * factor, y * factor
-            drw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=ink)
+            draw.ellipse([cx - radius, cy - radius, cx + radius, cy + radius], fill=ink)
     return out
 
 
-# ------------------------------------------------------------------- vips
-def vips_resize(img: Image.Image, w: int, h: int) -> Image.Image:
+def vips_resize(image: Image.Image, w: int, h: int) -> Image.Image:
     if not HAS_VIPS:
-        return img.resize((w, h), Image.LANCZOS)
-    arr = np.ascontiguousarray(np.asarray(img))
-    vi = pyvips.Image.new_from_memory(arr.tobytes(), img.width, img.height, 4, "uchar")
-    vi = vi.resize(w / img.width, vscale=h / img.height, kernel="lanczos3")
-    mem = vi.write_to_memory()
-    out = np.frombuffer(mem, dtype=np.uint8).reshape(vi.height, vi.width, 4)
-    return Image.fromarray(out, "RGBA")
+        # Pillow resamples RGBA via premultiplied alpha, avoiding RGB fringe bleed.
+        return image.resize((w, h), Image.Resampling.LANCZOS)
+    # Explicit premultiplication prevents transparent RGB bleeding with libvips.
+    source = pyvips.Image.new_from_memory(image.tobytes(), image.width, image.height, 4, "uchar")
+    resized = source.premultiply().resize(w / image.width, vscale=h / image.height, kernel="lanczos3").unpremultiply().cast("uchar")
+    return Image.frombytes("RGBA", (resized.width, resized.height), bytes(resized.write_to_memory()))
 
 
-def vips_save(img: Image.Image, out_path: Path) -> bytes:
-    if HAS_VIPS:
-        arr = np.ascontiguousarray(np.asarray(img))
-        vi = pyvips.Image.new_from_memory(arr.tobytes(), img.width, img.height, 4, "uchar")
-        vi.pngsave(str(out_path), compression=9, strip=True)
-        return vi.pngsave_buffer(compression=9, strip=True)
-    img.save(out_path, "PNG", optimize=True)
-    buf = io.BytesIO()
-    img.save(buf, "PNG", optimize=True)
-    return buf.getvalue()
+def _coverage(image: Image.Image) -> float:
+    hist = image.getchannel("A").histogram()
+    return round(sum(hist[17:]) / (image.width * image.height) * 100, 1)
 
 
-# ------------------------------------------------------------- main entry
-def process_design(raw: bytes, settings: dict, out_dir: Path, base_name: str = "design") -> tuple[bytes, dict]:
+def _prepare(raw: bytes, settings: dict, out_dir: Path, name: str, metadata: dict | None) -> tuple[bytes, dict]:
     t0 = time.perf_counter()
-    img = Image.open(io.BytesIO(raw)).convert("RGBA")
-    w0, h0 = img.size
-    if max(w0, h0) > 3000:  # keep the BFS passes sub-second; vips lanczos still lands on 4500
-        s = 3000 / max(w0, h0)
-        img = img.resize((max(2, int(w0 * s)), max(2, int(h0 * s))), Image.LANCZOS)
-
-    arr = np.asarray(img).copy()
+    image = decode_image(raw)
+    model = str(settings.get("model") or os.environ.get("MERCHFLOW_REMBG_MODEL", "u2net"))
+    remove = bool(settings.get("remove", True))
+    if remove:
+        image = remove_background(image, model)
     specks = 0
-    if settings.get("remove", True):
-        _border_bgrm(arr, int(settings.get("tol", 42)))
-    if int(settings.get("defringe", 0)) > 0:
-        _defringe(arr, int(settings.get("defringe", 2)))
     if settings.get("despeckle", True):
-        specks = _despeckle(arr, int(settings.get("despeckleMin", 24)))
+        image, specks = _despeckle(image, int(settings.get("despeckleMin", 4)))
+    if remove:
+        bounds = image.getchannel("A").getbbox()
+        if bounds is None:
+            raise ValueError("No printable foreground remains")
+        image = image.crop(bounds)
 
-    coverage = float((arr[..., 3] > 16).mean() * 100.0)
-    art = Image.fromarray(arr, "RGBA")
-
-    placement = settings.get("placement", "top")
-    top_margin = 350 if placement == "top" else 0
-    max_w = int(EXPORT_W * 0.92)
-    max_h = EXPORT_H - top_margin - (220 if placement == "top" else int(EXPORT_H * 0.10))
-    scale = min(max_w / art.width, max_h / art.height)
-    dw, dh = max(2, int(art.width * scale)), max(2, int(art.height * scale))
-    art_big = vips_resize(art, dw, dh)
-    dx = (EXPORT_W - dw) // 2
-    dy = top_margin if placement == "top" else (EXPORT_H - dh) // 2
-
+    w, h = settings.get("dimensions", (EXPORT_W, EXPORT_H))
+    if (w, h) not in {(4500, 5400), (4500, 4500), (4050, 5400)}:
+        raise ValueError("Unsupported print canvas")
+    top = 350 if settings.get("placement", "top") == "top" else 0
+    max_w, max_h = int(w * 0.92), h - top - (220 if top else int(h * 0.10))
+    scale = min(max_w / image.width, max_h / image.height)
+    dw, dh = max(1, round(image.width * scale)), max(1, round(image.height * scale))
+    placed = vips_resize(image, dw, dh)
+    final = Image.new("RGBA", (w, h))
+    final.alpha_composite(placed, ((w - dw) // 2, top if top else (h - dh) // 2))
+    del image, placed
+    if remove:
+        final = choke_alpha(final, int(settings.get("defringe", 1)))
     if settings.get("halftone"):
-        comp = Image.new("RGBA", (EXPORT_W, EXPORT_H), (0, 0, 0, 0))
-        comp.alpha_composite(art_big, (dx, dy))
-        final = _halftone(comp, int(settings.get("lpi", 48)), settings.get("ink", "#E8E2D2"), EXPORT_W, EXPORT_H)
-    else:
-        final = Image.new("RGBA", (EXPORT_W, EXPORT_H), (0, 0, 0, 0))
-        final.alpha_composite(art_big, (dx, dy))
-
-    out_dir.mkdir(parents=True, exist_ok=True)
-    safe = "".join(c if c.isalnum() or c in "-_" else "-" for c in base_name)[:60] or "design"
-    out_path = out_dir / f"{safe}_{EXPORT_W}x{EXPORT_H}_{time.strftime('%Y%m%d-%H%M%S')}.png"
-    png_bytes = vips_save(final, out_path)
-
-    ms = round((time.perf_counter() - t0) * 1000)
-    report = {
-        "ms": ms,
-        "coverage": round(coverage, 1),
-        "specks": int(specks),
-        "path": str(out_path),
-        "w": EXPORT_W,
-        "h": EXPORT_H,
-        "engine": ENGINE_NAME,
-    }
-    return png_bytes, report
+        final = _halftone(final, int(settings.get("lpi", 48)), settings.get("ink", "#E8E2D2"), w, h)
+    coverage = _coverage(final)
+    bg = str((metadata or {}).get("background", "transparent"))
+    if bg in {"black", "white"}:
+        solid = Image.new("RGBA", final.size, "black" if bg == "black" else "white")
+        solid.alpha_composite(final)
+        final = solid
+    png, design = output_store.save_image(final, out_dir, name, metadata, ms=round((time.perf_counter() - t0) * 1000), compress=bool(settings.get("compress", True)))
+    report = {**design, "design": design, "coverage": coverage, "specks": specks, "engine": ENGINE_NAME, "cutoutModel": model if remove else None}
+    return png, report
 
 
-# ------------------------------------------------- mock engine (offline dev)
-def mock_render(style_bytes: bytes, niche_bytes: bytes, aspect: str, background: str, text: str) -> bytes:
+def process_design(raw: bytes, settings: dict, out_dir: Path, base_name: str = "design", metadata: dict | None = None) -> tuple[bytes, dict]:
+    with PIPELINE_LOCK:
+        return _prepare(raw, settings, out_dir, base_name, metadata)
+
+
+def pixel_to_pixel(raw: bytes, payload: dict, out_dir: Path, name: str) -> tuple[bytes, dict]:
+    """Export a REAL provider recreation, not a renamed/recoloured input.
+
+    8K means 8192 px on the longest edge. Provider-native dimensions are
+    disclosed; Lanczos enlarges the real render when the provider returns less.
+    'original' bypasses segmentation and retains the provider-rendered backdrop.
     """
-    Deterministic placeholder engine (MERCHFLOW_MOCK_ENGINE=1) so the full
-    dispatch → libvips → SSE → disk pipeline is testable without Gemini auth.
-    """
-    dims = {"4:5": (1120, 1400), "1:1": (1400, 1400), "3:4": (1200, 1600)}.get(aspect, (1120, 1400))
-    style = Image.open(io.BytesIO(style_bytes)).convert("RGB").resize((64, 64))
-    q = style.quantize(colors=6, method=Image.MEDIANCUT).convert("RGB")
-    pal = q.getcolors(64 * 64) or [(1, (20, 20, 30))]
-    pal.sort(reverse=True)
-    ramp = sorted((c for _, c in pal), key=lambda c: sum(c))
-
-    niche = Image.open(io.BytesIO(niche_bytes)).convert("RGBA")
-    scale = min(dims[0] * 0.8 / niche.width, dims[1] * 0.7 / niche.height)
-    niche = niche.resize((max(2, int(niche.width * scale)), max(2, int(niche.height * scale))), Image.LANCZOS)
-
-    canvas = Image.new("RGBA", dims, (0, 0, 0, 0))
-    px = niche.load()
-    lo, hi = ramp[0], ramp[-1]
-    for y in range(niche.height):
-        for x in range(niche.width):
-            r, g, b, a = px[x, y]
-            if a < 12:
-                continue
-            t = (0.299 * r + 0.587 * g + 0.114 * b) / 255.0
-            px[x, y] = (
-                int(lo[0] + (hi[0] - lo[0]) * t),
-                int(lo[1] + (hi[1] - lo[1]) * t),
-                int(lo[2] + (hi[2] - lo[2]) * t),
-                a,
-            )
-    canvas.alpha_composite(niche, ((dims[0] - niche.width) // 2, (dims[1] - niche.height) // 2))
-
-    if text.strip():
-        from PIL import ImageDraw, ImageFont
-
-        drw = ImageDraw.Draw(canvas)
-        try:
-            font = ImageFont.truetype("arialbd.ttf", int(dims[1] * 0.08))
-        except Exception:
-            font = ImageFont.load_default()
-        drw.text((dims[0] / 2, dims[1] * 0.86), text.upper(), font=font, fill=hi + (255,), anchor="mm")
-
-    if background in ("white", "black"):
-        bg = Image.new("RGBA", dims, (255, 255, 255, 255) if background == "white" else (11, 11, 11, 255))
-        bg.alpha_composite(canvas)
-        canvas = bg
-
-    buf = io.BytesIO()
-    canvas.save(buf, "PNG")
-    return buf.getvalue()
+    with PIPELINE_LOCK:
+        t0 = time.perf_counter()
+        image = decode_image(raw)
+        native_w, native_h = image.size
+        background = payload.get("background", "transparent")
+        if background not in {"transparent", "black", "white", "original"}:
+            raise ValueError("Unknown recreation background")
+        if background != "original":
+            image = remove_background(image, str(payload.get("model", "u2net")))
+        scale = 8192 / max(image.size)
+        image = vips_resize(image, max(1, round(image.width * scale)), max(1, round(image.height * scale)))
+        if background != "original":
+            image = choke_alpha(image, int(payload.get("defringe", 1)))
+        if background in {"black", "white"}:
+            solid = Image.new("RGBA", image.size, background)
+            solid.alpha_composite(image)
+            image = solid
+        meta = {
+            "source": "pixel-to-pixel", "style": "8K concept recreation", "niche": name,
+            "background": background, "prompt": payload.get("prompt", ""), "account": payload.get("account", "local"),
+        }
+        png, design = output_store.save_image(image, out_dir, name, meta, ms=round((time.perf_counter() - t0) * 1000))
+        return png, {**design, "design": design, "nativeW": native_w, "nativeH": native_h, "upscaled": scale > 1, "engine": ENGINE_NAME}
 
 
 def postprocess_generate(raw: bytes, payload: dict, out_dir: Path, name: str) -> tuple[bytes, dict]:
-    """Print-standardize a fresh AI render (keep-holes + lanczos 4500×5400)."""
-    settings = {
-        "remove": True,
-        "tol": 46,
-        "defringe": 2,
-        "despeckle": True,
-        "halftone": False,
-        "placement": "top",
+    if payload.get("task") == "recreate":
+        return pixel_to_pixel(raw, payload, out_dir, name)
+    dimensions = {"4:5": (4500, 5400), "1:1": (4500, 4500), "3:4": (4050, 5400)}.get(payload.get("aspect"), (EXPORT_W, EXPORT_H))
+    metadata = {
+        "source": "generator", "niche": name, "style": payload.get("styleName", "Style fusion"),
+        "aspect": payload.get("aspect", "4:5"), "background": payload.get("background", "transparent"),
+        "prompt": payload.get("prompt", ""), "account": payload.get("account", "local"),
     }
-    return process_design(raw, settings, out_dir, base_name=name)
+    return process_design(raw, {"remove": True, "model": payload.get("model", "u2net"), "defringe": 1, "despeckle": False, "dimensions": dimensions, "placement": "top"}, out_dir, name, metadata)

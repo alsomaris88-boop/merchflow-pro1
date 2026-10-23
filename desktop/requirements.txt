@@ -6,6 +6,9 @@ httpx>=0.27
 websockets>=12.0
 numpy>=1.26
 pillow>=10.3
+# Universal neural cutout (CPU ONNX). First use downloads the selected weights.
+rembg[cpu]>=2.0.67,<3
+opencv-python-headless>=4.10,<5
 # Native libvips binding. Requires the libvips runtime on Windows:
 #   winget install --id libvips.libvips   (or the official installer)
 # If unavailable, the engine auto-falls back to Pillow Lanczos.

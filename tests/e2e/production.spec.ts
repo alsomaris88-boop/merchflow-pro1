@@ -1,0 +1,110 @@
+import { expect, test, type Page } from "@playwright/test";
+import { readFile } from "node:fs/promises";
+import path from "node:path";
+import JSZip from "jszip";
+
+const fixture = path.join(process.cwd(), "tests/fixtures/concept.png");
+
+async function mockNoProvider(page: Page) {
+  // UI wiring tests only: no successful design/provider response is fabricated.
+  await page.route("**/api/**", async (route) => {
+    const url = new URL(route.request().url());
+    if (url.pathname === "/api/bridge") return route.fulfill({ json: { connected: true, mock: false, outDir: "output/", profiles: [] } });
+    if (["/api/bridge/generate", "/api/bridge/pixel-to-pixel"].includes(url.pathname)) {
+      return route.fulfill({ status: 409, json: { detail: "No authenticated image-provider account. Connect one in Account Pool." } });
+    }
+    return route.fulfill({ json: { items: [], source: "test fixture", jobCount: 0, listingCount: 0 } });
+  });
+}
+
+test("55 real print PNGs are queued sequentially, streamed in one ZIP, and handed off from durable History", async ({ page, request }, info) => {
+  test.skip(process.env.MERCHFLOW_E2E_REAL_WORKER !== "1", "Requires a running real FastAPI worker and same-origin Next proxy");
+  test.setTimeout(360000);
+  const prefix = `batch-${Date.now()}`;
+  const buffer = await readFile(fixture);
+  let active = 0, peak = 0, calls = 0;
+  page.on("request", (req) => { if (new URL(req.url()).pathname === "/api/bridge/process") { active++; peak = Math.max(peak, active); calls++; } });
+  page.on("requestfinished", (req) => { if (new URL(req.url()).pathname === "/api/bridge/process") active--; });
+  page.on("requestfailed", (req) => { if (new URL(req.url()).pathname === "/api/bridge/process") active--; });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Prepare Designs Lab", exact: true }).click();
+  // This exercises actual resize/save/ZIP endpoints without needing model
+  // inference 55 times. Real U2Net matting has a separate opt-in smoke test.
+  await page.getByRole("button", { name: "Universal rembg cutout", exact: true }).click();
+  await page.getByRole("button", { name: "pHash duplicate check in this batch", exact: true }).click();
+  await page.locator("#lab-files").setInputFiles([
+    ...Array.from({ length: 55 }, () => ({ name: `${prefix}.png`, mimeType: "image/png", buffer })),
+    { name: "broken.png", mimeType: "image/png", buffer: Buffer.from("invalid-image-fixture") },
+  ]);
+  await expect(page.getByText("Batch queue · 56", { exact: true })).toBeVisible();
+  const run = page.getByRole("button", { name: "Prepare designs (56)", exact: true });
+  await expect(run).toBeEnabled();
+  await run.click();
+  const all = page.getByRole("button", { name: "Download all (55)", exact: true });
+  await expect(all).toBeEnabled({ timeout: 300000 });
+  await expect(page.getByText("1 failed", { exact: true })).toBeVisible();
+  expect(calls).toBe(56);
+  expect(peak).toBe(1);
+  const downloadEvent = page.waitForEvent("download");
+  await all.click();
+  const download = await downloadEvent;
+  const zipPath = info.outputPath("real-55-print-files.zip");
+  await download.saveAs(zipPath);
+  const zip = await JSZip.loadAsync(await readFile(zipPath));
+  const names = Object.keys(zip.files);
+  expect(names).toHaveLength(55);
+  expect(new Set(names).size).toBe(55);
+  for (const name of names) {
+    expect(name).toMatch(/4500x5400_300dpi(?:_\d+)?\.png$/);
+    const png = await zip.file(name)!.async("nodebuffer");
+    expect(png.subarray(0, 8)).toEqual(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]));
+    expect(png.readUInt32BE(16)).toBe(4500);
+    expect(png.readUInt32BE(20)).toBe(5400);
+    const physical = png.indexOf(Buffer.from("pHYs"));
+    expect(physical).toBeGreaterThan(0);
+    expect(png.readUInt32BE(physical + 4)).toBe(11811); // 300 DPI in pixels/metre
+    expect(png.readUInt32BE(physical + 8)).toBe(11811);
+  }
+  const response = await request.get("/api/bridge/designs");
+  const history = (await response.json()).items.filter((d: { name: string }) => d.name === prefix);
+  expect(history).toHaveLength(55);
+  expect((await readFile(history[0].path)).readUInt32BE(16)).toBe(4500);
+  await page.getByRole("button", { name: "Designs History", exact: true }).click();
+  await page.getByPlaceholder("filter by niche, style, account…").fill(prefix);
+  await expect(page.getByRole("button", { name: "Send to Prepare (all)", exact: true })).toBeEnabled();
+  await page.getByRole("button", { name: "Send to Prepare (all)", exact: true }).click();
+  await expect(page.getByText("Batch queue · 55", { exact: true })).toBeVisible();
+  await page.reload();
+  await page.getByRole("button", { name: "Designs History", exact: true }).click();
+  await expect(page.getByText(`${prefix}`, { exact: true }).first()).toBeVisible();
+});
+
+test("provider authentication errors stay failed; there is no simulated generator output", async ({ page }) => {
+  await mockNoProvider(page);
+  await page.goto("/");
+  await page.getByRole("button", { name: "AI Design Generator", exact: true }).click();
+  await page.locator("#dz-style").setInputFiles(fixture);
+  await page.locator("#dz-niche").setInputFiles(fixture);
+  const run = page.getByRole("button", { name: "Generate batch (1)", exact: true });
+  await expect(run).toBeEnabled(); await run.click();
+  await expect(page.getByRole("alert").filter({ hasText: "No authenticated image-provider account" })).toContainText("No authenticated image-provider account");
+  await expect(page.getByText("Saved designs · 1", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("failed", { exact: true })).toBeVisible();
+});
+
+for (const [label, key] of [["Transparent", "transparent"], ["Solid Black", "black"], ["Solid White", "white"], ["Keep Original", "original"]]) {
+  test(`Pixel to Pixel sends the ${label} background to the real recreation endpoint`, async ({ page }) => {
+    await mockNoProvider(page);
+    await page.goto("/");
+    await page.getByRole("button", { name: "Pixel to Pixel", exact: true }).click();
+    await page.locator("#p2p-files").setInputFiles(fixture);
+    const option = page.getByRole("button", { name: label, exact: true });
+    await option.click(); await expect(option).toHaveAttribute("aria-pressed", "true");
+    const payload = page.waitForRequest((req) => new URL(req.url()).pathname === "/api/bridge/pixel-to-pixel");
+    const run = page.getByRole("button", { name: "Recreate in 8K (1)", exact: true });
+    await expect(run).toBeEnabled(); await run.click();
+    expect((await payload).postDataJSON().background).toBe(key);
+    await expect(page.getByRole("alert").filter({ hasText: "No authenticated image-provider account" })).toContainText("No authenticated image-provider account");
+    await expect(page.getByText("Saved designs · 1", { exact: true })).toHaveCount(0);
+  });
+}

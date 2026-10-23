@@ -61,7 +61,10 @@ export default function Licensing() {
   const [busy, setBusy] = useState(false);
   const [res, setRes] = useState<VerifyResult | null>(null);
 
-  useEffect(() => setHwid(computeHwid()), []);
+  useEffect(() => {
+    const initial = setTimeout(() => setHwid(computeHwid()), 0);
+    return () => clearTimeout(initial);
+  }, []);
 
   const verify = useCallback(async (k?: string) => {
     const useKey = (k ?? key).trim();

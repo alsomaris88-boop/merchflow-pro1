@@ -22,20 +22,24 @@ import asyncio
 import base64
 import json
 import os
+import threading
+import time
+import uuid
+from typing import Literal
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-from . import browser, db, elite_tools, gemini_pool, image_lab, trademark_shield, trends_local
+from . import browser, db, elite_tools, gemini_pool, image_lab, output_store, trademark_shield, trends_local
 
-WORKER_VERSION = "2.1.0-unified"
+WORKER_VERSION = "2.2.0-disk-backed"
 
-OUT_DIR = Path(os.environ.get("MERCHFLOW_OUT") or (Path.home() / "MerchFlow" / "Output"))
+OUT_DIR = Path(os.environ.get("MERCHFLOW_OUT") or (Path(__file__).resolve().parents[2] / "output")).resolve()
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 _here = Path(__file__).resolve()
@@ -65,7 +69,7 @@ async def health() -> dict:
         "engine": f"gemini-headless-batchexecute + {image_lab.ENGINE_NAME}",
         "libvips": image_lab.HAS_VIPS, "mock": gemini_pool.MOCK, "headless": True,
         "outDir": str(OUT_DIR), "profiles": gemini_pool.profile_cards(),
-        "capabilities": elite_tools.CAPABILITIES,
+        "capabilities": {**elite_tools.CAPABILITIES, "rembg": image_lab.HAS_REMBG, "opencv": image_lab.HAS_CV, "streamZip": True, "diskHistory": True},
     }
 
 
@@ -288,19 +292,44 @@ async def login_cancel(flow_id: str) -> JSONResponse:
 
 
 # -------------------------------------------------------------- generate SSE
+class ReferenceImage(BaseModel):
+    id: str = Field(min_length=1, max_length=100)
+    name: str = Field(default="design", max_length=160)
+    image: str
+
+
 class GenerateReq(BaseModel):
     styleName: str = "style"
-    styleImage: str
-    aspect: str = "4:5"
-    background: str = "transparent"
-    textOverride: str = ""
-    nicheImages: list[dict] = []
+    styleImage: str = ""
+    aspect: Literal["4:5", "1:1", "3:4"] = "4:5"
+    background: Literal["transparent", "black", "white", "original"] = "transparent"
+    textOverride: str = Field(default="", max_length=1000)
+    model: Literal["u2net", "birefnet-general"] = "u2net"
+    instructions: str = Field(default="", max_length=4000)
+    nicheImages: list[ReferenceImage] = Field(min_length=1, max_length=1000)
 
 
-@app.post("/generate/stream")
-@app.post("/api/bridge/generate")
-async def generate_stream(req: GenerateReq) -> StreamingResponse:
-    payload = req.model_dump()
+def _decode(data: str) -> bytes:
+    import binascii
+    try:
+        raw = base64.b64decode(data.split(",", 1)[-1], validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise HTTPException(400, "Invalid base64 image") from exc
+    if not raw or len(raw) > 40 * 1024 * 1024:
+        raise HTTPException(413, "Each image must be between 1 byte and 40 MB")
+    return raw
+
+
+def _generate_response(req: GenerateReq, task: str) -> StreamingResponse:
+    if gemini_pool.MOCK:
+        raise HTTPException(409, "Mock generation is disabled. Unset MERCHFLOW_MOCK_ENGINE and connect a real account.")
+    if not any(gemini_pool.client_for(a.id) is not None for a in gemini_pool.POOL.accounts):
+        raise HTTPException(409, "No authenticated image-provider account. Connect one in Account Pool.")
+    if task == "fusion" and not req.styleImage:
+        raise HTTPException(400, "A style reference is required")
+    if task == "fusion" and req.background == "original":
+        raise HTTPException(400, "Keep Original is available for Pixel to Pixel recreations")
+    payload = {**req.model_dump(), "task": task}
     queue: asyncio.Queue[dict] = asyncio.Queue()
     loop = asyncio.get_running_loop()
 
@@ -309,40 +338,145 @@ async def generate_stream(req: GenerateReq) -> StreamingResponse:
 
     def runner() -> None:
         try:
-            gemini_pool.run_batch(payload, push, OUT_DIR)
-            push({"type": "done"})
-        except Exception as e:
-            push({"type": "fatal", "reason": str(e)})
+            summary = gemini_pool.run_batch(payload, push, OUT_DIR)
+            push({"type": "done", **summary})
+        except Exception as exc:
+            push({"type": "fatal", "reason": str(exc)})
 
     loop.run_in_executor(None, runner)
 
     async def sse():
         yield "retry: 2000\n\n"
         while True:
-            ev = await queue.get()
-            yield f"data: {json.dumps(ev)}\n\n"
-            if ev.get("type") in {"done", "fatal"}:
+            try:
+                event = await asyncio.wait_for(queue.get(), timeout=15)
+            except asyncio.TimeoutError:
+                yield ": heartbeat\n\n"
+                continue
+            yield f"data: {json.dumps(event)}\n\n"
+            if event.get("type") in {"done", "fatal"}:
                 break
 
-    return StreamingResponse(sse(), media_type="text/event-stream",
-                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+    return StreamingResponse(sse(), media_type="text/event-stream", headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"})
 
 
-# ---------------------------------------------------------------- process
+@app.post("/generate/stream")
+@app.post("/api/bridge/generate")
+async def generate_stream(req: GenerateReq) -> StreamingResponse:
+    return _generate_response(req, "fusion")
+
+
+@app.post("/p2p")
+@app.post("/api/bridge/pixel-to-pixel")
+async def recreate_stream(req: GenerateReq) -> StreamingResponse:
+    return _generate_response(req, "recreate")
+
+
 class ProcessReq(BaseModel):
     image: str
-    settings: dict = {}
+    name: str = Field(default="lab-design", max_length=160)
+    settings: dict = Field(default_factory=dict)
 
 
 @app.post("/process")
 @app.post("/api/bridge/process")
 async def process(req: ProcessReq) -> JSONResponse:
     try:
-        raw = base64.b64decode(req.image.split(",", 1)[-1])
-        png, report = await asyncio.to_thread(image_lab.process_design, raw, req.settings, OUT_DIR, "lab-design")
-        return JSONResponse({"ok": True, "png": base64.b64encode(png).decode(), "report": report})
-    except Exception as e:
-        return JSONResponse({"ok": False, "reason": str(e)}, status_code=500)
+        raw = _decode(req.image)
+        _, report = await asyncio.to_thread(image_lab.process_design, raw, req.settings, OUT_DIR, req.name)
+        return JSONResponse({"ok": True, "design": report["design"], "report": report})
+    except HTTPException:
+        raise
+    except Exception as exc:
+        return JSONResponse({"ok": False, "reason": str(exc)}, status_code=500)
+
+
+# ------------------------------- genuine file/history API ------------------
+class SaveReq(BaseModel):
+    image: str
+    name: str = Field(default="design", max_length=160)
+    meta: dict = Field(default_factory=dict)
+
+
+@app.get("/api/bridge/designs")
+async def designs_list() -> dict:
+    return {"ok": True, "items": await asyncio.to_thread(output_store.list_designs, OUT_DIR)}
+
+
+@app.post("/api/bridge/designs")
+async def designs_save(req: SaveReq) -> JSONResponse:
+    try:
+        _, design = await asyncio.to_thread(output_store.save_raw, _decode(req.image), OUT_DIR, req.name, req.meta)
+        return JSONResponse({"ok": True, "design": design})
+    except HTTPException:
+        raise
+    except Exception as exc:
+        return JSONResponse({"ok": False, "reason": str(exc)}, status_code=500)
+
+
+class DeleteDesignsReq(BaseModel):
+    ids: list[str] = Field(default_factory=list)
+    all: bool = False
+
+
+@app.delete("/api/bridge/designs")
+async def designs_delete(req: DeleteDesignsReq) -> dict:
+    await asyncio.to_thread(output_store.delete_records, OUT_DIR, None if req.all else req.ids)
+    return {"ok": True}
+
+
+@app.get("/api/bridge/designs/{design_id}")
+async def design_file(design_id: str, preview: bool = False) -> FileResponse:
+    try:
+        record = await asyncio.to_thread(output_store.get_design, OUT_DIR, design_id)
+        path = output_store.file_path(OUT_DIR, record, preview)
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(404, str(exc)) from exc
+    return FileResponse(path, media_type="image/png", filename=f"{output_store.safe_name(record['name'])}_{record['w']}x{record['h']}_300dpi.png", content_disposition_type="inline", headers={"Cache-Control": "no-store"})
+
+
+# A short-lived ticket keeps arbitrarily large ID lists OUT of download URLs.
+_ZIP_TICKETS: dict[str, tuple[float, list[str]]] = {}
+_ZIP_LOCK = threading.Lock()
+
+
+class ExportReq(BaseModel):
+    ids: list[str] = Field(min_length=1, max_length=5000)
+
+
+@app.post("/api/bridge/export")
+async def export_ticket(req: ExportReq) -> dict:
+    ids = list(dict.fromkeys(req.ids))
+    try:
+        # Preflight every file before promising a ZIP to the browser.
+        await asyncio.to_thread(lambda: [output_store.get_design(OUT_DIR, i) for i in ids])
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(404, str(exc)) from exc
+    with _ZIP_LOCK:
+        now = time.monotonic()
+        for key in [key for key, (expiry, _) in _ZIP_TICKETS.items() if expiry < now]:
+            del _ZIP_TICKETS[key]
+        if len(_ZIP_TICKETS) >= 1000:
+            raise HTTPException(429, "Too many pending ZIP downloads")
+        ticket = uuid.uuid4().hex
+        _ZIP_TICKETS[ticket] = (now + 600, ids)
+    return {"ok": True, "url": f"/api/bridge/export?ticket={ticket}", "count": len(ids)}
+
+
+@app.get("/api/bridge/export")
+async def export_zip(ticket: str) -> StreamingResponse:
+    with _ZIP_LOCK:
+        entry = _ZIP_TICKETS.get(ticket)
+    if not entry or entry[0] < time.monotonic():
+        raise HTTPException(404, "Download expired; click Download all again")
+    try:
+        records = await asyncio.to_thread(lambda: [output_store.get_design(OUT_DIR, i) for i in entry[1]])
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(404, str(exc)) from exc
+    return StreamingResponse(output_store.stream_zip(OUT_DIR, records), media_type="application/zip", headers={
+        "Content-Disposition": f'attachment; filename="merchflow-designs_{len(records)}.zip"',
+        "Cache-Control": "no-store", "X-Accel-Buffering": "no",
+    })
 
 
 # ===========================================================================
@@ -363,11 +497,11 @@ class EliteReq(BaseModel):
 @app.get("/elite/capabilities")
 @app.get("/api/bridge/elite/capabilities")
 async def elite_caps() -> dict:
-    return {"ok": True, "capabilities": elite_tools.CAPABILITIES, "products": elite_tools.PRODUCTS}
+    return {"ok": True, "capabilities": {**elite_tools.CAPABILITIES, "rembg": image_lab.HAS_REMBG, "opencv": image_lab.HAS_CV, "streamZip": True, "diskHistory": True}, "products": elite_tools.PRODUCTS}
 
 
 async def _elite_decode(req: EliteReq) -> bytes:
-    return base64.b64decode(req.image.split(",", 1)[-1])
+    return _decode(req.image)
 
 
 @app.post("/elite/polycanvas")
@@ -418,7 +552,8 @@ async def elite_vectorize(req: EliteReq) -> JSONResponse:
 async def elite_distress(req: EliteReq) -> JSONResponse:
     try:
         png = await asyncio.to_thread(elite_tools.apply_distress_knockout, await _elite_decode(req), req.intensity, req.seed)
-        return JSONResponse({"ok": True, "png": base64.b64encode(png).decode()})
+        png, design = await asyncio.to_thread(output_store.save_raw, png, OUT_DIR, f"{req.name}-distress", {"source": "prepare", "style": "Distress knockout"})
+        return JSONResponse({"ok": True, "png": base64.b64encode(png).decode(), "design": design})
     except Exception as e:
         return JSONResponse({"ok": False, "reason": str(e)}, status_code=500)
 
@@ -441,7 +576,7 @@ _FALLBACK_UI = """<!doctype html><html><head><meta charset="utf-8"><title>MerchF
 .c{max-width:560px;text-align:center}.k{color:#c9f24b}code{background:#11111c;padding:2px 8px;border-radius:6px}</style></head>
 <body><div class="c"><h1>MerchFlow Pro <span class="k">Engine Online</span></h1>
 <p>The engine is running on <b>127.0.0.1:8000</b>, but the static UI bundle (<code>out/</code>) was not found.</p>
-<p>Build it once with <code>DESKTOP_EXPORT=1 npx next build</code>, or open the cloud dashboard while developing.</p>
+<p>Build it once with <code>npm run build:desktop</code>, or open the cloud dashboard while developing.</p>
 <p><a style="color:#b9a8ff" href="/api/health">/api/health</a> · <a style="color:#b9a8ff" href="/api/accounts/status">/api/accounts/status</a></p>
 </div></body></html>"""
 

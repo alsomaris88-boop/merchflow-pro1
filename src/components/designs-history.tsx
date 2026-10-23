@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   CheckSquare,
   Download,
@@ -22,7 +22,7 @@ import {
   clearDesigns,
   deleteDesigns,
   formatBytes,
-  getDesigns,
+  downloadDesignsZip,
   listDesigns,
   sendToPrepare,
   timeAgo,
@@ -42,36 +42,26 @@ export default function DesignsHistory({ setView }: { setView: (v: ViewKey) => v
   const [zipping, setZipping] = useState(false);
   const [confirmClear, setConfirmClear] = useState(false);
   const [preview, setPreview] = useState<Row | null>(null);
-  const urlsRef = useRef<string[]>([]);
-
-  const revokeAll = useCallback(() => {
-    for (const u of urlsRef.current) URL.revokeObjectURL(u);
-    urlsRef.current = [];
-  }, []);
+  const [error, setError] = useState("");
 
   const load = useCallback(async () => {
-    const recs = await listDesigns();
-    revokeAll();
-    const mapped = recs.map((r) => {
-      const url = URL.createObjectURL(r.blob);
-      urlsRef.current.push(url);
-      return { ...r, url };
-    });
-    setRows(mapped);
-    setSel((prev) => new Set([...prev].filter((id) => mapped.some((m) => m.id === id))));
-    setLoading(false);
-  }, [revokeAll]);
+    try {
+      const records = await listDesigns();
+      const mapped = records.map((record) => ({ ...record, url: record.previewUrl }));
+      setRows(mapped);
+      setSel((previous) => new Set([...previous].filter((id) => mapped.some((row) => row.id === id))));
+      setError("");
+    } catch (e) { setError(e instanceof Error ? e.message : "Could not load disk-backed History"); }
+    finally { setLoading(false); }
+  }, []);
 
   useEffect(() => {
-    void load();
+    const initial = setTimeout(() => void load(), 0);
     const onChange = () => void load();
     window.addEventListener(DESIGNS_EVENT, onChange);
-    return () => {
-      window.removeEventListener(DESIGNS_EVENT, onChange);
-      revokeAll();
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+    const timer = setInterval(onChange, 10000);
+    return () => { clearTimeout(initial); clearInterval(timer); window.removeEventListener(DESIGNS_EVENT, onChange); };
+  }, [load]);
 
   const filtered = useMemo(() => {
     const term = q.trim().toLowerCase();
@@ -106,59 +96,23 @@ export default function DesignsHistory({ setView }: { setView: (v: ViewKey) => v
   }, [setView, working]);
 
   const downloadZip = useCallback(async () => {
-    const set = working();
-    if (!set.length || zipping) return;
-    setZipping(true);
-    try {
-      const JSZip = (await import("jszip")).default;
-      const zip = new JSZip();
-      const recs = await getDesigns(set.map((r) => r.id));
-      const used = new Set<string>();
-      for (const r of recs) {
-        let base = (r.name || "design").replace(/[^a-z0-9_-]+/gi, "-").toLowerCase().slice(0, 48) || "design";
-        let fn = `${base}_${r.w}x${r.h}.png`;
-        let i = 2;
-        while (used.has(fn)) fn = `${base}_${r.w}x${r.h}_${i++}.png`;
-        used.add(fn);
-        zip.file(fn, r.blob);
-      }
-      zip.file(
-        "manifest.csv",
-        [
-          ["File", "Niche", "Style", "Aspect", "Background", "Account", "Width", "Height", "Created"].join(","),
-          ...recs.map((r) =>
-            [
-              `${(r.name || "design").replace(/[^a-z0-9_-]+/gi, "-").toLowerCase()}.png`,
-              r.niche, r.style, r.aspect, r.background, r.account, r.w, r.h,
-              new Date(r.createdAt).toISOString(),
-            ]
-              .map((v) => (/[",\n]/.test(String(v)) ? `"${String(v).replace(/"/g, '""')}"` : String(v)))
-              .join(",")
-          ),
-        ].join("\r\n")
-      );
-      const blob = await zip.generateAsync({ type: "blob", compression: "DEFLATE", compressionOptions: { level: 6 } });
-      const a = document.createElement("a");
-      a.href = URL.createObjectURL(blob);
-      a.download = `merchflow-designs_${new Date().toISOString().slice(0, 10)}_${recs.length}.zip`;
-      a.click();
-      setTimeout(() => URL.revokeObjectURL(a.href), 4000);
-    } catch {
-      /* noop */
-    }
-    setZipping(false);
+    const records = working();
+    if (!records.length || zipping) return;
+    setZipping(true); setError("");
+    try { await downloadDesignsZip(records.map((r) => r.id)); }
+    catch (e) { setError(e instanceof Error ? e.message : "ZIP download failed"); }
+    finally { setZipping(false); }
   }, [working, zipping]);
 
   const deleteSelected = useCallback(async () => {
     if (!sel.size) return;
-    await deleteDesigns([...sel]);
-    setSel(new Set());
+    try { await deleteDesigns([...sel]); setSel(new Set()); }
+    catch (e) { setError(e instanceof Error ? e.message : "Could not remove History entries"); }
   }, [sel]);
 
   const purgeAll = useCallback(async () => {
-    await clearDesigns();
-    setSel(new Set());
-    setConfirmClear(false);
+    try { await clearDesigns(); setSel(new Set()); setConfirmClear(false); }
+    catch (e) { setError(e instanceof Error ? e.message : "Could not clear History"); }
   }, []);
 
   return (
@@ -166,14 +120,16 @@ export default function DesignsHistory({ setView }: { setView: (v: ViewKey) => v
       <PageHead
         kicker="MODULE 02 · DESIGNS LIBRARY & HISTORY"
         title="Every render, one batch away"
-        desc="Designs auto-archive here the moment they finish generating. Multi-select, then hand the whole batch straight to the Prepare Lab, export a ZIP, or purge buffers to reclaim disk and RAM."
+        desc="Designs auto-archive here the moment they finish generating. Multi-select, then hand the whole batch straight to the Prepare Lab, stream a ZIP, or remove history entries without deleting your PNG files."
         right={
           <div className="flex items-center gap-2">
-            <Chip tone="violet"><HardDrive size={11} /> {formatBytes(totalBytes)} cached</Chip>
+            <Chip tone="violet"><HardDrive size={11} /> {formatBytes(totalBytes)} on disk</Chip>
             <Chip tone="lime"><Images size={11} /> {rows.length} archived</Chip>
           </div>
         }
       />
+
+      {error && <div role="alert" className="mb-4 rounded-xl border border-red-400/30 bg-red-500/10 p-4 text-sm text-red-200">{error}</div>}
 
       {/* batch control bar */}
       <Card className="p-4 mb-4 sticky top-[68px] z-30 backdrop-blur-xl">
@@ -221,7 +177,7 @@ export default function DesignsHistory({ setView }: { setView: (v: ViewKey) => v
             </Btn>
             <Btn variant="primary" onClick={() => void downloadZip()} disabled={!filtered.length || zipping}>
               {zipping ? <Loader2 size={14} className="animate-spin" /> : <Package size={14} />}
-              {zipping ? "Zipping…" : "Download ZIP"}
+              {zipping ? "Starting download…" : "Download ZIP"}
             </Btn>
             <Btn variant="danger" onClick={() => void deleteSelected()} disabled={!sel.size}>
               <Trash2 size={14} /> Delete
@@ -241,7 +197,7 @@ export default function DesignsHistory({ setView }: { setView: (v: ViewKey) => v
           <FolderOpen size={30} className="mx-auto text-white/20 mb-4" />
           <div className="text-[14px] font-semibold">No designs archived yet</div>
           <div className="text-[12px] text-white/35 mt-1.5 max-w-sm mx-auto leading-relaxed">
-            Run a batch in the AI Design Generator or Pixel to Pixel — finished renders land here automatically.
+            Generate a design, recreate a concept, or run the Prepare Lab — verified PNGs land here automatically.
           </div>
           <div className="mt-5 flex justify-center gap-2">
             <Btn variant="lime" onClick={() => setView("generator")}>Open Generator</Btn>
@@ -265,7 +221,7 @@ export default function DesignsHistory({ setView }: { setView: (v: ViewKey) => v
               >
                 <div className="checkerboard aspect-[4/5] relative">
                   {/* eslint-disable-next-line @next/next/no-img-element */}
-                  <img src={r.url} alt={r.name} className="w-full h-full object-contain" />
+                  <img src={r.url} alt={r.name} loading="lazy" className="w-full h-full object-contain" />
                   <div className={cx(
                     "absolute top-2 left-2 h-5 w-5 rounded-md border flex items-center justify-center transition-all",
                     on ? "bg-[#c9f24b] border-[#c9f24b] text-black" : "bg-black/60 border-white/25 text-transparent group-hover:border-white/60"
@@ -299,7 +255,7 @@ export default function DesignsHistory({ setView }: { setView: (v: ViewKey) => v
       {rows.length > 0 && (
         <div className="mt-5 flex items-center justify-between flex-wrap gap-3">
           <div className="font-mono2 text-[10px] text-white/25">
-            auto-archived locally (IndexedDB) · blobs purge instantly on clear to free RAM + disk
+            disk-backed History · clearing entries leaves PNG files on disk untouched
           </div>
           <Btn variant="ghost" className="py-2" onClick={() => setView("prepare")}>
             <FlaskConical size={13} /> Open Prepare Lab
@@ -325,15 +281,16 @@ export default function DesignsHistory({ setView }: { setView: (v: ViewKey) => v
             </div>
             <div className="checkerboard rounded-2xl border border-white/10 overflow-hidden max-h-[56vh] flex items-center justify-center">
               {/* eslint-disable-next-line @next/next/no-img-element */}
-              <img src={preview.url} alt={preview.name} className="max-w-full max-h-[56vh] object-contain" />
+              <img src={preview.fileUrl} alt={preview.name} className="max-w-full max-h-[56vh] object-contain" />
             </div>
+            <div className="mt-3 text-[10px] text-[#c9f24b]/75 break-all">{preview.w}×{preview.h} · {preview.dpi} DPI · {preview.path}</div>
             {preview.prompt && (
               <pre className="mt-3 max-h-[90px] overflow-y-auto whitespace-pre-wrap font-mono2 text-[10px] leading-relaxed text-white/45 bg-black/35 border border-white/[0.06] rounded-xl p-3">
                 {preview.prompt}
               </pre>
             )}
             <div className="mt-4 flex justify-end gap-2">
-              <Btn variant="ghost" onClick={() => { const a = document.createElement("a"); a.href = preview.url; a.download = `${preview.name}.png`; a.click(); }}>
+              <Btn variant="ghost" onClick={() => { const a = document.createElement("a"); a.href = preview.fileUrl; a.download = `${preview.name}.png`; a.click(); }}>
                 <Download size={13} /> Download PNG
               </Btn>
               <Btn variant="lime" onClick={() => { sendToPrepare([preview.id]); setPreview(null); setView("prepare"); }}>
@@ -352,14 +309,13 @@ export default function DesignsHistory({ setView }: { setView: (v: ViewKey) => v
             <div className="h-11 w-11 rounded-2xl bg-red-500/15 border border-red-500/30 flex items-center justify-center text-red-300 mb-4">
               <Trash2 size={18} />
             </div>
-            <div className="font-display font-bold text-lg tracking-tight">Purge the entire history?</div>
+            <div className="font-display font-bold text-lg tracking-tight">Clear the entire history?</div>
             <div className="text-[12.5px] text-white/45 mt-2 leading-relaxed">
-              Deletes all {rows.length} archived designs and frees {formatBytes(totalBytes)} of cached image buffers.
-              Files already exported to disk are untouched.
+              Removes all {rows.length} entries from History. The {formatBytes(totalBytes)} of genuine PNG files on disk are untouched.
             </div>
             <div className="mt-5 flex justify-end gap-2">
               <Btn variant="ghost" onClick={() => setConfirmClear(false)}>Cancel</Btn>
-              <Btn variant="danger" onClick={() => void purgeAll()}><Trash2 size={13} /> Purge everything</Btn>
+              <Btn variant="danger" onClick={() => void purgeAll()}><Trash2 size={13} /> Clear history</Btn>
             </div>
           </div>
         </div>

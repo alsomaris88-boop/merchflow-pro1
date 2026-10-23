@@ -75,7 +75,7 @@ echo.
 echo   MerchFlow Pro is UP - one port, zero Node at runtime:
 echo     App + API  %UI_URL%          (served by Python/FastAPI)
 echo     Database   %USERPROFILE%\MerchFlow\merchflow.db  (SQLite, offline)
-echo     Output     %USERPROFILE%\MerchFlow\Output
+if defined MERCHFLOW_OUT (echo     Output     %MERCHFLOW_OUT%) else (echo     Output     %~dp0output)
 echo.
 echo   Leave the engine window running while you work.
 endlocal

@@ -6,7 +6,11 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint .",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "build:desktop": "node scripts/build-desktop.mjs",
+    "test:unit": "tsx --test tests/unit/*.test.ts",
+    "test:e2e": "playwright test",
+    "test:python": "python -m pytest desktop/tests -q"
   },
   "dependencies": {
     "@fontsource/jetbrains-mono": "^5.3.0",
@@ -24,6 +28,7 @@
     "tesseract.js": "^7.0.0"
   },
   "devDependencies": {
+    "@playwright/test": "^1.64.1",
     "@tailwindcss/postcss": "4.1.17",
     "@types/node": "22.19.15",
     "@types/pg": "8.18.0",
@@ -34,6 +39,7 @@
     "eslint-config-next": "16.2.6",
     "postcss": "8.5.8",
     "tailwindcss": "4.1.17",
+    "tsx": "^4.23.15",
     "typescript": "5.9.3"
   }
 }
