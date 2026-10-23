@@ -31,6 +31,24 @@
 - Normal production Next.js build **without** a configured `DATABASE_URL`.
 - Static desktop build to `out/`, with API source restoration.
 
+## Windows launcher follow-up
+
+The full Python suite was re-run after the launcher fix: **46 passed, 1
+intentional opt-in model skip**. This includes 11 new launcher regressions for
+unconditional venv-bound requirements installation, crash logging/exit status,
+visible persistent consoles, embedded PowerShell parsing, healthy readiness,
+the original date-binding failure, early crash detection, deadline expiry and
+rejection of an unrelated service. Python compilation and `git diff --check`
+also passed.
+
+Executable PowerShell checks used **PowerShell 7.6.8 on Linux** with isolated
+health-response test doubles; no production listener or engine was launched by
+these tests. Native `cmd.exe` and Windows PowerShell 5.1 were not available, so
+this is not a Windows startup smoke test. The launcher now waits for the actual
+worker `/api/health` fields (`ok`, `connected`, `unified`), which match the API.
+The frontend and image pipeline are unchanged by this follow-up; their prior
+validation results are recorded above.
+
 ## Scope and limits
 
 Validation ran on Linux with Node 20 / Python 3.13. The browser's batch test

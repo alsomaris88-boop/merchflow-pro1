@@ -16,3 +16,5 @@ playwright-report/
 test-results/
 out/
 next-env.d.ts
+desktop/engine_boot.log
+desktop/engine_boot.exit

@@ -20,7 +20,28 @@ Ship the generated `out/` folder with the Python desktop package. Run
 `run_windows.bat` from the repository root on Windows; it installs the worker
 dependencies and opens `http://127.0.0.1:8000` in an app window.
 
-For two-process development:
+### Windows startup upgrades and crash logs
+
+`run_windows.bat` refreshes `desktop/requirements.txt` on **every normal launch**,
+including when `desktop/.venv_worker` already exists. Both pip and uvicorn use
+that venv's exact `Scripts/python.exe`, not executables resolved from PATH.
+`rembg[cpu]` in the requirements installs rembg and its ONNX Runtime dependency.
+A pip upgrade failure does not skip the requirements install; a requirements
+install failure stops startup and displays its error.
+
+Boot diagnostics, dependency-install output, and combined engine stdout/stderr
+are recorded in **`desktop/engine_boot.log`**. The engine runs in a visible
+console that stays open after it exits and prints the complete log. On startup
+failure, the original launcher console also prints the log and pauses instead
+of disappearing. A fresh exit-status marker lets the readiness check stop
+promptly after a crash; stale status is cleared before each launch.
+
+The launcher checks the actual worker health API before opening the UI. If port
+8000 is already in use, stop the old engine first and rerun the launcher. You do
+not need to delete a working venv just to install newly added dependencies.
+Runtime log/status files are ignored by Git.
+
+### Two-process development
 
 ```sh
 python -m pip install -r desktop/requirements.txt
