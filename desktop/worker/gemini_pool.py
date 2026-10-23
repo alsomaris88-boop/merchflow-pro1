@@ -33,16 +33,40 @@ JITTER = (
     float(os.environ.get("MERCHFLOW_JITTER_MAX", "2" if MOCK else 85)),
 )
 
-FUSION_PROMPT = """Act as a print-on-demand vector artist.
-IMAGE A is an ART-STYLE reference: extract ONLY its color palette, line weight,
-vector shading and surface texture. Completely IGNORE the subject matter of
-Image A — it must never appear in the output.
-IMAGE B is the NICHE SUBJECT: render this exact subject with perfect fidelity,
-redrawn 100% in the extracted style of Image A.
-{TEXT_RULE}
-Composition: single centred subject, clean silhouette edges, apparel design,
-no frames, no watermarks, no mockups.
-Aspect ratio {ASPECT}. Background instruction: {BG}."""
+# ---------------------------------------------------------------------------
+# CLIENT-MANDATED MULTIMODAL DIRECTIVE — injected VERBATIM into every
+# Gemini Pro Style × Niche fusion generation. Do not paraphrase, trim, or
+# reword a single character of the directive body.
+#
+# Reference upload order is contractually bound to this text:
+#   IMAGE 1 (first upload)  = the NICHE SUBJECT   (Dropzone B in Module 01)
+#   IMAGE 2 (second upload) = the ART STYLE        (Dropzone A in Module 01)
+# ---------------------------------------------------------------------------
+FUSION_DIRECTIVE = """[MANDATORY MULTIMODAL DIRECTIVE: STYLE × NICHE COMPLETE FUSION]
+
+I have provided two reference images:
+- IMAGE 1 = The NICHE SUBJECT (The character/object/theme to be drawn)
+- IMAGE 2 = The ART STYLE REFERENCE (The visual DNA, aesthetic, and medium)
+
+YOUR MISSION:
+Completely re-draw and synthesize the core subject of IMAGE 1 entirely inside the exact artistic medium and visual universe of IMAGE 2.
+
+EXECUTION RULES:
+
+1. STYLE EXTRACTION (From IMAGE 2):
+   - Extract the full visual DNA: exact color palette, line weight, shading method, lighting contrast, artistic medium (e.g. vintage screenprint, 90s bootleg rap tee, distressed retro vector, hand-drawn linework, or airbrush texture).
+   - STRICTLY FILTER OUT: Ignore any t-shirt mockups, fabric wrinkles, watermarks, background frames, logos, or overlaid stamps from IMAGE 2.
+
+2. SUBJECT EMBODIMENT (From IMAGE 1):
+   - Capture the essence, character, pose, and distinctive anatomy/features of the subject in IMAGE 1.
+   - Do NOT simply cut and paste IMAGE 1 onto IMAGE 2. You must re-imagine and illustrate the subject from scratch using IMAGE 2's visual grammar, textures, and color hierarchy.
+
+3. PRINT-ON-DEMAND GRAPHIC QUALITY:
+   - Output must be an ultra-high resolution (8K clarity), high-contrast, master apparel graphic design ready for commercial printing.
+   - Razor-sharp edges, vibrant focal subject, zero blur, zero random gibberish or garbled AI text.
+   - Background: Render the isolated graphic cleanly on a pure, solid pitch-black background (#000000) with zero t-shirt collars or garment borders.
+
+Generate the finished master apparel graphic now."""
 
 
 RECREATION_PROMPT = """Recreate the uploaded design concept as fresh, high-detail artwork.
@@ -76,18 +100,27 @@ def _build_prompt(payload: dict) -> str:
         return RECREATION_PROMPT.format(BG=bg, DIRECTION=payload.get("instructions") or "faithful concept recreation")
     text = (payload.get("textOverride") or "").strip()
     text_rule = (
-        f'TEXT OVERRIDE: render exactly the string "{text}" inside the design, '
-        "set in typography matching Image A lettering. Spell it perfectly."
+        f'TEXT OVERRIDE: additionally render exactly the string "{text}" inside the design, '
+        "set in typography matching IMAGE 2's lettering. Spell it perfectly."
         if text
         else "TEXT RULE: generate PURE GRAPHIC ART. Absolutely no letters, words, "
         "numbers or garbled pseudo-text anywhere in the image."
     )
+    # The directive mandates a pitch-black (#000000) backdrop. Only an explicit
+    # operator override below may relax that single clause (e.g. when the local
+    # worker is about to neural-mat the subject onto transparency).
     bg = {
-        "transparent": "subject isolated on a plain backdrop for neural alpha matting; clean edges",
-        "white": "solid white",
-        "black": "solid black",
-    }.get(payload.get("background") or "transparent", "solid white")
-    return FUSION_PROMPT.format(TEXT_RULE=text_rule, ASPECT=(payload.get("aspect") or "4:5"), BG=bg)
+        "transparent": "BACKGROUND OVERRIDE: despite the pitch-black clause above, render the isolated graphic on a plain, uniform, high-contrast backdrop so the local worker can neural-mat it to true transparency; keep edges razor-clean.",
+        "white": "BACKGROUND OVERRIDE: despite the pitch-black clause above, render the isolated graphic on a solid pure white background (RGB 255 255 255) with zero garment borders.",
+    }.get(payload.get("background") or "black")
+    addendum = (
+        "\n\n[RUNTIME OPERATOR SETTINGS — append-only; every clause of the mandatory "
+        "directive above remains in force unless a setting below explicitly overrides it]\n"
+        f"- Canvas aspect ratio: {payload.get('aspect') or '4:5'}.\n"
+        f"- {text_rule}\n"
+        + (f"- {bg}\n" if bg else "")
+    )
+    return FUSION_DIRECTIVE + addendum
 
 
 # --------------------------------------------------------------- clients
@@ -462,7 +495,9 @@ def run_batch(payload: dict, push: Callable[[dict], None], out_dir: Path) -> dic
                 if client is None:
                     raise GeminiAuthError("No live provider session; connect an account in Account Pool")
                 push({"type": "progress", "job": job_id, "pct": 25, "msg": f"[{acct.label}] sending reference to the image provider"})
-                references = [(niche_bytes, "concept-reference.png")] if recreate else [(style_bytes, "style_ref.png"), (niche_bytes, f"niche_{job_id}.png")]
+                # Upload order is the directive contract: niche FIRST (= IMAGE 1
+                # subject), style SECOND (= IMAGE 2 visual DNA). Never reorder.
+                references = [(niche_bytes, "concept-reference.png")] if recreate else [(niche_bytes, f"niche_{job_id}_IMAGE1.png"), (style_bytes, "style_ref_IMAGE2.png")]
                 raw = client.generate_image(prompt, references)
                 POOL.note_render(acct.id)
                 break

@@ -11,7 +11,9 @@ export default function Generator() {
   const [style, setStyle] = useState<ReferenceItem | null>(null);
   const [niches, setNiches] = useState<ReferenceItem[]>([]);
   const [aspect, setAspect] = useState("4:5");
-  const [background, setBackground] = useState("transparent");
+  // The mandated fusion directive renders on pure pitch-black (#000000);
+  // other choices emit an explicit operator override clause in the prompt.
+  const [background, setBackground] = useState("black");
   const [model, setModel] = useState("u2net");
   const [text, setText] = useState("");
   const [bridge, setBridge] = useState<BridgeStatus>({ connected: false });
@@ -51,13 +53,13 @@ export default function Generator() {
 
   return <div>
     <PageHead kicker="MODULE 01 · AI DESIGN GENERATOR" title="Style × Niche fusion"
-      desc="Upload an art-style reference and niche subjects. The connected image provider recreates each subject in the reference style; the local worker mats, verifies, and saves genuine 300 DPI PNGs."
+      desc="Drop niche subjects (IMAGE 1) and the art-style reference (IMAGE 2). Every job injects the mandatory Style × Niche Complete Fusion multimodal directive verbatim; the local worker mats, verifies, and saves genuine 300 DPI PNGs."
       right={<Chip tone={bridge.connected && !bridge.mock ? "lime" : "neutral"}>{bridge.connected ? <PlugZap size={11} /> : <WifiOff size={11} />}{bridge.mock ? "MOCK MODE · GENERATION BLOCKED" : bridge.connected ? "LOCAL ENGINE" : "ENGINE OFFLINE"}</Chip>} />
     {(inputError || generation.error) && <div role="alert" className="mb-4 rounded-xl border border-red-400/30 bg-red-500/10 p-4 text-sm text-red-200">{inputError || generation.error}</div>}
     <div className="grid xl:grid-cols-5 gap-4">
       <div className="xl:col-span-3 space-y-4">
         <div className="grid md:grid-cols-2 gap-4">
-          <Card className="p-4"><Section icon={<ImageUp size={15} />} title="A · Art style" desc="Palette, linework, texture and shading." />
+          <Card className="p-4"><Section icon={<ImageUp size={15} />} title="A · Art style · IMAGE 2" desc="Visual DNA: palette, linework, medium, shading." />
             <div role="button" aria-label="Upload style reference" tabIndex={0} className="dropzone rounded-xl h-[270px] flex items-center justify-center cursor-pointer overflow-hidden"
               onClick={() => { if (!generation.running) styleInput.current?.click(); }}
               onKeyDown={(e) => { if (e.key === "Enter" && !generation.running) styleInput.current?.click(); }}
@@ -70,7 +72,7 @@ export default function Generator() {
             </div>
             {style && <p className="text-xs mt-3 truncate">{style.name}</p>}
           </Card>
-          <Card className="p-4"><Section icon={<Layers size={15} />} title={`B · Niche subjects · ${niches.length}`} desc="All dropped images are queued sequentially." />
+          <Card className="p-4"><Section icon={<Layers size={15} />} title={`B · Niche subjects · IMAGE 1 · ${niches.length}`} desc="All dropped images are queued sequentially." />
             <div role="button" aria-label="Upload niche subjects" tabIndex={0} className="dropzone rounded-xl h-[270px] overflow-y-auto cursor-pointer p-2"
               onClick={() => { if (!generation.running) nicheInput.current?.click(); }}
               onKeyDown={(e) => { if (e.key === "Enter" && !generation.running) nicheInput.current?.click(); }}
@@ -96,7 +98,7 @@ export default function Generator() {
             </Btn>
           </div>
         </Card>
-        <Card className="p-4 text-xs text-white/40 leading-relaxed">The provider determines render quality, text accuracy, account limits and costs. Successful files are saved under <code>{bridge.outDir ?? "output/"}</code> and archived before the UI reports completion. An unavailable provider, empty response or failed disk write is a failed job.</Card>
+        <Card className="p-4 text-xs text-white/40 leading-relaxed">Every fusion job sends both references to the provider paired with the mandatory <em>Style × Niche Complete Fusion</em> directive verbatim — IMAGE 1 niche subject fully re-drawn inside IMAGE 2's visual DNA, 8K apparel quality, pitch-black (#000000) background unless an operator override below relaxes it. The provider determines render quality, text accuracy, account limits and costs. Successful files are saved under <code>{bridge.outDir ?? "output/"}</code> and archived before the UI reports completion. An unavailable provider, empty response or failed disk write is a failed job.</Card>
       </div>
       <div className="xl:col-span-2"><ProductionQueue jobs={generation.jobs} logs={generation.logs} /></div>
     </div>
