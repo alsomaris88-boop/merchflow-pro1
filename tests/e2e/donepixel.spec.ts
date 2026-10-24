@@ -113,7 +113,7 @@ test("retained files can be regenerated on another colour as a fresh archived ba
     return (await (await request.get(`/api/bridge/p2p/batches/${id}`)).json()).batch;
   };
   const first = await generate();
-  await page.getByRole("radio", { name: "⚪ Pure White (#FFFFFF)", exact: true }).click();
+  await page.getByRole("radio", { name: "⚪ White (#FFFFFF)", exact: true }).click();
   const second = await generate();
   expect(first.background).toBe("#000000"); expect(second.background).toBe("#FFFFFF");
   expect(first.id).not.toBe(second.id);

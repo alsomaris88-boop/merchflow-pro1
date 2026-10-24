@@ -93,12 +93,12 @@ test("provider authentication errors stay failed; there is no simulated generato
   await expect(page.getByText("failed", { exact: true })).toBeVisible();
 });
 
-for (const [label, hex] of [["⚫ Pitch Black (#000000)", "#000000"], ["⚪ Pure White (#FFFFFF)", "#FFFFFF"]]) {
+for (const [label, hex] of [["⚫ Black (#000000)", "#000000"], ["⚪ White (#FFFFFF)", "#FFFFFF"]]) {
   test(`Pixel to Pixel sends the exact ${label} background and never fakes an authenticated render`, async ({ page }) => {
     await mockNoProvider(page);
     await page.goto("/");
     await page.getByRole("button", { name: "Pixel to Pixel", exact: true }).click();
-    await expect(page.getByRole("radio", { name: "⚫ Pitch Black (#000000)", exact: true })).toHaveAttribute("aria-checked", "true");
+    await expect(page.getByRole("radio", { name: "⚫ Black (#000000)", exact: true })).toHaveAttribute("aria-checked", "true");
     await page.locator("#p2p-files").setInputFiles(fixture);
     const option = page.getByRole("radio", { name: label, exact: true });
     await option.click(); await expect(option).toHaveAttribute("aria-checked", "true");

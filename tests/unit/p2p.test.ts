@@ -17,8 +17,8 @@ function storage() {
 
 test("Donepixel target background is a binary toggle anchored on the mandated defaults", () => {
   assert.deepEqual(COLOUR_SWATCHES.map((s) => s.hex), ["#000000", "#FFFFFF"]);
-  assert.equal(COLOUR_SWATCHES[0].label, "⚫ Pitch Black (#000000)");
-  assert.equal(COLOUR_SWATCHES[1].label, "⚪ Pure White (#FFFFFF)");
+  assert.equal(COLOUR_SWATCHES[0].label, "⚫ Black (#000000)");
+  assert.equal(COLOUR_SWATCHES[1].label, "⚪ White (#FFFFFF)");
   for (const n of [1, 5, 20, 50, 101, 217]) assert.equal(generationLabel(n), `${n} designs in, ${n} back on your colour. ▷ Generate`);
   assert.equal(normaliseHex("#aBcDeF"), "#ABCDEF");
   assert.throws(() => normaliseHex("#ABC"));

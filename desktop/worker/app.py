@@ -23,6 +23,7 @@ from contextlib import asynccontextmanager
 import base64
 import json
 import os
+import shutil
 import threading
 import time
 import uuid
@@ -36,7 +37,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Streamin
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import browser, db, elite_tools, gemini_pool, image_lab, output_store, p2p_batches, trademark_shield, trends_local
+from . import browser, db, elite_tools, gemini_cdp, gemini_pool, image_lab, output_store, p2p_batches, trademark_shield, trends_local
 
 WORKER_VERSION = "2.3.0-donepixel"
 
@@ -56,6 +57,8 @@ STATIC_DIR = next((p for p in STATIC_CANDIDATES if p and (p / "index.html").exis
 async def lifespan(_app):
     await asyncio.to_thread(p2p_batches.recover, OUT_DIR)
     yield
+    # Never leave orphaned headless Chrome processes holding account profiles.
+    await asyncio.to_thread(gemini_pool.shutdown_clients)
 
 
 app = FastAPI(title="MerchFlow Local Engine", version=WORKER_VERSION, lifespan=lifespan)
@@ -110,6 +113,19 @@ class AccountPatchReq(BaseModel):
 @app.patch("/api/accounts")
 async def api_accounts_patch(req: AccountPatchReq) -> dict:
     return db.patch_account(req.id, req.status)
+
+
+@app.delete("/api/accounts/{account_id}")
+@app.delete("/api/bridge/accounts/{account_id}")
+async def api_accounts_delete(account_id: int) -> dict:
+    """Remove an account everywhere: pool lease, headless Chrome, SQLite row and its
+    isolated profile folder (which holds the Google session)."""
+    removed = await asyncio.to_thread(gemini_pool.POOL.remove_account, account_id)
+    deleted = db.delete_account(account_id)["deleted"]
+    folder = gemini_cdp.profile_dir(account_id)
+    if folder.exists():
+        await asyncio.to_thread(shutil.rmtree, folder, True)
+    return {"ok": True, "removed": bool(removed or deleted), "profileDeleted": not folder.exists()}
 
 
 # ------------------------------------------------------------------ jobs

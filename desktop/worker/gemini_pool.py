@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from . import gemini_client, image_lab
+from . import gemini_cdp, gemini_client, image_lab
 from .gemini_client import GeminiAuthError, GeminiRenderError, ModelDegradedError
 
 CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "gemini_accounts.json"
@@ -164,6 +164,8 @@ class AccountState:
     total_generated: int = 0
     daily_cap: int = 200                   # 200+ designs/day across the loop
     weekly_cap: int = 1400
+    engine: str = "cookies"                # "cdp" = persistent Chrome profile (headless)
+    profile_dir: str = ""                  # desktop/profiles/account_<id> for engine="cdp"
 
     @property
     def label(self) -> str:
@@ -181,12 +183,16 @@ class AccountPool:
 
     # ------------------------------ persistence
     def _load(self) -> None:
+        # No config → ZERO accounts. Placeholder slots are never invented.
         try:
             data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
             rows = data.get("accounts", [])
         except Exception:
-            rows = [{"id": i} for i in range(1, 6)]
+            rows = []
         for r in rows:
+            engine = r.get("engine") or "cookies"
+            if engine != "cdp" and not r.get("secure_1psid"):
+                continue  # legacy empty placeholder slot (never signed in) — drop it
             a = AccountState(
                 id=int(r.get("id", self.accounts.__len__() + 1)),
                 email=r.get("email", ""),
@@ -200,12 +206,28 @@ class AccountPool:
                 daily_used=int(r.get("daily_used", 0)),
                 weekly_used=int(r.get("weekly_used", 0)),
                 total_generated=int(r.get("total_generated", 0)),
+                engine=engine,
+                profile_dir=r.get("profile_dir", ""),
             )
-            if r.get("status") and not a.secure_1psid:
+            if engine == "cdp":
+                live = bool(a.profile_dir) and Path(a.profile_dir).exists()
+                a.is_pro = live
+                a.status = ("cooldown" if a.cooldown_until > time.time() else "ready") if live else "auth-required"
+            elif r.get("status") and not a.secure_1psid:
                 a.status = r.get("status")
             elif a.secure_1psid:
                 a.status = "cooldown" if a.cooldown_until > time.time() else "ready"
             self.accounts.append(a)
+        # SQLite is the record of signed-in profiles; restore any the JSON lacks.
+        known = {a.id for a in self.accounts}
+        for row in _sqlite_cdp_accounts():
+            if int(row["id"]) in known:
+                continue
+            live = Path(row["profile_dir"]).exists()
+            self.accounts.append(AccountState(
+                id=int(row["id"]), email=row.get("email") or "", provider=row.get("provider") or "chrome",
+                engine="cdp", profile_dir=row["profile_dir"], is_pro=live,
+                status="ready" if live else "auth-required"))
         self.accounts.sort(key=lambda a: a.id)
 
     def save(self) -> None:
@@ -218,6 +240,7 @@ class AccountPool:
                     "cooldown_until": a.cooldown_until, "is_pro": a.is_pro,
                     "daily_used": a.daily_used, "weekly_used": a.weekly_used,
                     "total_generated": a.total_generated,
+                    "engine": a.engine, "profile_dir": a.profile_dir,
                 }
                 for a in self.accounts
             ]
@@ -230,7 +253,11 @@ class AccountPool:
 
     def _warm_clients(self) -> None:
         for a in self.accounts:
-            if a.secure_1psid:
+            if a.engine == "cdp":
+                # Lazy: no Chrome starts until the first job leases this account.
+                if a.profile_dir and Path(a.profile_dir).exists():
+                    _register_client(a.id, gemini_cdp.CdpGeminiClient(a.id, a.provider, a.label, a.profile_dir))
+            elif a.secure_1psid:
                 _register_client(a.id, gemini_client.GeminiClient(a.secure_1psid, a.secure_1psidts or None, a.label))
 
     # ------------------------------ window lifecycle
@@ -285,6 +312,41 @@ class AccountPool:
                 acct.is_pro = False
             self.save()
             return {"ok": False, "authed": False, "reason": str(e), "email": acct.email, "label": acct.label}
+
+    def register_cdp_profile(self, account_id: int, email: str, provider: str, profile_dir: str) -> dict:
+        """A human just signed in inside the isolated profile — make it a headless worker."""
+        with self.lock:
+            acct = next((a for a in self.accounts if a.id == account_id), None)
+            if acct is None:
+                acct = AccountState(id=account_id)
+                self.accounts.append(acct)
+                self.accounts.sort(key=lambda x: x.id)
+            acct.engine, acct.profile_dir, acct.provider = "cdp", profile_dir, provider
+            acct.secure_1psid = acct.secure_1psidts = ""
+            if email:
+                acct.email = email
+            acct.is_pro, acct.status = True, "ready"
+            acct.window_usage, acct.cooldown_until = 0, 0.0
+        _register_client(account_id, gemini_cdp.CdpGeminiClient(account_id, provider, acct.label, profile_dir))
+        self.save()
+        return {"ok": True, "authed": True, "email": acct.email, "label": acct.label, "provider": provider,
+                "headless": True, "engine": "cdp", "profileDir": profile_dir, "cdpPort": gemini_cdp.cdp_port(account_id)}
+
+    def release_profile(self, account_id: int) -> None:
+        """Stop a profile's headless Chrome so a visible window can open it."""
+        client = client_for(account_id)
+        if client is not None and hasattr(client, "close"):
+            client.close()
+
+    def remove_account(self, account_id: int) -> bool:
+        with self.condition:
+            before = len(self.accounts)
+            self.accounts = [a for a in self.accounts if a.id != account_id]
+            self._busy.discard(account_id)
+            self.condition.notify_all()
+        _register_client(account_id, None)
+        self.save()
+        return len(self.accounts) != before
 
     def verify_cookies(self, account_id: int, psid: str, psidts: str, label: str | None, email: str | None) -> dict:
         with self.lock:
@@ -412,6 +474,10 @@ class AccountPool:
                         "hasCookies": bool(a.secure_1psid),
                         "isPro": a.is_pro,
                         "headless": True,
+                        "engine": a.engine,
+                        "transport": "cdp-headless" if a.engine == "cdp" else "httpx-rpc",
+                        "cdpPort": gemini_cdp.cdp_port(a.id) if a.engine == "cdp" else None,
+                        "profileDir": a.profile_dir,
                         "windowUsage": a.window_usage,
                         "windowCap": WINDOW_CAP,
                         "windowSeconds": WINDOW_SECONDS,
@@ -425,6 +491,26 @@ class AccountPool:
                     }
                 )
             return out
+
+
+def _sqlite_cdp_accounts() -> list[dict]:
+    try:
+        from . import db
+
+        return db.list_cdp_accounts()
+    except Exception:
+        return []
+
+
+def shutdown_clients() -> None:
+    """Close every provider client (terminates headless Chrome processes)."""
+    with _clients_lock:
+        clients = list(CLIENTS.values())
+    for client in clients:
+        try:
+            client.close()
+        except Exception:
+            pass
 
 
 POOL = AccountPool()

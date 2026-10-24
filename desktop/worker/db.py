@@ -73,20 +73,17 @@ DEMO_KEYS = {
     "MF-STARTER-DEMO-2026-0003": {"plan": "starter", "seats": 2},
 }
 
-SEED_ACCOUNTS = [
-    ("Profile 01", "merchflow.alpha@gmail.com", "chrome", "active", 21, 812),
-    ("Profile 02", "mf.bravo.studio@gmail.com", "brave", "ready", 9, 655),
-    ("Profile 03", "charlie.prints.mf@gmail.com", "chrome", "cooldown", 38, 944),
-    ("Profile 04", "delta.merchlab@gmail.com", "edge", "ready", 3, 431),
-    ("Profile 05", "echo.podworks@gmail.com", "brave", "ready", 0, 209),
-]
-
-SEED_JOBS = [
-    ("Retro Wavy", "Pickleball", "4:5", "transparent", "", "Profile 01", 71000, 240),
-    ("Kawaii", "Axolotl", "4:5", "white", "", "Profile 02", 68000, 720),
-    ("Distressed Badge", "Welder Skull", "4:5", "transparent", "", "Profile 03", 74000, 2640),
-    ("Linework", "Celestial Moth", "4:5", "black", "", "Profile 04", 66000, 5280),
-]
+# Accounts are NEVER seeded: the Account Manager starts with 0 accounts and
+# grows only through a real "+ Add Gemini Account" sign-in. These identities
+# were seeded by earlier builds; init() purges them from existing databases.
+LEGACY_SEED_EMAILS = (
+    "merchflow.alpha@gmail.com", "mf.bravo.studio@gmail.com", "charlie.prints.mf@gmail.com",
+    "delta.merchlab@gmail.com", "echo.podworks@gmail.com",
+)
+LEGACY_SEED_JOBS = (
+    ("Retro Wavy", "Pickleball"), ("Kawaii", "Axolotl"),
+    ("Distressed Badge", "Welder Skull"), ("Linework", "Celestial Moth"),
+)
 
 SEED_LISTINGS = [
     (
@@ -121,33 +118,29 @@ def conn() -> sqlite3.Connection:
 
 
 def init() -> None:
+    fresh = not DB_PATH.exists()
     with _lock, conn() as c:
         c.executescript(SCHEMA)
         columns = {row["name"] for row in c.execute("PRAGMA table_info(listings)")}
         for name in ("design_id", "design_path"):
             if name not in columns:
                 c.execute(f"ALTER TABLE listings ADD COLUMN {name} TEXT NOT NULL DEFAULT ''")
-        n = c.execute("SELECT COUNT(*) AS n FROM accounts").fetchone()["n"]
-        if n == 0:
-            for label, email, provider, status, used, total in SEED_ACCOUNTS:
+        account_columns = {row["name"] for row in c.execute("PRAGMA table_info(accounts)")}
+        if "profile_dir" not in account_columns:
+            c.execute("ALTER TABLE accounts ADD COLUMN profile_dir TEXT NOT NULL DEFAULT ''")
+        if "engine" not in account_columns:
+            c.execute("ALTER TABLE accounts ADD COLUMN engine TEXT NOT NULL DEFAULT ''")
+        # Purge the fake demo accounts (and their fake job history) from older installs.
+        marks = ",".join("?" * len(LEGACY_SEED_EMAILS))
+        c.execute(f"DELETE FROM accounts WHERE profile_dir='' AND email IN ({marks})", LEGACY_SEED_EMAILS)
+        for style, niche in LEGACY_SEED_JOBS:
+            c.execute("DELETE FROM jobs WHERE style_name=? AND niche_name=? AND account_label LIKE 'Profile 0%'", (style, niche))
+        if fresh and c.execute("SELECT COUNT(*) AS n FROM listings").fetchone()["n"] == 0:
+            for row in SEED_LISTINGS:  # sample listing copy only; never accounts
                 c.execute(
-                    "INSERT INTO accounts (label,email,provider,status,daily_used,total_generated,created_at) VALUES (?,?,?,?,?,?,?)",
-                    (label, email, provider, status, used, total, time.time()),
+                    "INSERT INTO listings (niche,brand,title,bullet1,bullet2,tp_title,tp_description,main_tag,tags,risk_score,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    (*row[:-1], time.time() - row[-1]),
                 )
-            n2 = c.execute("SELECT COUNT(*) AS n FROM jobs").fetchone()["n"]
-            if n2 == 0:
-                for s1, s2, asp, bg, txt, acct, ms, ago in SEED_JOBS:
-                    c.execute(
-                        "INSERT INTO jobs (style_name,niche_name,aspect,background,text_override,account_label,duration_ms,created_at) VALUES (?,?,?,?,?,?,?,?)",
-                        (s1, s2, asp, bg, txt, acct, ms, time.time() - ago),
-                    )
-            n3 = c.execute("SELECT COUNT(*) AS n FROM listings").fetchone()["n"]
-            if n3 == 0:
-                for row in SEED_LISTINGS:
-                    c.execute(
-                        "INSERT INTO listings (niche,brand,title,bullet1,bullet2,tp_title,tp_description,main_tag,tags,risk_score,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                        (*row[:-1], time.time() - row[-1]),
-                    )
 
 # ------------------------------------------------------------------ helpers
 
@@ -162,10 +155,35 @@ def list_accounts() -> list[dict]:
         {
             "id": r["id"], "label": r["label"], "email": r["email"], "provider": r["provider"],
             "status": r["status"], "dailyUsed": r["daily_used"], "dailyCap": r["daily_cap"],
-            "totalGenerated": r["total_generated"],
+            "totalGenerated": r["total_generated"], "profileDir": r["profile_dir"], "engine": r["engine"],
         }
         for r in rows
     ]
+
+
+def list_cdp_accounts() -> list[dict]:
+    """Accounts backed by a persistent isolated Chrome profile (headless CDP engine)."""
+    return _rows("SELECT * FROM accounts WHERE engine='cdp' AND profile_dir!='' ORDER BY id ASC")
+
+
+def upsert_gemini_account(account_id: int, label: str, email: str, provider: str, profile_dir: str) -> dict:
+    """Record a signed-in Gemini profile; the id is the profile slot (account_<id>)."""
+    with _lock, conn() as c:
+        c.execute(
+            """INSERT INTO accounts (id,label,email,provider,status,profile_dir,engine,created_at)
+               VALUES (?,?,?,?,'ready',?,'cdp',?)
+               ON CONFLICT(id) DO UPDATE SET label=excluded.label,
+                 email=CASE WHEN excluded.email!='' THEN excluded.email ELSE accounts.email END,
+                 provider=excluded.provider, status='ready', profile_dir=excluded.profile_dir, engine='cdp'""",
+            (int(account_id), label[:40], email[:120], provider[:20], profile_dir[:1000], time.time()),
+        )
+        return {"ok": True, "item": {"id": int(account_id)}}
+
+
+def delete_account(account_id: int) -> dict:
+    with _lock, conn() as c:
+        cur = c.execute("DELETE FROM accounts WHERE id=?", (int(account_id),))
+        return {"ok": True, "deleted": cur.rowcount}
 
 
 def add_account(label: str, email: str, provider: str) -> dict:

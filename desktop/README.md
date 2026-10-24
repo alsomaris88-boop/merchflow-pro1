@@ -91,13 +91,57 @@ chunks, stores already-compressed PNGs without recompression, and disambiguates
 duplicate filenames. Neither browser nor Next.js holds an archive-sized Blob.
 The PNGs in the ZIP are the exact bytes on disk, including DPI and alpha.
 
+### Gemini accounts — isolated Chrome profiles driven over CDP
+
+The Account Manager starts with **zero accounts**; nothing is seeded. Clicking
+**+ Add Gemini Account** launches a real, visible Chrome window:
+
+```
+chrome --user-data-dir="desktop/profiles/account_<id>" --app="https://gemini.google.com/app"
+       --remote-debugging-port=<9500+id>
+```
+
+You sign in manually (password, 2FA and passkeys all work — it is a genuine
+browser). A CDP sensor polls every 1.5 s; once the tab is on
+`gemini.google.com/app`, the prompt box is present, no *Sign in* button is
+shown and the session is live, the account is written to SQLite
+(`accounts.engine = 'cdp'`, `accounts.profile_dir`) and the window is closed.
+
+Every generation then reopens **the same profile headlessly**
+(`--headless=new`, DevTools port `9222 + id − 1`; each profile is its own
+Chrome process, so parallel accounts need separate ports). Credentials are
+never requested again and no cookies are copied out of the profile.
+`desktop/worker/gemini_cdp.py` drives Gemini's normal chat input:
+
+1. dispatch the reference file(s) to `<input type="file" accept="image/*">`
+   (fallbacks: the attachment menu's intercepted file chooser, then native
+   drag-and-drop onto the rich-textarea);
+2. **Gate 1** — wait for the thumbnail card in the input container;
+3. inject the exact prompt into the rich-textarea with `Input.insertText`;
+4. submit with `button[aria-label="Send message"]` (Enter fallback);
+   **Gate 2** — the user bubble must carry the attached image;
+5. wait for the response, then extract the image at full size: the
+   *Download full size image* button with browser-level
+   `Browser.setDownloadBehavior`, falling back to an in-page `=s0` original
+   fetch, then `canvas.toDataURL` at natural size (thumbnails < 256 px are
+   rejected);
+6. return **exactly one** image — extra images in a response are ignored.
+
+Refusals and text-only answers fail the job; image-limit messages trigger the
+account's cooldown. Removing an account deletes its SQLite row and its profile
+folder. `desktop/profiles/` and `desktop/config/gemini_accounts.json` hold live
+sessions and are git-ignored. Gemini's DOM changes over time; all selectors
+live in `gemini_cdp.SELECTORS`. Tests drive real headless Chromium against a
+local DOM stand-in (`tests/support/fake_gemini.py`); a live Google sign-in
+still needs a manual smoke test on Windows.
+
 ### Dynamic Donepixel Pixel to Pixel
 
 The new `src/components/modules/pixel-to-pixel.tsx` accepts **1, 5, 20, 50, 100+
 images**, with no fixed batch-count cap. The counter and Generate label reflect
 exactly N files. Each thumbnail has Remove; Clear all releases object URLs.
-The target background is a crystal-clear binary toggle: **⚫ Pitch Black
-`#000000` (default)** or **⚪ Pure White `#FFFFFF`**.
+The target background is a crystal-clear binary toggle: **⚫ Black
+`#000000` (default)** or **⚪ White `#FFFFFF`**.
 
 Every run is a strict 1:1 operation: ONE input produces EXACTLY ONE design —
 never 3 variations — saved directly to `output/` and registered in Designs

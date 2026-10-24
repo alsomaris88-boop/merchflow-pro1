@@ -39,6 +39,9 @@ interface Account {
   cooldownUntil?: number | null;
   cooldownRemaining?: number;
   isPro?: boolean;
+  engine?: string;
+  cdpPort?: number | null;
+  profileDir?: string;
 }
 
 interface WorkerCard {
@@ -61,6 +64,10 @@ interface WorkerCard {
   windowSeconds?: number;
   cooldownUntil?: number | null;
   cooldownRemaining?: number;
+  engine?: string;
+  transport?: string;
+  cdpPort?: number | null;
+  profileDir?: string;
 }
 
 interface FlowState {
@@ -73,8 +80,8 @@ interface FlowState {
 }
 
 const PROVIDERS = [
-  { key: "brave", label: "Brave" },
   { key: "chrome", label: "Google Chrome" },
+  { key: "brave", label: "Brave" },
 ] as const;
 
 const CLOSED_EARLY = "The sign-in window was closed before sign-in finished.";
@@ -91,7 +98,7 @@ export default function Accounts() {
 
   // login modal
   const [open, setOpen] = useState(false);
-  const [provider, setProvider] = useState<"brave" | "chrome">("brave");
+  const [provider, setProvider] = useState<"brave" | "chrome">("chrome");
   const [flowId, setFlowId] = useState<string | null>(null);
   const [flow, setFlow] = useState<FlowState | null>(null);
   const [starting, setStarting] = useState(false);
@@ -104,7 +111,8 @@ export default function Accounts() {
     try {
       const r = await fetch("/api/accounts");
       const d = await r.json();
-      if (Array.isArray(d.items) && d.items.length) setItems(d.items);
+      // Zero is a valid answer: the Account Manager starts empty and shrinks on delete.
+      if (Array.isArray(d.items)) setItems(d.items);
     } catch {
       /* keep */
     }
@@ -143,7 +151,7 @@ export default function Accounts() {
   const items = useMemo(() => {
       const next = [...localItems];
       for (const [id, w] of workers) {
-        if (!w.email && !w.hasCookies) continue;
+        if (!w.email && !w.hasCookies && w.engine !== "cdp") continue;
         const i = next.findIndex((n) => n.id === id);
         const merged: Account = {
           id,
@@ -162,6 +170,9 @@ export default function Accounts() {
           cooldownUntil: w.cooldownUntil ?? null,
           cooldownRemaining: w.cooldownRemaining ?? 0,
           isPro: w.isPro,
+          engine: w.engine,
+          cdpPort: w.cdpPort ?? null,
+          profileDir: w.profileDir,
         };
         if (i === -1) next.push(merged);
         else next[i] = { ...next[i], ...merged };
@@ -243,6 +254,12 @@ export default function Accounts() {
 
   const forget = useCallback(
     async (id: number) => {
+      if (!window.confirm(`Remove Profile ${String(id).padStart(2, "0")}? Its isolated Chrome profile (and the Google session inside it) is deleted from this computer.`)) return;
+      try {
+        await fetch(`/api/accounts/${id}`, { method: "DELETE" });
+      } catch {
+        /* engine offline — still hide locally; it will reappear if it still exists */
+      }
       setWorkers((m) => {
         const n = new Map(m);
         n.delete(id);
@@ -296,7 +313,7 @@ export default function Accounts() {
       <PageHead
         kicker="MODULE 08 · ACCOUNT POOL"
         title="Add a Gemini account"
-        desc="Pick a browser, then sign in once in the window that opens. The account runs hidden and on its own — every generation after that is a silent HTTP request, never a browser window."
+        desc="Click + Add Gemini Account: a real Chrome window opens on gemini.google.com with its own isolated profile (desktop/profiles/account_N). Sign in once — password, 2FA or passkey. The window closes itself, and every generation afterwards drives that same profile headlessly over CDP."
         right={
           <div className="flex items-center gap-2">
             {bridge.connected ? (
@@ -305,7 +322,7 @@ export default function Accounts() {
               <Chip tone="neutral"><WifiOff size={11} /> ENGINE OFFLINE</Chip>
             )}
             <Btn variant="lime" className="py-2" onClick={() => { setOpen(true); setFatal(null); }}>
-              <Plus size={14} /> Add account
+              <Plus size={14} /> Add Gemini Account
             </Btn>
           </div>
         }
@@ -338,9 +355,9 @@ export default function Accounts() {
           </div>
           <div className="text-[14px] font-semibold">No accounts linked yet</div>
           <div className="text-[12px] text-white/35 mt-1.5 max-w-sm mx-auto leading-relaxed">
-            Add your first Gemini account — one sign-in, then it runs hidden forever.
+            The Account Manager starts empty. Add your first Gemini account — sign in once, then it runs headless.
           </div>
-          <Btn variant="lime" className="mt-5" onClick={() => setOpen(true)}><Plus size={14} /> Add and sign in</Btn>
+          <Btn variant="lime" className="mt-5" onClick={() => setOpen(true)}><Plus size={14} /> Add Gemini Account</Btn>
         </Card>
       ) : (
         <div className="grid sm:grid-cols-2 xl:grid-cols-3 gap-4">
@@ -406,12 +423,14 @@ export default function Accounts() {
                   <div className="space-y-1.5 flex-1">
                     <Row icon={<Layers size={9} />} k="lifetime" v={String((a.totalGenerated ?? 0).toLocaleString())} />
                     <Row icon={<Timer size={9} />} k="jitter" v="65–85s" />
-                    <Row icon={<Zap size={9} />} k="transport" v="httpx RPC" />
+                    <Row icon={<Zap size={9} />} k="transport" v={a.engine === "cdp" ? `CDP :${a.cdpPort ?? 9222}` : "httpx RPC"} />
                   </div>
                 </div>
 
                 <div className="rounded-lg bg-black/30 border border-white/[0.05] px-2.5 py-1.5 mb-3 font-mono2 text-[9px] text-white/30 truncate">
-                  {isReady ? "HIDDEN · silent session · batchexecute maZAc" : "sign in once to activate this slot"}
+                  {a.engine === "cdp"
+                    ? (isReady ? `HEADLESS · chrome --headless=new · ${a.profileDir || `profiles/account_${a.id}`}` : "session expired — remove and add this account again")
+                    : isReady ? "LEGACY · cookie session · batchexecute" : "sign in once to activate this slot"}
                 </div>
 
                 <div className="flex gap-2">
@@ -462,10 +481,10 @@ export default function Accounts() {
                       Signed in
                     </div>
                     <div className="font-mono2 text-[12px] text-white/70 mt-2">
-                      {flow.email || "account"}@gmail.com
+                      {flow.email || flow.label || "Gemini account"}
                     </div>
                     <div className="text-[12px] text-white/40 mt-3 max-w-[340px] mx-auto leading-relaxed">
-                      The sign-in window has been closed. This account now runs hidden — no browser window will open again.
+                      Session detected and saved to SQLite. The setup window has been closed — generations now reuse this profile headlessly and never ask for credentials again.
                     </div>
                     <Btn variant="lime" className="mt-5" onClick={dismissLogin}>Done</Btn>
                   </>
@@ -475,8 +494,8 @@ export default function Accounts() {
                       Waiting for you to sign in
                     </div>
                     <div className="text-[12.5px] text-white/40 mt-2 max-w-[340px] mx-auto leading-relaxed">
-                      The {providerLabel(flow?.provider || provider)} window is open on Google&apos;s sign-in page.
-                      Enter your email and password — 2FA is fine.
+                      A {providerLabel(flow?.provider || provider)} window is open on gemini.google.com with an isolated profile.
+                      Sign in there — password, 2FA and passkeys all work. It closes automatically once Gemini loads.
                     </div>
                     <div className="mt-5 flex items-center justify-center gap-2 font-mono2 text-[10.5px] text-white/35">
                       <span className="h-1.5 w-1.5 rounded-full bg-[#c9f24b] pulse-dot" />
@@ -503,7 +522,7 @@ export default function Accounts() {
                   </button>
                 </div>
                 <div className="text-[13px] text-white/45 leading-relaxed mb-6">
-                  Pick a browser, then sign in once in the window that opens. The account runs hidden and on its own.
+                  A real browser window opens with its own isolated profile. Sign in once; afterwards the account runs headless over the Chrome DevTools Protocol.
                 </div>
 
                 <div className="font-mono2 text-[10px] tracking-[0.2em] text-white/40 mb-2.5">BROWSER</div>
@@ -536,7 +555,7 @@ export default function Accounts() {
 
                 <Btn variant="lime" className="w-full justify-center py-3" onClick={() => void beginLogin()} disabled={starting}>
                   {starting ? <Loader2 size={15} className="animate-spin" /> : <Plus size={15} />}
-                  {starting ? "Opening window…" : "Add and sign in"}
+                  {starting ? "Opening window…" : "Open Gemini sign-in"}
                 </Btn>
 
                 {fatal && (
@@ -549,7 +568,7 @@ export default function Accounts() {
                 <div className="mt-6 pt-5 border-t border-white/[0.07] flex items-start gap-2.5">
                   <ShieldCheck size={14} className="text-[#c9f24b] mt-0.5 shrink-0" />
                   <div className="text-[11.5px] text-white/40 leading-relaxed">
-                    Chrome or Brave. Your everyday browsing is never touched. Each account is its own hidden profile that you sign into once.
+                    Your everyday browser profile is never touched. Each account lives in desktop/profiles/account_N — no passwords or cookies are copied out of it.
                   </div>
                 </div>
 

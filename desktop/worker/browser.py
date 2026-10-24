@@ -1,202 +1,60 @@
 """
-MerchFlow Pro — one-time interactive login spawner (Donepixel UX).
+MerchFlow Pro — "+ Add Gemini Account" login flow (isolated Chrome profile).
 
-IMPORTANT ARCHITECTURE
-  The browser window is used ONLY to let a human sign in once. The moment the
-  sensor sees an authenticated gemini.google.com/app page it harvests the
-  session cookies + account email, PERSISTS them, and closes the window.
+  spawn_login_flow("chrome")
+    └─ real, visible Chrome window, driven over CDP:
+         chrome --user-data-dir="desktop/profiles/account_<id>"
+                --app="https://gemini.google.com/app"
+                --remote-debugging-port=<login port>
+    └─ the human signs in manually — password, 2FA, passkey all work because
+       it is a genuine browser window, never an embedded/automated form
+    └─ sensor polls every 1.5 s over CDP
+         ├─ URL matches gemini.google.com/app AND the session is live
+         │    → record the account in local SQLite + the provider pool
+         │    → Browser.close (releases the profile lock) → state=authenticated
+         └─ user closed the window first → state=closed
 
-  Every subsequent generation is 100% headless HTTP (gemini_client.py /
-  batchexecute). No browser window is ever opened during generation.
-
-Flow
-  spawn_login_flow("brave")
-    └─ isolated window → https://accounts.google.com
-    └─ sensor polls every 1.5s
-         ├─ user finished → extract email + __Secure-1PSID(/TS) → verify
-         │   SNlM0e → persist to pool → Browser.close() → state=authenticated
-         └─ user closed window early → state=closed
-              "The sign-in window was closed before sign-in finished."
+  Every later generation reopens the SAME profile with --headless=new
+  (gemini_cdp.CdpGeminiClient), so credentials are never requested again.
+  No cookies are copied out of the profile.
 """
 from __future__ import annotations
 
-import json
-import os
-import re
-import subprocess
-import sys
 import threading
 import time
 import uuid
 from pathlib import Path
 
-import httpx
+from . import gemini_cdp
+from .gemini_cdp import PROVIDER_LABELS, CDPSession
 
-IS_WIN = sys.platform.startswith("win")
-APPDATA = Path(os.environ.get("LOCALAPPDATA") or (Path.home() / ".merchflow"))
-PROFILE_ROOT = APPDATA / "MerchFlow" / "Profiles"
-LOGIN_URL = "https://accounts.google.com/"
-APP_URL = "https://gemini.google.com/app"
 POLL_SECONDS = 1.5
-FLOW_TIMEOUT = 15 * 60  # generous window for 2FA / password recovery
-
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/57.36"
-)
-
-PROVIDER_LABELS = {
-    "brave": "Brave",
-    "chrome": "Google Chrome",
-    "edge": "Microsoft Edge",
-}
-
-EXE_CANDIDATES = {
-    "brave": [
-        os.path.expandvars(r"%LOCALAPPDATA%\BraveSoftware\Brave-Browser\Application\brave.exe"),
-        r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
-        r"C:\Program Files (x86)\BraveSoftware\Brave-Browser\Application\brave.exe",
-        "brave", "brave.exe",
-    ],
-    "chrome": [
-        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-        os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
-        "chrome", "chrome.exe", "google-chrome", "chromium",
-    ],
-    "edge": [
-        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
-        "msedge", "msedge.exe",
-    ],
-}
-
+FLOW_TIMEOUT = 15 * 60  # generous window for 2FA, passkeys and recovery prompts
 CLOSED_EARLY_MSG = "The sign-in window was closed before sign-in finished."
 
-EMAIL_JS = """(() => {
-  const rx = /[a-zA-Z0-9._%+-]+@(?:gmail|googlemail)\\.com/g;
-  const hits = [];
-  for (const i of document.querySelectorAll('img[alt]')) {
-    const m = (i.getAttribute('alt') || '').match(rx);
-    if (m) hits.push(m[0]);
-  }
-  for (const a of document.querySelectorAll('a[aria-label],button[aria-label]')) {
-    const m = (a.getAttribute('aria-label') || '').match(rx);
-    if (m) hits.push(m[0]);
-  }
-  if (!hits.length) {
-    const m = document.documentElement.innerHTML.match(rx);
-    if (m) hits.push(...m.slice(0, 3));
-  }
-  return hits[0] || null;
-})()"""
 
-HTML_JS = "document.documentElement.outerHTML"
+def resolve_exe(provider: str) -> str:  # kept for callers of the old module API
+    return gemini_cdp.resolve_exe(provider)
 
 
-def resolve_exe(provider: str) -> str:
-    for cand in EXE_CANDIDATES.get(provider, EXE_CANDIDATES["chrome"]):
-        if os.path.isabs(cand) and Path(cand).exists():
-            return cand
-        found = None
-        try:
-            from shutil import which
-
-            found = which(cand)
-        except Exception:
-            found = None
-        if found:
-            return found
-    raise FileNotFoundError(f"Could not find a {PROVIDER_LABELS.get(provider, provider)} installation on this computer.")
-
-
-def _targets(port: int) -> list[dict]:
-    try:
-        r = httpx.get(f"http://127.0.0.1:{port}/json", timeout=2.0,
-                      headers={"User-Agent": USER_AGENT})
-        if r.status_code != 200:
-            return []
-        return [t for t in r.json() if t.get("type") == "page"]
-    except Exception:
-        return []
-
-
-def _cdp_eval(ws_url: str, expression: str, timeout: float = 20.0):
-    from websockets.sync.client import connect
-
-    with connect(ws_url, max_size=64 * 1024 * 1024, open_timeout=6) as ws:
-        payload = json.dumps(
-            {
-                "id": 1,
-                "method": "Runtime.evaluate",
-                "params": {"expression": expression, "awaitPromise": False, "returnByValue": True},
-            }
-        )
-        ws.send(payload)
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            msg = json.loads(ws.recv(timeout=max(0.2, deadline - time.time())))
-            if msg.get("id") == 1:
-                return msg.get("result", {}).get("result", {}).get("value")
-        raise TimeoutError("CDP evaluate timed out")
-
-
-def _cdp_cookies(ws_url: str) -> list[dict]:
-    """Network.getCookies scoped to gemini.google.com."""
-    from websockets.sync.client import connect
-
-    with connect(ws_url, max_size=16 * 1024 * 1024, open_timeout=6) as ws:
-        ws.send(json.dumps(
-            {"id": 1, "method": "Network.enable", "params": {}}
-        ))
-        ws.send(json.dumps(
-            {"id": 2, "method": "Network.getCookies",
-             "params": {"urls": ["https://gemini.google.com", "https://accounts.google.com"]}}
-        ))
-        deadline = time.time() + 15
-        while time.time() < deadline:
-            msg = json.loads(ws.recv(timeout=max(0.2, deadline - time.time())))
-            if msg.get("id") == 2:
-                if "error" in msg:
-                    return []
-                return msg.get("result", {}).get("cookies", []) or []
-        return []
-
-
-def _cdp_close(ws_url: str) -> None:
-    """Best-effort graceful close of the whole login window."""
-    from websockets.sync.client import connect
-
-    try:
-        with connect(ws_url, max_size=1024 * 1024, open_timeout=4) as ws:
-            ws.send(json.dumps({"id": 1, "method": "Browser.close", "params": {}}))
-            try:
-                ws.recv(timeout=3)
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-
-# --------------------------------------------------------------------- flows
 class LoginFlow:
-    def __init__(self, provider: str, slot: int) -> None:
+    def __init__(self, provider: str, slot: int, port: int, user_data_dir: Path) -> None:
         self.id = uuid.uuid4().hex[:12]
         self.provider = provider
         self.slot = slot
-        self.port = 9300 + (slot % 200)
+        self.port = port
+        self.user_data_dir = user_data_dir
         self.pid: int | None = None
         self.state = "pending"          # pending | authenticated | closed | failed
         self.email: str | None = None
         self.error: str | None = None
         self.label = f"Profile {slot:02d}"
         self.started = time.time()
-        self.exe: str | None = None
-        self.user_data_dir: str | None = None
 
     def public(self) -> dict:
         return {
-            "ok": self.state == "authenticated",
+            # ok=False only for terminal failures so the UI keeps polling while pending
+            "ok": self.state in {"pending", "authenticated"},
             "flowId": self.id,
             "state": self.state,
             "email": self.email,
@@ -204,6 +62,7 @@ class LoginFlow:
             "provider": PROVIDER_LABELS.get(self.provider, self.provider),
             "port": self.port,
             "slot": self.slot,
+            "profileDir": str(self.user_data_dir),
             "error": self.error,
             "elapsed": round(time.time() - self.started, 1),
         }
@@ -213,131 +72,102 @@ FLOWS: dict[str, LoginFlow] = {}
 _flow_lock = threading.Lock()
 
 
-def _persist(flow: LoginFlow, psid: str, psidts: str, email: str | None) -> dict | None:
-    """Hand the harvested session to the headless pool."""
-    try:
-        from . import gemini_pool
+def _record(flow: LoginFlow) -> dict:
+    """Persist the authenticated profile: SQLite row + headless provider client."""
+    from . import db, gemini_pool
 
-        return gemini_pool.POOL.register_session(
-            account_id=flow.slot,
-            psid=psid,
-            psidts=psidts,
-            email=email,
-            provider=flow.provider,
-            label=flow.label,
-        )
-    except Exception as e:  # pragma: no cover
-        flow.state = "failed"
-        flow.error = f"could not persist session: {e}"
-        return None
+    db.upsert_gemini_account(flow.slot, flow.label, flow.email or "", flow.provider, str(flow.user_data_dir))
+    return gemini_pool.POOL.register_cdp_profile(flow.slot, flow.email or "", flow.provider, str(flow.user_data_dir))
 
 
-def _sensor(flow: LoginFlow, proc: subprocess.Popen) -> None:
+def _close_window(flow: LoginFlow, proc) -> None:
+    info = gemini_cdp.devtools_version(flow.port) or {}
+    if info.get("webSocketDebuggerUrl"):
+        try:
+            s = CDPSession(info["webSocketDebuggerUrl"], timeout=4)
+            s.send("Browser.close", timeout=5)
+            s.close()
+        except Exception:
+            pass
+    try:  # the headless worker cannot open the profile until this process is gone
+        proc.wait(timeout=10)
+    except Exception:
+        proc.kill()
+
+
+def probe_session(port: int) -> tuple[bool, dict | None]:
+    """One sensor tick: is any Gemini chat tab on this DevTools port signed in?"""
+    for target in gemini_cdp.list_pages(port):
+        if not gemini_cdp.is_app_url(target.get("url", "")) or not target.get("webSocketDebuggerUrl"):
+            continue
+        try:
+            s = CDPSession(target["webSocketDebuggerUrl"], timeout=4)
+            try:
+                info = s.evaluate(gemini_cdp.SESSION_JS, timeout=8)
+                cookies = gemini_cdp.session_cookies(s)
+            finally:
+                s.close()
+        except Exception:
+            continue
+        if gemini_cdp.signed_in(info, cookies):
+            return True, info
+    return False, None
+
+
+def _sensor(flow: LoginFlow, proc) -> None:
     deadline = flow.started + FLOW_TIMEOUT
     while time.time() < deadline:
         time.sleep(POLL_SECONDS)
-
-        # ---- user closed the window before finishing sign-in
-        if proc.poll() is not None:
-            flow.state = "closed"
-            flow.error = CLOSED_EARLY_MSG
+        if flow.state != "pending":       # cancelled from the UI
             return
-
-        # ---- look for an authenticated gemini app tab
-        target = None
-        for t in _targets(flow.port):
-            url = t.get("url") or ""
-            if "gemini.google.com" in url and "accounts.google.com" not in url:
-                target = t
-                break
-        if target is None:
+        if proc.poll() is not None and not gemini_cdp.devtools_version(flow.port, timeout=0.5):
+            flow.state, flow.error = "closed", CLOSED_EARLY_MSG
+            return
+        ok, info = probe_session(flow.port)
+        if not ok:
             continue
-
+        account = (info or {}).get("account") or ""
+        flow.email = account if "@" in account else None
         try:
-            html = _cdp_eval(target["webSocketDebuggerUrl"], HTML_JS) or ""
-        except Exception:
-            continue
-
-        # SNlM0e only exists on a signed-in, fully loaded app page
-        if not re.search(r'"SNlM0e":"(.+?)"', html):
-            continue
-
-        # ---- harvest email
-        try:
-            flow.email = _cdp_eval(target["webSocketDebuggerUrl"], EMAIL_JS)
-        except Exception:
-            flow.email = None
-
-        # ---- harvest session cookies
-        psid = psidts = ""
-        for c in _cdp_cookies(target["webSocketDebuggerUrl"]):
-            name = c.get("name", "")
-            if name == "__Secure-1PSID":
-                psid = c.get("value", "")
-            elif name == "__Secure-1PSIDTS":
-                psidts = c.get("value", "")
-        if not psid:
-            flow.state = "failed"
-            flow.error = "Signed in, but the session cookie could not be read. Please try again."
+            result = _record(flow)
+        except Exception as exc:  # pragma: no cover - disk/db failure
+            flow.state, flow.error = "failed", f"Signed in, but the account could not be saved: {exc}"
             return
-
-        # ---- persist + verify headlessly, then close the window
-        result = _persist(flow, psid, psidts, flow.email)
-        if result is None:
-            return
+        _close_window(flow, proc)
         if not result.get("ok"):
-            flow.state = "failed"
-            flow.error = result.get("reason") or "Session could not be verified."
-            _cdp_close(target["webSocketDebuggerUrl"])
+            flow.state, flow.error = "failed", result.get("reason") or "Account could not be registered."
             return
-
-        if result.get("email") and not flow.email:
-            flow.email = result["email"]
         flow.state = "authenticated"
-        _cdp_close(target["webSocketDebuggerUrl"])
         return
-
-    flow.state = "closed"
-    flow.error = "Sign-in timed out. Please try again."
+    flow.state, flow.error = "closed", "Sign-in timed out. Please try again."
+    try:
+        _close_window(flow, proc)
+    except Exception:
+        pass
 
 
 def spawn_login_flow(provider: str = "chrome", slot: int | None = None) -> dict:
-    """Open the isolated one-time login window and start the capture sensor."""
+    """Open the isolated one-time sign-in window and start the CDP sensor."""
     provider = provider if provider in PROVIDER_LABELS else "chrome"
-    exe = resolve_exe(provider)
+    exe = gemini_cdp.resolve_exe(provider)
 
     from . import gemini_pool
 
     if slot is None:
         slot = gemini_pool.POOL.next_free_slot()
+    gemini_pool.POOL.release_profile(slot)  # re-login: stop that profile's headless Chrome first
 
-    udir = PROFILE_ROOT / f"Profile_{slot}"
+    udir = gemini_cdp.profile_dir(slot)
     udir.mkdir(parents=True, exist_ok=True)
+    port = gemini_cdp.LOGIN_BASE_PORT + slot
+    while not gemini_cdp.port_free(port):
+        port += 1
 
-    flow = LoginFlow(provider, slot)
-    args = [
-        exe,
-        f"--user-data-dir={udir}",
-        f"--remote-debugging-port={flow.port}",
-        "--no-first-run",
-        "--no-default-browser-check",
-        "--disable-session-crashed-bubble",
-        "--disable-restore-session-state",
-        "--new-window",
-        LOGIN_URL,
-    ]
-    kwargs: dict = {}
-    if IS_WIN:
-        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS  # type: ignore[attr-defined]
-
-    proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kwargs)
+    flow = LoginFlow(provider, slot, port, udir)
+    proc = gemini_cdp.popen(gemini_cdp.chrome_args(exe, udir, port, headless=False), visible=True)
     flow.pid = proc.pid
-    flow.exe = exe
-    flow.user_data_dir = str(udir)
-
     with _flow_lock:
         FLOWS[flow.id] = flow
-
     threading.Thread(target=_sensor, args=(flow, proc), daemon=True).start()
     return flow.public()
 
@@ -349,12 +179,11 @@ def flow_status(flow_id: str) -> dict | None:
 
 
 def cancel_flow(flow_id: str) -> dict | None:
-    """User dismissed the modal — stop the sensor, keep the window usable."""
+    """User dismissed the modal — stop the sensor, leave the window to the user."""
     with _flow_lock:
         f = FLOWS.get(flow_id)
     if not f:
         return None
     if f.state == "pending":
-        f.state = "closed"
-        f.error = CLOSED_EARLY_MSG
+        f.state, f.error = "closed", CLOSED_EARLY_MSG
     return f.public()

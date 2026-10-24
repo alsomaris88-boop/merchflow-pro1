@@ -18,3 +18,7 @@ out/
 next-env.d.ts
 desktop/engine_boot.log
 desktop/engine_boot.exit
+# Live Google sessions — NEVER commit (isolated Chrome profiles + legacy cookie store)
+desktop/profiles/
+desktop/config/gemini_accounts.json
+desktop/config/*.json.part

@@ -16,7 +16,7 @@ Final checks for this update:
   handoff and fresh identities when regenerating retained files; existing
   SSE/download protections remain covered.
 - **16 Chromium browser tests passed, 1 separately opt-in legacy Prepare test
-  skipped** (1.0min), against the built static desktop UI served by FastAPI. Binary ⚫ Pitch Black (#000000) default / ⚪ Pure White (#FFFFFF) toggle and dynamic
+  skipped** (1.0min), against the built static desktop UI served by FastAPI. Binary ⚫ Black (#000000) default / ⚪ White (#FFFFFF) toggle and dynamic
   ingestion/removal/Clear for 1/5/20/101 pass. Deep integration verifies real SSE
   archive events, physical print files, optional streaming ZIP, selected real-ID
   Listing save and durable History. Reload testing restores an already queued

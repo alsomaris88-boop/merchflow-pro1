@@ -5,19 +5,14 @@ import { asc, eq } from "drizzle-orm";
 
 export const dynamic = "force-dynamic";
 
-const FALLBACK = [
-  { id: 1, label: "Profile 01", email: "merchflow.alpha@gmail.com", provider: "chrome", status: "active", dailyUsed: 21, dailyCap: 38, totalGenerated: 812, lastHeartbeat: new Date().toISOString() },
-  { id: 2, label: "Profile 02", email: "mf.bravo.studio@gmail.com", provider: "brave", status: "ready", dailyUsed: 9, dailyCap: 38, totalGenerated: 655, lastHeartbeat: new Date().toISOString() },
-  { id: 3, label: "Profile 03", email: "charlie.prints.mf@gmail.com", provider: "chrome", status: "cooldown", dailyUsed: 38, dailyCap: 38, totalGenerated: 944, lastHeartbeat: new Date().toISOString() },
-  { id: 4, label: "Profile 04", email: "delta.merchlab@gmail.com", provider: "edge", status: "ready", dailyUsed: 3, dailyCap: 38, totalGenerated: 431, lastHeartbeat: new Date().toISOString() },
-  { id: 5, label: "Profile 05", email: "echo.podworks@gmail.com", provider: "brave", status: "ready", dailyUsed: 0, dailyCap: 38, totalGenerated: 209, lastHeartbeat: new Date().toISOString() },
-];
+// The Account Manager starts with ZERO accounts — never fabricate identities.
+const FALLBACK: never[] = [];
 
 export async function GET() {
   try {
     const rows = await db.select().from(accounts).orderBy(asc(accounts.id));
     if (rows.length) return NextResponse.json({ source: "db", items: rows });
-    return NextResponse.json({ source: "seed", items: FALLBACK });
+    return NextResponse.json({ source: "db", items: FALLBACK });
   } catch {
     return NextResponse.json({ source: "fallback", items: FALLBACK });
   }
