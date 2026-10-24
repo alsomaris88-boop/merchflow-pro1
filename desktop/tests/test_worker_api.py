@@ -23,6 +23,8 @@ def worker(tmp_path, monkeypatch):
     monkeypatch.setenv("MERCHFLOW_DB", str(tmp_path / "test.db"))
     from desktop.worker import app as module
     monkeypatch.setattr(module, "OUT_DIR", tmp_path / "output")
+    monkeypatch.setattr(module.db, "DB_PATH", tmp_path / "test.db")
+    module.db.init()
     monkeypatch.setattr(module.gemini_pool, "MOCK", False)
     monkeypatch.setattr(module.gemini_pool, "client_for", lambda account_id: None)
     module._ZIP_TICKETS.clear()

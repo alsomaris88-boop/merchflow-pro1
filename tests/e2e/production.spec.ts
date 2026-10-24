@@ -93,16 +93,15 @@ test("provider authentication errors stay failed; there is no simulated generato
   await expect(page.getByText("failed", { exact: true })).toBeVisible();
 });
 
-for (const [label, hex] of [["Grey", "#808080"], ["Black", "#000000"], ["Cream", "#FDFBF7"], ["Navy", "#0A192F"], ["Maroon", "#6B1D2F"], ["Forest Green", "#1B4332"], ["Orange", "#E65100"], ["Custom Hex", "#123ABC"]]) {
+for (const [label, hex] of [["Pitch Black", "#000000"], ["Pure White", "#FFFFFF"]]) {
   test(`Pixel to Pixel sends the exact ${label} colour and never fakes an authenticated render`, async ({ page }) => {
     await mockNoProvider(page);
     await page.goto("/");
     await page.getByRole("button", { name: "Pixel to Pixel", exact: true }).click();
-    await expect(page.getByRole("radio", { name: "Black", exact: true })).toHaveAttribute("aria-checked", "true");
+    await expect(page.getByRole("radio", { name: "Pitch Black", exact: true })).toHaveAttribute("aria-checked", "true");
     await page.locator("#p2p-files").setInputFiles(fixture);
     const option = page.getByRole("radio", { name: label, exact: true });
     await option.click(); await expect(option).toHaveAttribute("aria-checked", "true");
-    if (label === "Custom Hex") await page.getByRole("textbox", { name: "Custom background hex" }).fill(hex);
     const payload = page.waitForRequest((req) => new URL(req.url()).pathname === "/api/bridge/p2p/batches");
     const run = page.getByRole("button", { name: "1 designs in, 1 back on your colour. ▷ Generate", exact: true });
     await expect(run).toBeEnabled(); await run.click();

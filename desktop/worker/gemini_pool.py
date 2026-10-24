@@ -8,29 +8,27 @@ from __future__ import annotations
 
 import base64
 import csv
-import json
 import os
 import random
 import re
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from . import gemini_client, image_lab
+from . import db, gemini_client, image_lab
 from .gemini_client import GeminiAuthError, GeminiRenderError, ModelDegradedError
 
-CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "gemini_accounts.json"
 MOCK = os.environ.get("MERCHFLOW_MOCK_ENGINE", "").lower() in {"1", "true", "yes"}
 
-# ---- 18-month Pro window tuning -------------------------------------------
-WINDOW_SECONDS = int(os.environ.get("MERCHFLOW_WINDOW_SECONDS", "150" if MOCK else 5 * 3600))
-WINDOW_CAP = int(os.environ.get("MERCHFLOW_WINDOW_CAP", "6" if MOCK else 60))  # ~60 Pro renders/window
-MINI_COOLDOWN_SECONDS = int(os.environ.get("MERCHFLOW_MINI_COOLDOWN", "10" if MOCK else 90))
+# ---- Configured local scheduling budgets -------------------------------------------
+WINDOW_SECONDS = int(os.environ.get("MERCHFLOW_WINDOW_SECONDS", 5 * 3600))
+WINDOW_CAP = int(os.environ.get("MERCHFLOW_WINDOW_CAP", 60))  # local budget; actual provider limits still apply
+MINI_COOLDOWN_SECONDS = int(os.environ.get("MERCHFLOW_MINI_COOLDOWN", 90))
 JITTER = (
-    float(os.environ.get("MERCHFLOW_JITTER_MIN", "1" if MOCK else 65)),
-    float(os.environ.get("MERCHFLOW_JITTER_MAX", "2" if MOCK else 85)),
+    float(os.environ.get("MERCHFLOW_JITTER_MIN", 65)),
+    float(os.environ.get("MERCHFLOW_JITTER_MAX", 85)),
 )
 
 FUSION_PROMPT = """Act as a print-on-demand vector artist.
@@ -54,12 +52,12 @@ Background: {BG}. Additional direction: {DIRECTION}.
 The application will export the real render at 8192px on its longest edge."""
 
 
-DONEPIXEL_PROMPT = "Recreate this exact uploaded image in ultra-high quality, 8K resolution, and high definition. Maintain 100% fidelity to the original composition, overall style, colors, characters, fonts, and graphic elements. Enhance all textures, sharpen blurry lines, clean up low-resolution artifacts, and make it look like a crisp, professional graphic design ready for high-quality printing. Do not alter or change the elements, just upgrade the visual clarity, sharpness, and quality. Render the clean artwork on a solid background of: {Selected_Color_Hex}."
+DONEPIXEL_PROMPT = "Recreate this exact uploaded graphic artwork in ultra-high resolution, 8K crisp print definition. Maintain 100% fidelity to the original composition, typography, characters, and graphic elements. Do NOT add variations, do NOT alter the subject or layout. Clean up all low-resolution artifacts, blur, and fabric wrinkles, and render the exact clean artwork strictly on a solid background of: {Selected_Color_Hex}."
 
 
 def donepixel_prompt(colour: str) -> str:
-    if not re.fullmatch(r"#[0-9a-fA-F]{6}", colour):
-        raise ValueError("Background must be a six-digit hex colour, such as #000000")
+    if colour.upper() not in {"#000000", "#FFFFFF"}:
+        raise ValueError("Choose Pitch Black (#000000) or Pure White (#FFFFFF)")
     return DONEPIXEL_PROMPT.replace("{Selected_Color_Hex}", colour.upper())
 
 
@@ -115,8 +113,10 @@ class AccountState:
     id: int
     email: str = ""
     provider: str = "chrome"
-    secure_1psid: str = ""
-    secure_1psidts: str = ""
+    secure_1psid: str = field(default="", repr=False)
+    secure_1psidts: str = field(default="", repr=False)
+    login_flow_id: str = ""
+    verified_at: float = 0.0
     status: str = "auth-required"          # ready | active | cooldown | auth-required
     window_usage: int = 0                  # renders inside the current 5h window
     window_started: float = 0.0            # first render of the window
@@ -126,12 +126,12 @@ class AccountState:
     daily_used: int = 0
     weekly_used: int = 0
     total_generated: int = 0
-    daily_cap: int = 200                   # 200+ designs/day across the loop
+    daily_cap: int = 200                   # configured local budget, not provider quota
     weekly_cap: int = 1400
 
     @property
     def label(self) -> str:
-        return f"Profile {self.id:02d}"
+        return self.email or "Gemini account"
 
 
 class AccountPool:
@@ -144,53 +144,29 @@ class AccountPool:
         self._warm_clients()
 
     # ------------------------------ persistence
+    @staticmethod
+    def _from_row(row: dict) -> AccountState:
+        account = AccountState(**{key: row[key] for key in AccountState.__dataclass_fields__ if key in row})
+        account.is_pro = bool(account.is_pro)
+        if account.status == "active":
+            account.status = "cooldown" if account.cooldown_until > time.time() else "ready"
+        return account
+
     def _load(self) -> None:
-        try:
-            data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-            rows = data.get("accounts", [])
-        except Exception:
-            rows = [{"id": i} for i in range(1, 6)]
-        for r in rows:
-            a = AccountState(
-                id=int(r.get("id", self.accounts.__len__() + 1)),
-                email=r.get("email", ""),
-                provider=r.get("provider", "chrome"),
-                secure_1psid=r.get("secure_1psid", ""),
-                secure_1psidts=r.get("secure_1psidts", ""),
-                window_usage=int(r.get("window_usage", 0)),
-                window_started=float(r.get("window_started", 0.0)),
-                cooldown_until=float(r.get("cooldown_until", 0.0)),
-                is_pro=bool(r.get("is_pro", False)),
-                daily_used=int(r.get("daily_used", 0)),
-                weekly_used=int(r.get("weekly_used", 0)),
-                total_generated=int(r.get("total_generated", 0)),
-            )
-            if r.get("status") and not a.secure_1psid:
-                a.status = r.get("status")
-            elif a.secure_1psid:
-                a.status = "cooldown" if a.cooldown_until > time.time() else "ready"
-            self.accounts.append(a)
-        self.accounts.sort(key=lambda a: a.id)
+        # An empty SQLite database means exactly zero accounts. No JSON import,
+        # placeholder profiles, fallback identities or fabricated auth state.
+        self.accounts = [self._from_row(row) for row in db.session_rows()]
 
     def save(self) -> None:
         with self.lock:
-            rows = [
-                {
-                    "id": a.id, "label": a.label, "email": a.email, "provider": a.provider,
-                    "secure_1psid": a.secure_1psid, "secure_1psidts": a.secure_1psidts,
-                    "window_usage": a.window_usage, "window_started": a.window_started,
-                    "cooldown_until": a.cooldown_until, "is_pro": a.is_pro,
-                    "daily_used": a.daily_used, "weekly_used": a.weekly_used,
-                    "total_generated": a.total_generated,
-                }
-                for a in self.accounts
-            ]
-            try:
-                temp = CONFIG_PATH.with_suffix(".json.part")
-                temp.write_text(json.dumps({"jitter_seconds": [65, 85], "window_cap": WINDOW_CAP, "accounts": rows}, indent=2), encoding="utf-8")
-                os.replace(temp, CONFIG_PATH)
-            except Exception:
-                pass
+            db.save_account_states([
+                {"id": a.id, "login_flow_id": a.login_flow_id, "status": a.status,
+                 "window_usage": a.window_usage, "window_started": a.window_started,
+                 "cooldown_until": a.cooldown_until, "is_pro": a.is_pro,
+                 "daily_used": a.daily_used, "weekly_used": a.weekly_used,
+                 "total_generated": a.total_generated}
+                for a in self.accounts if a.verified_at > 0
+            ])
 
     def _warm_clients(self) -> None:
         for a in self.accounts:
@@ -201,7 +177,7 @@ class AccountPool:
     def _reset_expired_locked(self) -> None:
         now = time.time()
         for a in self.accounts:
-            if (a.status == "cooldown" or a.window_usage >= WINDOW_CAP) and a.cooldown_until and a.cooldown_until <= now:
+            if a.status != "auth-required" and (a.status == "cooldown" or a.window_usage >= WINDOW_CAP) and a.cooldown_until and a.cooldown_until <= now:
                 a.status = "ready"
                 a.window_usage = 0
                 a.window_started = 0.0
@@ -210,51 +186,53 @@ class AccountPool:
     # ------------------------------ session intake
     def next_free_slot(self) -> int:
         with self.lock:
-            used = {a.id for a in self.accounts}
-            for i in range(1, 200):
-                if i not in used:
-                    return i
-            return len(used) + 1
+            return max(db.next_account_id(), max((a.id for a in self.accounts), default=0) + 1)
 
-    def register_session(self, account_id: int, psid: str, psidts: str, email: str | None, provider: str, label: str | None = None) -> dict:
-        with self.lock:
-            acct = next((a for a in self.accounts if a.id == account_id), None)
-            if acct is None:
-                acct = AccountState(id=account_id)
-                self.accounts.append(acct)
-                self.accounts.sort(key=lambda x: x.id)
-            acct.secure_1psid = (psid or "").strip()
-            acct.secure_1psidts = (psidts or "").strip()
-            acct.provider = provider
-            if email:
-                acct.email = email
+    def register_session(self, flow, psid: str, psidts: str, email: str | None) -> dict:
+        """Only the real browser sensor may supply an observed login flow.
 
-        client = gemini_client.GeminiClient(acct.secure_1psid, acct.secure_1psidts or None, acct.label)
+        Verify before inserting anything. Failed/cancelled attempts create no
+        row, no pool member, and no client; existing valid accounts stay intact.
+        """
+        with flow.lock:
+            if flow.state != "pending" or not flow.authentication_observed:
+                return {"ok": False, "authed": False, "reason": "Complete the real Google/Gemini browser login first"}
+        client = gemini_client.GeminiClient(psid, psidts or None, "Google/Gemini login")
         try:
-            client.init()  # headless SNlM0e — proves the Pro session
-            if client.email:
-                acct.email = client.email
-            _register_client(acct.id, client)
-            with self.lock:
-                acct.is_pro = True
-                acct.status = "ready"
-                acct.window_usage = 0
-                acct.cooldown_until = 0.0
-            self.save()
-            return {"ok": True, "authed": True, "email": acct.email, "label": acct.label, "provider": provider, "headless": True, "isPro": True}
-        except Exception as e:
-            _register_client(acct.id, None)
-            with self.lock:
-                acct.status = "auth-required"
-                acct.is_pro = False
-            self.save()
-            return {"ok": False, "authed": False, "reason": str(e), "email": acct.email, "label": acct.label}
+            client.init()
+            verified_email = (client.email or email or "").strip()
+            if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", verified_email):
+                raise GeminiAuthError("Could not verify the signed-in Google account email")
+            with flow.lock, self.condition:
+                if flow.state != "pending":
+                    raise GeminiAuthError("Sign-in was cancelled; no account was saved")
+                existing = next((a for a in self.accounts if a.id == flow.slot or a.email.casefold() == verified_email.casefold()), None)
+                if existing and existing.id in self._busy:
+                    raise GeminiAuthError("This account is generating; wait before reconnecting it")
+                row = db.persist_browser_session(flow.slot, verified_email, flow.provider, psid, psidts, flow.id)
+                account = self._from_row(row)
+                self.accounts = sorted([a for a in self.accounts if a.id != account.id] + [account], key=lambda a: a.id)
+                _register_client(account.id, client)
+                flow.slot = account.id
+                flow.email = account.email
+                flow.label = account.email
+                flow.state = "authenticated"
+                self.condition.notify_all()
+            return {"ok": True, "authed": True, "email": account.email, "label": account.label,
+                    "provider": account.provider, "headless": True, "isPro": account.is_pro}
+        except Exception as exc:
+            client.close()
+            return {"ok": False, "authed": False, "reason": str(exc)}
 
-    def verify_cookies(self, account_id: int, psid: str, psidts: str, label: str | None, email: str | None) -> dict:
-        with self.lock:
-            acct = next((a for a in self.accounts if a.id == account_id), None)
-            provider = acct.provider if acct else "chrome"
-        return self.register_session(account_id, psid, psidts, email, provider, label)
+    def remove(self, account_id: int) -> bool:
+        with self.condition:
+            if account_id in self._busy:
+                raise RuntimeError("This account is generating; wait before removing it")
+            removed = db.delete_account(account_id)
+            self.accounts = [a for a in self.accounts if a.id != account_id]
+            _register_client(account_id, None)
+            self.condition.notify_all()
+            return removed
 
     # ------------------------------ SEQUENTIAL EXHAUSTION scheduling
     def ready_pro_count(self) -> int:
@@ -348,6 +326,7 @@ class AccountPool:
             else:
                 a.status = "cooldown"
                 a.cooldown_until = time.time() + MINI_COOLDOWN_SECONDS
+            self.save()
 
     def _wait_jitter(self, a: AccountState) -> None:
         jitter = random.uniform(*JITTER)
@@ -364,6 +343,8 @@ class AccountPool:
             now = time.time()
             out = []
             for a in self.accounts:
+                if not a.login_flow_id or a.verified_at <= 0 or not a.secure_1psid:
+                    continue
                 cool_left = max(0, int(a.cooldown_until - now)) if a.cooldown_until else 0
                 out.append(
                     {
@@ -372,7 +353,8 @@ class AccountPool:
                         "email": a.email,
                         "provider": a.provider,
                         "status": a.status,
-                        "authed": client_for(a.id) is not None,
+                        "authed": a.status != "auth-required" and client_for(a.id) is not None,
+                        "authSource": "browser-login", "verifiedAt": a.verified_at,
                         "hasCookies": bool(a.secure_1psid),
                         "isPro": a.is_pro,
                         "headless": True,

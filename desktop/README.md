@@ -36,8 +36,15 @@ failure, the original launcher console also prints the log and pauses instead
 of disappearing. A fresh exit-status marker lets the readiness check stop
 promptly after a crash; stale status is cleared before each launch.
 
-The launcher checks the actual worker health API before opening the UI. If port
-8000 is already in use, stop the old engine first and rerun the launcher. You do
+The launcher polls `http://127.0.0.1:8000/api/health` for up to **45 seconds**,
+allowing libvips/rembg/ONNX imports to finish. Only **HTTP 200** plus this worker's
+`ok`/`unified` markers permits opening Chrome/Edge/the browser. A signed-in Gemini
+account is not required for engine readiness: the empty Account Manager must
+also open normally. Connection errors, HTTP 201/202/204/503, malformed JSON,
+startup crashes and deadline expiry do not launch the UI. The exit marker is
+checked again after a healthy response to catch a child that just crashed.
+
+If port 8000 is already in use, stop the old engine first and rerun the launcher. You do
 not need to delete a working venv just to install newly added dependencies.
 Runtime log/status files are ignored by Git.
 
@@ -52,6 +59,42 @@ npm run dev
 
 For a remote/proxied preview, bind the processes to `0.0.0.0`. Browser code always
 uses same-origin URLs; `MERCHFLOW_WORKER_URL` is a **server-side** proxy setting.
+
+## Account Manager — real browser sessions only
+
+A fresh installation has **zero accounts**, with this exact empty state:
+
+> No accounts connected. Click [+ Add Gemini Account] to link your Google account.
+
+There are no seeded accounts, JSON/default profile lists, PostgreSQL fallbacks,
+pretend avatars, fabricated account counters or sample account activity. The old tracked
+`desktop/config/gemini_accounts.json` is removed and is never read/imported.
+
+**Add Gemini Account → choose Chrome/Brave → Open Google sign-in** starts a real
+isolated browser on Gemini, which redirects to Google's login with the proper
+return URL. Passwords/2FA are entered directly into Google. A pending/closed/
+cancelled/failed flow is not an account and never inserts a database row.
+The sensor must observe the real Gemini app, extract its session, and verify it
+headlessly before committing the account. Cancelling during verification blocks
+that commit; a failed reconnect leaves an existing valid session intact.
+
+The single credential source is **`~/MerchFlow/merchflow.db`** (`MERCHFLOW_DB`
+overrides it). The private `accounts` table stores real session cookies,
+browser-login provenance, verification time and actual counters. Credentials do
+not go into JSON, frontend storage, account/health responses or logs. Protect the
+local database and its backups; it is local storage, not a claim of encrypted
+SQLite. Database filenames and legacy credential JSON are ignored by Git.
+
+Upgrade migration removes pre-refactor **unverified metadata-only account rows**;
+users of the old JSON store must connect again through the browser. Existing
+jobs, listings, designs and output PNGs are not deleted. Repeat sign-in for the
+same Google identity updates its existing row. Disconnect durably deletes the
+stored session and closes its HTTP client; it is not a temporary UI hide.
+
+Both desktop and Next `/api/accounts` read the worker's SQLite-backed list.
+Manual POST/PATCH account creation and pasted-cookie intake return HTTP 405.
+Configured scheduling windows are local budgets, not promised provider quotas
+or evidence of a paid subscription. Real provider access/rate limits still apply.
 
 ## The four production paths
 
@@ -91,14 +134,20 @@ chunks, stores already-compressed PNGs without recompression, and disambiguates
 duplicate filenames. Neither browser nor Next.js holds an archive-sized Blob.
 The PNGs in the ZIP are the exact bytes on disk, including DPI and alpha.
 
-### Dynamic Donepixel Pixel to Pixel
+### Strict 1:1 Donepixel Pixel to Pixel (dynamic batches)
 
 The new `src/components/modules/pixel-to-pixel.tsx` accepts **1, 5, 20, 50, 100+
 images**, with no fixed batch-count cap. The counter and Generate label reflect
 exactly N files. Each thumbnail has Remove; Clear all releases object URLs.
-Background swatches are Grey `#808080`, **Black `#000000` (default)**, Cream
-`#FDFBF7`, Navy `#0A192F`, Maroon `#6B1D2F`, Forest Green `#1B4332`, Orange
-`#E65100`, and validated Custom Hex.
+The prominent two-way background control is **Pitch Black `#000000` (default)**
+or **Pure White `#FFFFFF`**. These replace the earlier multicolour/custom picker.
+
+The manifest explicitly sends `outputsPerInput: 1`; a request for 3 or a variants
+parameter is rejected. Each original has one job and at most one verified master
+PNG/History entry—never 3N variants. Only the first actual generated image asset
+is downloaded if Gemini returns multiple candidate URLs. Original-resolution
+image downloads are requested rather than forcing an 8192px asset down to 2048.
+The stable response parser deduplicates renditions and excludes uploaded references.
 
 `gemini_pool.DONEPIXEL_PROMPT` contains the exact requested 8K multimodal prompt,
 with only `{Selected_Color_Hex}` substituted. Every call sends one original
@@ -109,7 +158,9 @@ calls, configurable with `MERCHFLOW_P2P_PARALLEL` (1–32). Auth-required,
 cooldown, exhausted and unverified/non-Pro sessions are excluded. Flash
 model-degradation failures are not accepted as Pro successes. Existing fusion
 scheduling keeps its ordered account strategy and shares the exclusive leases.
-There is no promised render throughput or provider quota bypass.
+There is no promised render throughput or provider quota bypass. The prompt is
+the exact requested faithful-artwork/no-variations text, including cleanup of
+fabric wrinkles, with only the selected Black/White hex substituted.
 
 **Uploads are bounded, not one enormous base64 JSON:** create a manifest, upload
 original files independently as binary (two at a time), then start the durable
@@ -179,10 +230,13 @@ application. Live provider generation is separate from the local raster tests.
 
 | Method | Same-origin route | Purpose |
 |---|---|---|
+| GET / DELETE | `/api/accounts` | Real SQLite sessions; `?id=N` durably disconnects |
+| POST | `/api/bridge/login/start` | Open a real isolated Google/Gemini sign-in window |
+| GET / POST | `/api/bridge/login/flow/{id}` | Read sign-in state / cancel without creating an account |
 | POST | `/api/bridge/process` | Sequential caller → cutout/print/save, returning verified record/report |
 | POST | `/api/bridge/generate` | Provider style fusion, SSE events |
 | POST | `/api/bridge/pixel-to-pixel` | Legacy 8192px recreation API, SSE events |
-| POST | `/api/bridge/p2p/batches` | Create dynamic manifest with background hex |
+| POST | `/api/bridge/p2p/batches` | Create 1:1 manifest: Black/White, `outputsPerInput: 1` |
 | POST | `/api/bridge/p2p/batches/{id}/items/{job}` | Stream one original binary upload (40 MB max) |
 | POST | `/api/bridge/p2p/batches/{id}/start` | Idempotently enqueue server-owned parallel generation |
 | GET | `/api/bridge/p2p/batches/{id}` | Persistent batch/job states and verified design records |
@@ -247,8 +301,9 @@ MERCHFLOW_E2E_REAL_WORKER=1 npm run test:e2e
 The real-worker browser case queues **55 valid files plus one invalid file**,
 checks only one processing request is in flight, downloads one ZIP, verifies all
 55 PNG dimensions/DPI and unique filenames, and checks History/handoff/reload.
-Other browser cases check all seven swatches/custom hex, default Black, dynamic
-1/5/20/101 ingestion, and genuine authentication failure without fake success.
+Other browser cases check Pitch Black/Pure White, default Black, dynamic
+1/5/20/101 ingestion, the exact empty Account Manager, pending/cancelled/failed
+browser sign-in, and genuine authentication failure without fake success.
 
 Donepixel browser integration has an explicit **test-only provider harness**:
 

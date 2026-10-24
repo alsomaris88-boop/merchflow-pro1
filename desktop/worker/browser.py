@@ -28,6 +28,7 @@ import sys
 import threading
 import time
 import uuid
+from urllib.parse import urlsplit
 from pathlib import Path
 
 import httpx
@@ -35,8 +36,9 @@ import httpx
 IS_WIN = sys.platform.startswith("win")
 APPDATA = Path(os.environ.get("LOCALAPPDATA") or (Path.home() / ".merchflow"))
 PROFILE_ROOT = APPDATA / "MerchFlow" / "Profiles"
-LOGIN_URL = "https://accounts.google.com/"
 APP_URL = "https://gemini.google.com/app"
+# Gemini redirects to Google sign-in with the correct return URL.
+LOGIN_URL = APP_URL
 POLL_SECONDS = 1.5
 FLOW_TIMEOUT = 15 * 60  # generous window for 2FA / password recovery
 
@@ -74,7 +76,7 @@ EXE_CANDIDATES = {
 CLOSED_EARLY_MSG = "The sign-in window was closed before sign-in finished."
 
 EMAIL_JS = """(() => {
-  const rx = /[a-zA-Z0-9._%+-]+@(?:gmail|googlemail)\\.com/g;
+  const rx = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}/g;
   const hits = [];
   for (const i of document.querySelectorAll('img[alt]')) {
     const m = (i.getAttribute('alt') || '').match(rx);
@@ -189,7 +191,9 @@ class LoginFlow:
         self.state = "pending"          # pending | authenticated | closed | failed
         self.email: str | None = None
         self.error: str | None = None
-        self.label = f"Profile {slot:02d}"
+        self.label = "New Gemini account"
+        self.lock = threading.RLock()
+        self.authentication_observed = False
         self.started = time.time()
         self.exe: str | None = None
         self.user_data_dir: str | None = None
@@ -201,7 +205,7 @@ class LoginFlow:
             "state": self.state,
             "email": self.email,
             "label": self.label,
-            "provider": PROVIDER_LABELS.get(self.provider, self.provider),
+            "provider": self.provider,
             "port": self.port,
             "slot": self.slot,
             "error": self.error,
@@ -218,14 +222,7 @@ def _persist(flow: LoginFlow, psid: str, psidts: str, email: str | None) -> dict
     try:
         from . import gemini_pool
 
-        return gemini_pool.POOL.register_session(
-            account_id=flow.slot,
-            psid=psid,
-            psidts=psidts,
-            email=email,
-            provider=flow.provider,
-            label=flow.label,
-        )
+        return gemini_pool.POOL.register_session(flow, psid, psidts, email)
     except Exception as e:  # pragma: no cover
         flow.state = "failed"
         flow.error = f"could not persist session: {e}"
@@ -236,6 +233,9 @@ def _sensor(flow: LoginFlow, proc: subprocess.Popen) -> None:
     deadline = flow.started + FLOW_TIMEOUT
     while time.time() < deadline:
         time.sleep(POLL_SECONDS)
+        with flow.lock:
+            if flow.state != "pending":
+                return  # cancellation must never create a delayed account
 
         # ---- user closed the window before finishing sign-in
         if proc.poll() is not None:
@@ -247,7 +247,7 @@ def _sensor(flow: LoginFlow, proc: subprocess.Popen) -> None:
         target = None
         for t in _targets(flow.port):
             url = t.get("url") or ""
-            if "gemini.google.com" in url and "accounts.google.com" not in url:
+            if urlsplit(url).hostname == "gemini.google.com" and "/app" in urlsplit(url).path:
                 target = t
                 break
         if target is None:
@@ -282,12 +282,19 @@ def _sensor(flow: LoginFlow, proc: subprocess.Popen) -> None:
             return
 
         # ---- persist + verify headlessly, then close the window
+        with flow.lock:
+            if flow.state != "pending":
+                return
+            flow.authentication_observed = True
         result = _persist(flow, psid, psidts, flow.email)
         if result is None:
             return
         if not result.get("ok"):
-            flow.state = "failed"
-            flow.error = result.get("reason") or "Session could not be verified."
+            with flow.lock:
+                if flow.state != "pending":
+                    return
+                flow.state = "failed"
+                flow.error = result.get("reason") or "Session could not be verified."
             _cdp_close(target["webSocketDebuggerUrl"])
             return
 
@@ -308,38 +315,33 @@ def spawn_login_flow(provider: str = "chrome", slot: int | None = None) -> dict:
 
     from . import gemini_pool
 
-    if slot is None:
-        slot = gemini_pool.POOL.next_free_slot()
-
-    udir = PROFILE_ROOT / f"Profile_{slot}"
-    udir.mkdir(parents=True, exist_ok=True)
-
-    flow = LoginFlow(provider, slot)
-    args = [
-        exe,
-        f"--user-data-dir={udir}",
-        f"--remote-debugging-port={flow.port}",
-        "--no-first-run",
-        "--no-default-browser-check",
-        "--disable-session-crashed-bubble",
-        "--disable-restore-session-state",
-        "--new-window",
-        LOGIN_URL,
-    ]
-    kwargs: dict = {}
-    if IS_WIN:
-        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS  # type: ignore[attr-defined]
-
-    proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kwargs)
-    flow.pid = proc.pid
-    flow.exe = exe
-    flow.user_data_dir = str(udir)
-
+    # Reserve pending slots in memory, never by inserting a phantom DB row.
+    # Do not reuse a cancelled flow's browser profile/port in this process.
     with _flow_lock:
+        if slot is None:
+            slot = max(gemini_pool.POOL.next_free_slot(), max((f.slot for f in FLOWS.values()), default=0) + 1)
+        elif any(f.slot == slot and f.state == "pending" for f in FLOWS.values()):
+            raise RuntimeError("This account already has a pending sign-in window")
+        flow = LoginFlow(provider, slot)
+        if any(f.port == flow.port and f.state == "pending" for f in FLOWS.values()):
+            raise RuntimeError("Another sign-in is using this browser port; finish it first")
+        udir = PROFILE_ROOT / f"Login_{flow.id}"
+        udir.mkdir(parents=True, exist_ok=True)
+        args = [
+            exe, f"--user-data-dir={udir}", f"--remote-debugging-port={flow.port}",
+            "--remote-debugging-address=127.0.0.1", "--no-first-run", "--no-default-browser-check",
+            "--disable-session-crashed-bubble", "--disable-restore-session-state",
+            "--new-window", LOGIN_URL,
+        ]
+        kwargs: dict = {}
+        if IS_WIN:
+            kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+        proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kwargs)
+        flow.pid, flow.exe, flow.user_data_dir = proc.pid, exe, str(udir)
         FLOWS[flow.id] = flow
 
     threading.Thread(target=_sensor, args=(flow, proc), daemon=True).start()
-    return flow.public()
+    return {**flow.public(), "ok": True}
 
 
 def flow_status(flow_id: str) -> dict | None:
@@ -354,7 +356,8 @@ def cancel_flow(flow_id: str) -> dict | None:
         f = FLOWS.get(flow_id)
     if not f:
         return None
-    if f.state == "pending":
-        f.state = "closed"
-        f.error = CLOSED_EARLY_MSG
+    with f.lock:
+        if f.state == "pending":
+            f.state = "closed"
+            f.error = CLOSED_EARLY_MSG
     return f.public()

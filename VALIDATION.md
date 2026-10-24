@@ -1,8 +1,61 @@
-# Pipeline validation — 2026-10-23
+# Pipeline validation — 2026-10-24
 
-## Dynamic Donepixel + automatic History archive
+## Critical account / single-output / startup refactor
 
-Final checks for this update:
+Current final checks:
+
+- **80 Python tests passed, 1 opt-in real-model smoke skipped** (252.42s).
+  Includes 14 new account/provider regressions and 17 executable/contract
+  launcher cases in total. Existing cutout, Prepare, disk/ZIP, History and
+  1/5/20/101 batch regressions continue to pass.
+- **22 TypeScript unit tests passed.** New coverage verifies the exact empty
+  message, rejection of unverified metadata, empty/offline account proxy behavior,
+  blocked manual account/cookie intake and durable disconnect. Upload manifests
+  explicitly request one output per input.
+- **13 Chromium browser tests passed, 1 opt-in 55-file Prepare test skipped**
+  (1.0min), against the actual built static desktop UI and FastAPI. Empty and
+  unverified account lists, pending/cancelled sign-in, browser-launch failures,
+  Black/White/default Black, 1/5/20/101 ingestion, live History/SSE, optional ZIP,
+  Listing linkage, reload recovery and repeat-colour generation all pass.
+- ESLint, TypeScript, Python compilation and whitespace checks passed.
+- Normal Next production build and static desktop build passed; API source
+  restoration was verified. The static UI is generated into `out/`.
+- Both real account HTTP lists remain empty after fixture-backed native image
+  integration; no test-provider profiles are exposed as connected accounts.
+  The isolated validation service was stopped afterward.
+
+Account upgrades remove unverified old metadata without deleting existing
+jobs/listings/design files. No JSON account list is loaded or written. Only an
+observed real Google/Gemini browser flow plus successful headless verification
+can commit a session to SQLite. Failed or cancelled verification inserts no
+account; failed reconnects preserve an existing session. Cookie fields and
+login-flow identifiers are absent from public account/health responses.
+
+The exact newly requested prompt is used with Pitch Black/Pure White. The
+manifest accepts only `outputsPerInput: 1`; requests for 3/variants fail validation.
+One job commits at most one verified PNG/History row. A three-candidate RPC test
+proves only one image download; the parser's stable ordering and original-size
+rendition request are covered without calling the paid provider. Existing
+4500×5400/300-DPI lossless RGBA, <25 MB saving remains intact.
+
+The launcher polls `/api/health` for up to 45 seconds and requires explicit
+HTTP 200 plus worker identity before opening the UI, including with zero linked
+accounts. Tests cover cold connection failure → HTTP 503 → HTTP 200, non-200
+responses, deadline/crash detection and a crash immediately after a healthy
+response. Complete `desktop/engine_boot.log` display/visible console and venv-bound
+requirements refresh remain covered.
+
+**Scope:** Google/CDP and successful provider responses are isolated test doubles;
+SQLite, libvips files, ZIP, SSE and browser UI are real. No live Google login or
+Gemini generation was performed. Executable launcher checks use official
+PowerShell 7.6.8 on Linux; native Windows cmd/PowerShell 5.1 startup still requires
+a target-machine smoke test. The single Python skip and legacy browser skip are
+explicit opt-ins, not hidden failures. Chromium's missing system libraries were
+installed before the final passing browser run.
+
+## Previous Donepixel + automatic History archive baseline
+
+Checks recorded for that earlier update:
 
 - **60 Python tests passed, 1 intentional opt-in model skip** (209.48s).
   Includes existing image/launcher regressions and 14 new Donepixel cases:
@@ -87,7 +140,7 @@ this is not a Windows startup smoke test. The launcher now waits for the actual
 worker `/api/health` fields (`ok`, `connected`, `unified`), which match the API.
 That launcher-only follow-up did not change the frontend or image pipeline;
 its prior validation results are retained above. The Donepixel update now
-re-runs those launcher/image regressions as part of the 60-test passing suite.
+re-runs those launcher/image regressions as part of the 80-test passing suite.
 
 ## Scope and limits
 

@@ -38,7 +38,7 @@ from pydantic import BaseModel, Field
 
 from . import browser, db, elite_tools, gemini_pool, image_lab, output_store, p2p_batches, trademark_shield, trends_local
 
-WORKER_VERSION = "2.3.0-donepixel"
+WORKER_VERSION = "2.4.0-real-accounts-single-output"
 
 OUT_DIR = Path(os.environ.get("MERCHFLOW_OUT") or (Path(__file__).resolve().parents[2] / "output")).resolve()
 OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -88,28 +88,25 @@ async def bridge_probe() -> dict:
 # ------------------------------------------------------------- accounts
 @app.get("/api/accounts")
 async def api_accounts() -> dict:
-    return {"source": "sqlite", "items": db.list_accounts()}
-
-
-class AccountCreateReq(BaseModel):
-    label: str
-    email: str
-    provider: str = "chrome"
+    rows = await asyncio.to_thread(db.list_accounts)
+    live = {row["id"]: row for row in gemini_pool.profile_cards()}
+    return {"source": "sqlite", "items": [{**row, **live.get(row["id"], {})} for row in rows]}
 
 
 @app.post("/api/accounts")
-async def api_accounts_post(req: AccountCreateReq) -> JSONResponse:
-    return JSONResponse(db.add_account(req.label, req.email, req.provider))
-
-
-class AccountPatchReq(BaseModel):
-    id: int
-    status: str | None = None
-
-
 @app.patch("/api/accounts")
-async def api_accounts_patch(req: AccountPatchReq) -> dict:
-    return db.patch_account(req.id, req.status)
+async def reject_manual_account_creation() -> None:
+    raise HTTPException(405, "Accounts can only be connected through the real Google/Gemini browser login")
+
+
+@app.delete("/api/accounts")
+async def api_accounts_delete(id: int) -> dict:
+    try:
+        if not await asyncio.to_thread(gemini_pool.POOL.remove, id):
+            raise HTTPException(404, "Account not found")
+        return {"ok": True}
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
 
 
 # ------------------------------------------------------------------ jobs
@@ -243,23 +240,10 @@ async def api_listings_post(req: ListingReq) -> JSONResponse:
 # ===========================================================================
 # Engine endpoints (identical to before) + /api/bridge aliases
 # ===========================================================================
-class CookiesReq(BaseModel):
-    id: int
-    psid: str
-    psidts: str | None = ""
-    label: str | None = None
-    email: str | None = None
-
-
 @app.post("/accounts/cookies")
 @app.post("/api/bridge/accounts")
-async def set_cookies(req: CookiesReq) -> JSONResponse:
-    if not req.psid or len(req.psid.strip()) < 20:
-        return JSONResponse({"ok": False, "authed": False, "reason": "__Secure-1PSID looks too short."}, status_code=400)
-    result = await asyncio.to_thread(
-        gemini_pool.POOL.verify_cookies, req.id, req.psid, req.psidts or "", req.label, req.email
-    )
-    return JSONResponse(result, status_code=200 if result.get("ok") else 401)
+async def reject_manual_cookies() -> None:
+    raise HTTPException(405, "Pasted credentials cannot create an account. Use Add Gemini Account and complete the real browser login")
 
 
 @app.get("/accounts/status")
@@ -271,8 +255,8 @@ async def accounts_status() -> dict:
 
 # -------------------------------------------------- one-time login window
 class LoginStartReq(BaseModel):
-    provider: str = "chrome"
-    slot: int | None = None
+    provider: Literal["chrome", "brave", "edge"] = "chrome"
+    slot: int | None = Field(default=None, ge=1)
 
 
 @app.post("/accounts/login/start")
@@ -301,7 +285,7 @@ async def login_status(flow_id: str) -> JSONResponse:
 @app.post("/accounts/login/cancel/{flow_id}")
 @app.post("/api/bridge/login/flow/{flow_id}")
 async def login_cancel(flow_id: str) -> JSONResponse:
-    flow = browser.cancel_flow(flow_id)
+    flow = await asyncio.to_thread(browser.cancel_flow, flow_id)
     if not flow:
         return JSONResponse({"ok": False, "reason": "login session not found"}, status_code=404)
     return JSONResponse(flow)

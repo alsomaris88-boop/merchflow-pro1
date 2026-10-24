@@ -3,7 +3,7 @@ MerchFlow Pro — headless Gemini client (the Donepixel paradigm).
 
 ZERO browser windows. ZERO CDP. Pure, silent HTTPS:
 
-  * Session cookies  __Secure-1PSID / __Secure-1PSIDTS  (pasted once per account)
+  * Session cookies  __Secure-1PSID / __Secure-1PSIDTS  (verified real browser login)
   * SNlM0e token     scraped from https://gemini.google.com/app HTML
   * batchexecute RP  POST /_/BardChatUi/data/batchexecute  (rpcids=maZAc)
   * Imagen 3 bytes   downloaded straight from the lh3 URLs in the RPC reply
@@ -104,10 +104,10 @@ class GeminiClient:
         html = resp.text
 
         m = re.search(r'"SNlM0e":"(.*?)"', html)
-        if not m:
+        if not m or not m.group(1):
             raise GeminiAuthError(
                 "SNlM0e token not found — cookies expired, invalid, or the "
-                "account is signed out. Re-paste fresh __Secure-1PSID."
+                "account is signed out. Reconnect with the Google/Gemini browser login."
             )
         self.token = m.group(1)
 
@@ -116,7 +116,7 @@ class GeminiClient:
         self.bl = bl.group(1) if bl else DEFAULT_BL
         self.f_sid = sid.group(1) if sid else None
 
-        mail = re.search(r'([a-zA-Z0-9._%+-]+@(?:gmail|googlemail)\.com)', html)
+        mail = re.search(r'([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})', html)
         if mail:
             self.email = mail.group(1)
 
@@ -264,12 +264,15 @@ class GeminiClient:
             raise GeminiRenderError(
                 "no Imagen URL in RPC response (rate limit / content refusal / protocol drift)"
             )
+        # Strict single-output contract: even if Gemini returns several asset
+        # candidates, download only the first. Never loop over alternatives.
         return self._download(urls[0])
 
     @staticmethod
     def _download(url: str) -> bytes:
-        # request the large rendition via lh3 sizing suffix
-        url = re.sub(r"=s\d+(-[-a-z0-9]+)?$", "=s2048", url) if "=s" in url else f"{url}=s2048"
+        # Request the original rendition; never down-cap an 8K provider result
+        # to 2048px before the verified print export.
+        url = re.sub(r"=s\d+(-[-a-z0-9]+)?$", "=s0", url) if "=s" in url else f"{url}=s0"
         for attempt in (1, 2, 3):
             try:
                 r = httpx.get(url, headers={"User-Agent": USER_AGENT}, timeout=90, follow_redirects=True)
@@ -295,11 +298,15 @@ def parse_generated_image_urls(text: str, exclude: set[str] | None = None) -> li
     """
     exclude = exclude or set()
     seen: list[str] = []
+    bases: set[str] = set()
     for u in _LH3_RE.findall(text):
         base = re.sub(r"=s\d+(-[-a-z0-9]+)?$", "", u)
         if any(base in e or e in base for e in exclude):
             continue
-        if base not in seen:
+        if base not in bases:
+            bases.add(base)
             seen.append(u)
-    seen.sort(key=lambda u: ("gg-dl" not in u, len(seen) - seen.index(u)))
+    # Python's stable sort preserves the first candidate. Do not inspect the
+    # list itself inside its sort key (CPython temporarily empties that list).
+    seen.sort(key=lambda u: "gg-dl" not in u)
     return seen

@@ -34,9 +34,6 @@ def worker(tmp_path, monkeypatch):
     monkeypatch.setattr(module, "OUT_DIR", tmp_path / "output")
     monkeypatch.setattr(module.db, "DB_PATH", tmp_path / "app.sqlite")
     module.db.init()
-    config = tmp_path / "accounts.json"
-    config.write_text('{"accounts":[]}')
-    monkeypatch.setattr(gemini_pool, "CONFIG_PATH", config)
     pool = gemini_pool.AccountPool()
     pool.accounts = [gemini_pool.AccountState(id=i, status="ready", is_pro=True) for i in (1, 2, 3)]
     monkeypatch.setattr(gemini_pool, "POOL", pool)
@@ -101,7 +98,7 @@ def finish(client, batch_id):
 @pytest.mark.parametrize("size", [1, 5, 20, 101])
 def test_dynamic_batches_archive_every_real_print_before_success_and_without_browser_download(worker, size):
     client, module, pool, metrics = worker
-    batch_id = create_upload_start(client, size, colour="#0A192F")
+    batch_id = create_upload_start(client, size, colour="#FFFFFF")
     # No SSE subscription and no active Pixel component is required to finish.
     result = finish(client, batch_id)
     assert result["status"] == "completed", result
@@ -126,7 +123,8 @@ def test_dynamic_batches_archive_every_real_print_before_success_and_without_bro
     saved = [ev for _, ev in events if ev["type"] == "design.saved"]
     assert len(saved) == size
     assert {event["design"]["id"] for event in saved} == {r["id"] for r in history}
-    assert len(metrics["calls"]) == size
+    assert len(metrics["calls"]) == size  # one provider result per input, never 3N
+    assert len({item["design_id"] for item in result["items"]}) == size
     if size > 1:
         assert metrics["peak"] >= 2
         assert len({call[0] for call in metrics["calls"]}) >= 2
@@ -139,8 +137,8 @@ def test_dynamic_batches_archive_every_real_print_before_success_and_without_bro
 
 def test_exact_prompt_and_single_reference_are_sent_to_each_provider(worker):
     client, module, pool, metrics = worker
-    finish(client, create_upload_start(client, 2, colour="#FDFBF7"))
-    expected = "Recreate this exact uploaded image in ultra-high quality, 8K resolution, and high definition. Maintain 100% fidelity to the original composition, overall style, colors, characters, fonts, and graphic elements. Enhance all textures, sharpen blurry lines, clean up low-resolution artifacts, and make it look like a crisp, professional graphic design ready for high-quality printing. Do not alter or change the elements, just upgrade the visual clarity, sharpness, and quality. Render the clean artwork on a solid background of: #FDFBF7."
+    finish(client, create_upload_start(client, 2, colour="#FFFFFF"))
+    expected = "Recreate this exact uploaded graphic artwork in ultra-high resolution, 8K crisp print definition. Maintain 100% fidelity to the original composition, typography, characters, and graphic elements. Do NOT add variations, do NOT alter the subject or layout. Clean up all low-resolution artifacts, blur, and fabric wrinkles, and render the exact clean artwork strictly on a solid background of: #FFFFFF."
     for _, prompt, references in metrics["calls"]:
         assert prompt == expected
         assert len(references) == 1 and references[0][0] == reference_png()
@@ -215,7 +213,10 @@ def test_history_outbox_failure_rolls_back_png_thumbnail_and_job(worker, monkeyp
 def test_auth_mock_missing_vips_and_invalid_input_are_never_fake_success(worker, monkeypatch):
     client, module, pool, metrics = worker
     payload = {"items": [{"id": "one", "name": "a.png"}]}
-    assert client.post("/api/bridge/p2p/batches", json={**payload, "background": "invalid"}).status_code == 422
+    assert client.post("/api/bridge/p2p/batches", json={**payload, "outputsPerInput": 3}).status_code == 422
+    assert client.post("/api/bridge/p2p/batches", json={**payload, "variants": 3}).status_code == 422
+    for background in ("invalid", "#808080", "#123ABC"):
+        assert client.post("/api/bridge/p2p/batches", json={**payload, "background": background}).status_code == 422
     assert client.post("/api/bridge/p2p/batches", json={"items": []}).status_code == 422
     assert client.post("/api/bridge/p2p/batches", json={"items": payload["items"] * 2}).status_code == 422
     for account in pool.accounts:

@@ -11,6 +11,7 @@ from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
+from typing import Literal
 import re
 import shutil
 import sqlite3
@@ -21,7 +22,7 @@ import uuid
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from PIL import Image
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from . import gemini_pool, image_lab, output_store
 
@@ -109,7 +110,9 @@ class BatchItem(BaseModel):
 
 
 class BatchRequest(BaseModel):
-    background: str = Field(default="#000000", pattern=r"^#[0-9a-fA-F]{6}$")
+    model_config = ConfigDict(extra="forbid")
+    outputsPerInput: Literal[1] = 1
+    background: Literal["#000000", "#FFFFFF"] = "#000000"
     items: list[BatchItem] = Field(min_length=1)
 
     @model_validator(mode="after")

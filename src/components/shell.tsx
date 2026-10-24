@@ -184,9 +184,7 @@ export function Shell({
           </div>
           <div className="flex items-center gap-3">
             <div className="hidden sm:block font-mono2 text-[11px] text-white/35 tabular-nums">{clock} LOCAL</div>
-            <div className="h-8 w-8 rounded-xl bg-gradient-to-br from-[#c9f24b]/25 to-viol-500/25 border border-white/10 flex items-center justify-center font-display font-bold text-[12px]">
-              MF
-            </div>
+
           </div>
         </header>
 

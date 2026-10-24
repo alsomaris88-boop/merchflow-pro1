@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { ArrowRight, Check, History, ImageUp, Loader2, Palette, Sparkles, X } from "lucide-react";
-import { Btn, Card, Chip, Field, Input, PageHead, Section, cx } from "@/components/ui";
+import { Btn, Card, Chip, PageHead, Section, cx } from "@/components/ui";
 import { probeBridge, type BridgeStatus } from "@/lib/bridge";
 import { COLOUR_SWATCHES, generationLabel, normaliseHex, type PixelInput } from "@/lib/p2p-client";
 import { usePixelBatch } from "@/lib/use-p2p-batch";
@@ -12,15 +12,11 @@ import type { ViewKey } from "@/components/shell";
 export default function PixelToPixel({ setView }: { setView: (view: ViewKey) => void }) {
   const [inputs, setInputs] = useState<PixelInput[]>([]);
   const [colour, setColour] = useState("#000000");
-  const [custom, setCustom] = useState(false);
-  const [customHex, setCustomHex] = useState("#000000");
   const [bridge, setBridge] = useState<BridgeStatus>({ connected: false });
   const [inputError, setInputError] = useState("");
   const fileInput = useRef<HTMLInputElement>(null);
   const urls = useRef(new Set<string>());
   const generation = usePixelBatch();
-  const selectedHex = custom ? customHex : colour;
-  const validHex = /^#[0-9a-f]{6}$/i.test(selectedHex);
   const batch = generation.batch;
 
   useEffect(() => {
@@ -52,13 +48,12 @@ export default function PixelToPixel({ setView }: { setView: (view: ViewKey) => 
     urls.current.clear(); setInputs([]); setInputError("");
   };
   const generate = async () => {
-    if (!validHex) { setInputError("Enter a six-digit custom hex colour."); return; }
-    await generation.run(inputs, normaliseHex(selectedHex));
+    await generation.run(inputs, normaliseHex(colour));
   };
 
   return <div>
     <PageHead kicker="MODULE 03 · DONEPIXEL PIXEL TO PIXEL" title="Your designs. Back on your colour."
-      desc="Drop any batch size—1, 5, 20, 50, 100 or more. Available Gemini Pro accounts recreate designs in parallel; every verified print PNG is saved to output/ and auto-archived in Designs History."
+      desc="Drop any batch size—1, 5, 20, 50, 100 or more. Available Gemini Pro accounts recreate designs in parallel; exactly one verified PNG per input is saved to output/ and auto-archived in Designs History."
       right={<Chip tone={bridge.connected && !bridge.mock ? "lime" : "neutral"}>{bridge.mock ? "MOCK MODE · BLOCKED" : bridge.connected ? "DISK + LIVE HISTORY" : "ENGINE OFFLINE"}</Chip>} />
     {(inputError || generation.error) && <div role="alert" className="mb-4 border border-red-400/30 rounded-xl bg-red-500/10 p-4 text-sm text-red-200">{inputError || generation.error}</div>}
     <div className="grid xl:grid-cols-5 gap-4">
@@ -84,25 +79,23 @@ export default function PixelToPixel({ setView }: { setView: (view: ViewKey) => 
         </Card>
         <Card className="p-5">
           <fieldset disabled={generation.running}>
-            <Section icon={<Palette size={16} />} title="Choose your background colour" desc="The exact hex is included in every multimodal Gemini prompt." />
-            <div role="radiogroup" aria-label="Background colour" className="grid grid-cols-4 gap-2">
-              {COLOUR_SWATCHES.map((option) => <button key={option.hex} type="button" role="radio" aria-label={option.label} aria-checked={!custom && colour === option.hex}
-                onClick={() => { setColour(option.hex); setCustom(false); }} className={cx("rounded-xl border p-3 text-left text-[11px] font-semibold", !custom && colour === option.hex ? "border-[#c9f24b]/60 bg-[#c9f24b]/10" : "border-white/10 text-white/55")}>
-                <span className="flex items-center justify-center w-8 h-8 mb-2 rounded-full border border-white/25" style={{ backgroundColor: option.hex }}>{!custom && colour === option.hex && <Check size={16} className={option.hex === "#FDFBF7" ? "text-black" : "text-white"} />}</span>
-                {option.label}<span className="block text-[9px] text-white/35 mt-1">{option.hex}</span>
+            <Section icon={<Palette size={16} />} title="Target background" desc="Strict 1:1 recreation · one input image → exactly one PNG · no variants" />
+            <div role="radiogroup" aria-label="Target background colour" className="grid grid-cols-2 gap-3">
+              {COLOUR_SWATCHES.map((option) => <button key={option.hex} type="button" role="radio" aria-label={option.label} aria-checked={colour === option.hex}
+                onClick={() => setColour(option.hex)} className={cx("rounded-2xl border-2 p-5 text-left font-semibold transition-colors", colour === option.hex ? "border-[#c9f24b]/70 bg-[#c9f24b]/10" : "border-white/15 text-white/60")}>
+                <span className="flex items-center justify-center w-12 h-12 mb-3 rounded-full border border-white/30" style={{ backgroundColor: option.hex }}>{colour === option.hex && <Check size={23} className={option.hex === "#FFFFFF" ? "text-black" : "text-white"} />}</span>
+                <span className="text-base">{option.label}</span><span className="block text-xs font-mono2 text-white/50 mt-1">{option.hex}</span>
               </button>)}
-              <button type="button" role="radio" aria-label="Custom Hex" aria-checked={custom} onClick={() => setCustom(true)} className={cx("rounded-xl border p-3 text-left text-[11px] font-semibold", custom ? "border-[#c9f24b]/60 bg-[#c9f24b]/10" : "border-white/10 text-white/55")}><span className="block w-8 h-8 mb-2 rounded-full border border-white/25" style={{ background: custom && validHex ? customHex : "conic-gradient(#E65100,#1B4332,#808080,#6B1D2F,#E65100)" }} />Custom Hex</button>
             </div>
-            {custom && <div className="mt-4"><Field label="Custom background hex"><Input aria-label="Custom background hex" value={customHex} maxLength={7} onChange={(e) => setCustomHex(e.target.value)} placeholder="#000000" aria-invalid={!validHex} /></Field></div>}
           </fieldset>
           <div className="mt-5 flex flex-col gap-3">
-            <Btn variant="lime" className="justify-center" disabled={!inputs.length || generation.running || !validHex || !bridge.connected || bridge.mock || bridge.capabilities?.donepixelBatch === false} onClick={() => void generate()}>
+            <Btn variant="lime" className="justify-center" disabled={!inputs.length || generation.running || !bridge.connected || bridge.mock || bridge.capabilities?.donepixelBatch === false} onClick={() => void generate()}>
               {generation.running ? <Loader2 size={15} className="animate-spin" /> : <Sparkles size={15} />}{generation.uploading ? generation.uploadProgress : generation.running ? `${batch?.completed ?? 0} / ${batch?.total ?? inputs.length} archived · generating…` : generationLabel(inputs.length)}
             </Btn>
           </div>
         </Card>
         <Card className="p-4 text-xs text-white/45 leading-relaxed">
-          <strong className="text-white/75">Real files, not a browser download:</strong> streamed libvips export → 4500 × 5400 RGBA PNG → 300 DPI → verified disk write → SQLite History → live update. Lossless compression only; no palette or colour reduction. Files above 4 MB remain valid below the 25 MB ceiling. The prompt requests 8K clarity; actual provider resolution varies, and the final print canvas is 4500 × 5400, with aspect ratio preserved and colour-matched padding.
+          <strong className="text-white/75">Real files, not a browser download:</strong> streamed libvips export → 4500 × 5400 RGBA PNG → 300 DPI → verified disk write → SQLite History → live update. Lossless compression only; no palette or colour reduction. Files above 4 MB remain valid below the 25 MB ceiling. Strictly one output per input, never candidate sets. The exact prompt requests 8K clarity; actual provider resolution varies, and the final print canvas is 4500 × 5400, with aspect ratio preserved and colour-matched padding.
         </Card>
       </div>
       <div className="xl:col-span-2 space-y-4">

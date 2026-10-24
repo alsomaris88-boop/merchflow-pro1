@@ -22,10 +22,19 @@ CREATE TABLE IF NOT EXISTS accounts (
   label TEXT NOT NULL,
   email TEXT NOT NULL DEFAULT '',
   provider TEXT NOT NULL DEFAULT 'chrome',
-  status TEXT NOT NULL DEFAULT 'ready',
+  status TEXT NOT NULL DEFAULT 'auth-required',
   daily_used INTEGER NOT NULL DEFAULT 0,
   daily_cap INTEGER NOT NULL DEFAULT 200,
   total_generated INTEGER NOT NULL DEFAULT 0,
+  secure_1psid TEXT NOT NULL DEFAULT '',
+  secure_1psidts TEXT NOT NULL DEFAULT '',
+  login_flow_id TEXT NOT NULL DEFAULT '',
+  verified_at REAL NOT NULL DEFAULT 0,
+  is_pro INTEGER NOT NULL DEFAULT 0,
+  window_usage INTEGER NOT NULL DEFAULT 0,
+  window_started REAL NOT NULL DEFAULT 0,
+  cooldown_until REAL NOT NULL DEFAULT 0,
+  weekly_used INTEGER NOT NULL DEFAULT 0,
   created_at REAL
 );
 CREATE TABLE IF NOT EXISTS jobs (
@@ -73,48 +82,25 @@ DEMO_KEYS = {
     "MF-STARTER-DEMO-2026-0003": {"plan": "starter", "seats": 2},
 }
 
-SEED_ACCOUNTS = [
-    ("Profile 01", "merchflow.alpha@gmail.com", "chrome", "active", 21, 812),
-    ("Profile 02", "mf.bravo.studio@gmail.com", "brave", "ready", 9, 655),
-    ("Profile 03", "charlie.prints.mf@gmail.com", "chrome", "cooldown", 38, 944),
-    ("Profile 04", "delta.merchlab@gmail.com", "edge", "ready", 3, 431),
-    ("Profile 05", "echo.podworks@gmail.com", "brave", "ready", 0, 209),
-]
-
-SEED_JOBS = [
-    ("Retro Wavy", "Pickleball", "4:5", "transparent", "", "Profile 01", 71000, 240),
-    ("Kawaii", "Axolotl", "4:5", "white", "", "Profile 02", 68000, 720),
-    ("Distressed Badge", "Welder Skull", "4:5", "transparent", "", "Profile 03", 74000, 2640),
-    ("Linework", "Celestial Moth", "4:5", "black", "", "Profile 04", 66000, 5280),
-]
-
-SEED_LISTINGS = [
-    (
-        "bass fishing", "Fishing Culture Co", "Vintage Bass Fishing Design",
-        "Striking vintage bass fishing artwork with distressed badge styling — made for men and women who live and breathe everything fishing. A conversation-starting graphic that pops on any base colorway.",
-        "Pairs effortlessly with denim, joggers or a flannel layer. Ideal for birthdays, holidays and weekend hangouts. A clean, expressive look for anglers.",
-        "Bass Fishing | Vintage Graphic Design",
-        "Bass fishing design in a vintage style with distressed badge. Perfect for anglers who love the lake.",
-        "bass fishing",
-        "bass fishing, fishing lover, fishing design, vintage fishing, funny fishing, fishing art, fishing gift, retro fishing, angler, lake life",
-        0, 1860,
-    ),
-    (
-        "roller skating", "Skating Culture Co", "Groovy Roller Skating Design",
-        "Striking groovy roller skating artwork with 70s sunset palette — made for men and women who live and breathe everything skating.",
-        "Pairs effortlessly with denim, joggers or a flannel layer. Ideal for game nights, parties and everyday wear.",
-        "Roller Skating | Groovy Graphic Design",
-        "Roller skating design in a groovy 70s style with sunset palette. Perfect for skaters.",
-        "roller skating",
-        "roller skating, skating lover, skating design, groovy skating, funny skating, skating art, skating gift, vintage skating, retro skating, disco skating",
-        0, 3960,
-    ),
-]
+# Existing installations may contain unverified account metadata. New session
+# columns distinguish real browser-linked credentials from that old data.
+ACCOUNT_COLUMNS = {
+    "secure_1psid": "TEXT NOT NULL DEFAULT ''",
+    "secure_1psidts": "TEXT NOT NULL DEFAULT ''",
+    "login_flow_id": "TEXT NOT NULL DEFAULT ''",
+    "verified_at": "REAL NOT NULL DEFAULT 0",
+    "is_pro": "INTEGER NOT NULL DEFAULT 0",
+    "window_usage": "INTEGER NOT NULL DEFAULT 0",
+    "window_started": "REAL NOT NULL DEFAULT 0",
+    "cooldown_until": "REAL NOT NULL DEFAULT 0",
+    "weekly_used": "INTEGER NOT NULL DEFAULT 0",
+}
 
 
 def conn() -> sqlite3.Connection:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     c = sqlite3.connect(str(DB_PATH), timeout=10, check_same_thread=False)
+    os.chmod(DB_PATH, 0o600)
     c.row_factory = sqlite3.Row
     c.execute("PRAGMA journal_mode=WAL")
     return c
@@ -127,27 +113,14 @@ def init() -> None:
         for name in ("design_id", "design_path"):
             if name not in columns:
                 c.execute(f"ALTER TABLE listings ADD COLUMN {name} TEXT NOT NULL DEFAULT ''")
-        n = c.execute("SELECT COUNT(*) AS n FROM accounts").fetchone()["n"]
-        if n == 0:
-            for label, email, provider, status, used, total in SEED_ACCOUNTS:
-                c.execute(
-                    "INSERT INTO accounts (label,email,provider,status,daily_used,total_generated,created_at) VALUES (?,?,?,?,?,?,?)",
-                    (label, email, provider, status, used, total, time.time()),
-                )
-            n2 = c.execute("SELECT COUNT(*) AS n FROM jobs").fetchone()["n"]
-            if n2 == 0:
-                for s1, s2, asp, bg, txt, acct, ms, ago in SEED_JOBS:
-                    c.execute(
-                        "INSERT INTO jobs (style_name,niche_name,aspect,background,text_override,account_label,duration_ms,created_at) VALUES (?,?,?,?,?,?,?,?)",
-                        (s1, s2, asp, bg, txt, acct, ms, time.time() - ago),
-                    )
-            n3 = c.execute("SELECT COUNT(*) AS n FROM listings").fetchone()["n"]
-            if n3 == 0:
-                for row in SEED_LISTINGS:
-                    c.execute(
-                        "INSERT INTO listings (niche,brand,title,bullet1,bullet2,tp_title,tp_description,main_tag,tags,risk_score,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                        (*row[:-1], time.time() - row[-1]),
-                    )
+        columns = {row["name"] for row in c.execute("PRAGMA table_info(accounts)")}
+        for name, definition in ACCOUNT_COLUMNS.items():
+            if name not in columns:
+                c.execute(f"ALTER TABLE accounts ADD COLUMN {name} {definition}")
+        # Never import the former JSON list or trust metadata-only rows. Real
+        # designs/jobs/listings are deliberately not deleted by this migration.
+        c.execute("DELETE FROM accounts WHERE verified_at<=0 OR login_flow_id='' OR length(trim(secure_1psid))<20 OR trim(email)=''")
+        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS verified_account_email ON accounts(lower(email))")
 
 # ------------------------------------------------------------------ helpers
 
@@ -156,32 +129,64 @@ def _rows(sql: str, params: tuple = ()) -> list[dict]:
         return [dict(r) for r in c.execute(sql, params).fetchall()]
 
 
+def session_rows() -> list[dict]:
+    """Private pool-only read. Never return these credential-bearing rows over HTTP."""
+    return _rows("SELECT * FROM accounts WHERE verified_at>0 AND login_flow_id!='' AND length(trim(secure_1psid))>=20 AND trim(email)!='' ORDER BY id")
+
+
 def list_accounts() -> list[dict]:
-    rows = _rows("SELECT * FROM accounts ORDER BY id ASC")
+    # Explicit projection: session credentials and login-flow identifiers must
+    # never escape into browser responses, health payloads or logs.
     return [
-        {
-            "id": r["id"], "label": r["label"], "email": r["email"], "provider": r["provider"],
-            "status": r["status"], "dailyUsed": r["daily_used"], "dailyCap": r["daily_cap"],
-            "totalGenerated": r["total_generated"],
-        }
-        for r in rows
+        {"id": r["id"], "label": r["label"], "email": r["email"], "provider": r["provider"],
+         "status": r["status"], "dailyUsed": r["daily_used"], "dailyCap": r["daily_cap"],
+         "totalGenerated": r["total_generated"], "verifiedAt": r["verified_at"],
+         "authSource": "browser-login", "hasCookies": True}
+        for r in session_rows()
     ]
 
 
-def add_account(label: str, email: str, provider: str) -> dict:
-    with _lock, conn() as c:
-        cur = c.execute(
-            "INSERT INTO accounts (label,email,provider,status,created_at) VALUES (?,?,?,?,?)",
-            (label[:40], email[:120], provider[:20], "auth-required", time.time()),
-        )
-        return {"ok": True, "item": {"id": cur.lastrowid}}
+def next_account_id() -> int:
+    rows = _rows("SELECT seq FROM sqlite_sequence WHERE name='accounts'")
+    return int(rows[0]["seq"]) + 1 if rows else 1
 
 
-def patch_account(account_id: int, status: str | None = None) -> dict:
+def persist_browser_session(account_id: int, email: str, provider: str, psid: str, psidts: str, flow_id: str) -> dict:
+    """Internal intake, called only after live Gemini verification by the login flow."""
+    if not email.strip() or len(psid.strip()) < 20 or not flow_id:
+        raise ValueError("A verified browser login, account email and real session cookie are required")
     with _lock, conn() as c:
-        if status:
-            c.execute("UPDATE accounts SET status=? WHERE id=?", (status[:20], account_id))
-        return {"ok": True}
+        existing = c.execute("SELECT * FROM accounts WHERE lower(email)=lower(?)", (email,)).fetchone()
+        if existing:
+            account_id = existing["id"]
+        occupied = c.execute("SELECT email FROM accounts WHERE id=?", (account_id,)).fetchone()
+        if occupied and occupied["email"].casefold() != email.casefold():
+            raise ValueError("Sign in with the same Google account when reconnecting an existing account")
+        c.execute("""INSERT INTO accounts
+            (id,label,email,provider,status,secure_1psid,secure_1psidts,login_flow_id,verified_at,is_pro,created_at)
+            VALUES (?,?,?,?,'ready',?,?,?,?,1,?)
+            ON CONFLICT(id) DO UPDATE SET
+              label=excluded.label,email=excluded.email,provider=excluded.provider,status='ready',
+              secure_1psid=excluded.secure_1psid,secure_1psidts=excluded.secure_1psidts,
+              login_flow_id=excluded.login_flow_id,verified_at=excluded.verified_at,is_pro=1""",
+            (account_id,email,email,provider,psid,psidts,flow_id,time.time(),time.time()))
+        return dict(c.execute("SELECT * FROM accounts WHERE id=?", (account_id,)).fetchone())
+
+
+def save_account_states(rows: list[dict]) -> None:
+    with _lock, conn() as c:
+        for row in rows:
+            c.execute("""UPDATE accounts SET status=?,window_usage=?,window_started=?,
+                cooldown_until=?,is_pro=?,daily_used=?,weekly_used=?,total_generated=?
+                WHERE id=? AND login_flow_id=? AND verified_at>0""",
+                (row["status"],row["window_usage"],row["window_started"],row["cooldown_until"],
+                 row["is_pro"],row["daily_used"],row["weekly_used"],row["total_generated"],
+                 row["id"],row["login_flow_id"]))
+
+
+def delete_account(account_id: int) -> bool:
+    with _lock, conn() as c:
+        return c.execute("DELETE FROM accounts WHERE id=?", (account_id,)).rowcount == 1
 
 
 def list_jobs(limit: int = 24) -> list[dict]:

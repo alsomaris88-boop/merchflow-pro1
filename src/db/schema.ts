@@ -1,19 +1,5 @@
 import { pgTable, serial, text, integer, timestamp, boolean } from "drizzle-orm/pg-core";
 
-/** Gemini pool accounts (isolated browser profiles) */
-export const accounts = pgTable("accounts", {
-  id: serial("id").primaryKey(),
-  label: text("label").notNull(),
-  email: text("email").notNull(),
-  provider: text("provider").notNull().default("chrome"), // chrome | brave | edge
-  status: text("status").notNull().default("ready"), // ready | active | cooldown | offline
-  dailyUsed: integer("daily_used").notNull().default(0),
-  dailyCap: integer("daily_cap").notNull().default(38),
-  totalGenerated: integer("total_generated").notNull().default(0),
-  lastHeartbeat: timestamp("last_heartbeat").defaultNow(),
-  createdAt: timestamp("created_at").defaultNow(),
-});
-
 /** Generation jobs routed through the account pool */
 export const jobs = pgTable("jobs", {
   id: serial("id").primaryKey(),

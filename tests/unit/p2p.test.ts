@@ -16,7 +16,7 @@ function storage() {
 }
 
 test("Donepixel swatches use exact requested hexes and dynamic labels do not cap N", () => {
-  assert.deepEqual(COLOUR_SWATCHES.map((s) => s.hex), ["#808080", "#000000", "#FDFBF7", "#0A192F", "#6B1D2F", "#1B4332", "#E65100"]);
+  assert.deepEqual(COLOUR_SWATCHES.map((s) => s.hex), ["#000000", "#FFFFFF"]);
   for (const n of [1, 5, 20, 50, 101, 217]) assert.equal(generationLabel(n), `${n} designs in, ${n} back on your colour. ▷ Generate`);
   assert.equal(normaliseHex("#aBcDeF"), "#ABCDEF");
   assert.throws(() => normaliseHex("#ABC"));
@@ -44,6 +44,7 @@ for (const n of [1, 5, 20, 101]) {
       const manifest = JSON.parse(String(init.body));
       assert.equal(manifest.items.length, n);
       assert.equal(manifest.background, "#000000");
+      assert.equal(manifest.outputsPerInput, 1);
       manifest.items.forEach((item: { id: string; name: string }, index: number) => {
         assert.notEqual(item.id, inputs[index].id);
         assert.equal(item.name, inputs[index].file.name);
@@ -113,8 +114,8 @@ test("regenerating retained files on another colour creates fresh job identities
   const inputs = [{ id: "retained-selection", file: new File(["source"], "same.png"), url: "blob:same" }];
   try {
     await submitPixelBatch(inputs, "#000000", () => {}, () => {});
-    await submitPixelBatch(inputs, "#0A192F", () => {}, () => {});
-    assert.deepEqual(colours, ["#000000", "#0A192F"]);
+    await submitPixelBatch(inputs, "#FFFFFF", () => {}, () => {});
+    assert.deepEqual(colours, ["#000000", "#FFFFFF"]);
     assert.equal(uploads, 2); assert.equal(seen.size, 2);
     assert.equal(inputs[0].id, "retained-selection");
   } finally { restoreFetch(); restoreStorage(); }

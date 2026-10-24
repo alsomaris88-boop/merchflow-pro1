@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode, type HTMLAttributes, type ButtonHTMLAttributes } from "react";
 import { Check, Copy, Loader2 } from "lucide-react";
 import clsx from "clsx";
 
@@ -11,13 +11,14 @@ export function Card({
   className,
   children,
   glow,
-}: {
-  className?: string;
+  ...props
+}: HTMLAttributes<HTMLDivElement> & {
   children: ReactNode;
   glow?: boolean;
 }) {
   return (
     <div
+      {...props}
       className={cx(
         "glass rounded-2xl relative overflow-hidden",
         glow && "shadow-[0_0_60px_-18px_rgba(124,90,255,0.55)]",
@@ -65,9 +66,9 @@ export function Btn({
   className,
   disabled,
   title,
-}: {
+  ...props
+}: ButtonHTMLAttributes<HTMLButtonElement> & {
   children: ReactNode;
-  onClick?: () => void;
   variant?: "primary" | "ghost" | "lime" | "danger";
   className?: string;
   disabled?: boolean;
@@ -82,6 +83,8 @@ export function Btn({
   } as const;
   return (
     <button
+      type="button"
+      {...props}
       title={title}
       disabled={disabled}
       onClick={onClick}

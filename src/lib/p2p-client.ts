@@ -3,13 +3,8 @@ import { responseJson, type DesignRecord } from "./designs-store";
 export const P2P_EVENT = "merchflow:p2p-updated";
 export const P2P_BATCH_KEY = "merchflow:current-p2p-batch";
 export const COLOUR_SWATCHES = [
-  { label: "Grey", hex: "#808080" },
-  { label: "Black", hex: "#000000" },
-  { label: "Cream", hex: "#FDFBF7" },
-  { label: "Navy", hex: "#0A192F" },
-  { label: "Maroon", hex: "#6B1D2F" },
-  { label: "Forest Green", hex: "#1B4332" },
-  { label: "Orange", hex: "#E65100" },
+  { label: "Pitch Black", hex: "#000000" },
+  { label: "Pure White", hex: "#FFFFFF" },
 ] as const;
 export interface PixelInput { id: string; file: File; url: string }
 export interface PixelJob {
@@ -41,12 +36,14 @@ export async function submitPixelBatch(
   onUpload: (finished: number, total: number) => void,
 ): Promise<PixelBatch> {
   if (!inputs.length) throw new Error("Upload at least one design.");
+  const background = normaliseHex(colour);
+  if (!COLOUR_SWATCHES.some((option) => option.hex === background)) throw new Error("Choose Pitch Black or Pure White.");
   // A retained selection may be generated again on another colour. Selection
   // IDs are not job IDs: each run needs fresh global SQLite job identities.
   const jobs = inputs.map(({ file }) => ({ id: crypto.randomUUID(), file }));
   const data = await responseJson<{ batch: PixelBatch }>(await fetch(root, {
     method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ background: normaliseHex(colour), items: jobs.map(({ id, file }) => ({ id, name: file.name })) }),
+    body: JSON.stringify({ background, outputsPerInput: 1, items: jobs.map(({ id, file }) => ({ id, name: file.name })) }),
   }));
   const batch = data.batch;
   localStorage.setItem(P2P_BATCH_KEY, batch.id);

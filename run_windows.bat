@@ -63,9 +63,11 @@ REM Do not minimize it or use an unqualified uvicorn executable from PATH.
 start "MerchFlow Engine (uvicorn :8000)" "%ComSpec%" /d /s /k ""%~f0" --engine"
 if errorlevel 1 goto :launch_failed
 
-REM Wait for the actual worker health API, not merely any open TCP port.
+REM Cold imports (libvips/rembg/ONNX) can take time. Poll for up to 45 seconds.
+REM Require HTTP 200 from our worker, not just a listener or a Google account.
+REM No app browser/WebView can open before the readiness command succeeds.
 REM The exit marker aborts the wait immediately when the engine process exits.
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$deadline = (Get-Date).AddSeconds(45); while ($true) { if (Test-Path -LiteralPath $env:ENGINE_EXIT_FILE) { exit 1 }; if ((Get-Date) -gt $deadline) { exit 1 }; try { $health = Invoke-RestMethod -Uri 'http://127.0.0.1:8000/api/health' -TimeoutSec 1 -ErrorAction Stop; if ($health.ok -and $health.connected -and $health.unified) { if (Test-Path -LiteralPath $env:ENGINE_EXIT_FILE) { exit 1 }; exit 0 } } catch { }; Start-Sleep -Milliseconds 400 }"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$deadline = (Get-Date).AddSeconds(45); while ($true) { if (Test-Path -LiteralPath $env:ENGINE_EXIT_FILE) { exit 1 }; if ((Get-Date) -gt $deadline) { exit 1 }; try { $response = Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:8000/api/health' -TimeoutSec 1 -ErrorAction Stop; if ([int]$response.StatusCode -eq 200) { $health = $response.Content | ConvertFrom-Json; if ($health.ok -and $health.unified) { if (Test-Path -LiteralPath $env:ENGINE_EXIT_FILE) { exit 1 }; if ((Get-Date) -gt $deadline) { exit 1 }; exit 0 } } } catch { }; Start-Sleep -Milliseconds 400 }"
 if errorlevel 1 goto :engine_not_ready
 echo   Engine online.
 
