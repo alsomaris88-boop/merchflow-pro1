@@ -27,3 +27,7 @@ desktop/config/gemini_accounts.json
 *.sqlite-*
 *.sqlite3
 *.sqlite3-*
+
+# Persistent browser credentials / isolated account profiles
+desktop/profiles/
+desktop/config/*.json.part

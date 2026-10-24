@@ -130,6 +130,40 @@ def test_failed_postprocessing_produces_failed_event_not_image(worker, monkeypat
     assert output_store.list_designs(module.OUT_DIR) == []
 
 
+def test_fusion_injects_exact_client_directive_and_upload_order(worker, monkeypatch):
+    """Module 01 contract: the mandatory Style × Niche directive goes out
+    VERBATIM on every fusion job, with the niche uploaded as IMAGE 1 and the
+    style reference as IMAGE 2."""
+    client, module = worker
+    calls = []
+    account = SimpleNamespace(id=1, label="Test fixture provider")
+    pool = SimpleNamespace(accounts=[account], acquire=lambda: account, _wait_jitter=lambda a: None, note_render=lambda i: False)
+    raw = base64.b64decode(image_data().split(",")[1])
+    monkeypatch.setattr(module.gemini_pool, "POOL", pool)
+    monkeypatch.setattr(module.gemini_pool, "client_for", lambda account_id: SimpleNamespace(
+        generate_image=lambda prompt, references: (calls.append((prompt, references)), raw)[1]))
+    monkeypatch.setattr(image_lab, "remove_background", lambda image, model: image)
+    payload = {"styleImage": image_data(), "background": "black", "aspect": "1:1",
+               "nicheImages": [{"id": "one", "name": "fixture", "image": image_data()}]}
+    response = client.post("/api/bridge/generate", json=payload)
+    assert response.status_code == 200 and calls
+    prompt, references = calls[0]
+    # The exact client directive body is embedded untouched.
+    assert prompt.startswith(module.gemini_pool.FUSION_DIRECTIVE)
+    for clause in [
+        "[MANDATORY MULTIMODAL DIRECTIVE: STYLE × NICHE COMPLETE FUSION]",
+        "IMAGE 1 = The NICHE SUBJECT (The character/object/theme to be drawn)",
+        "IMAGE 2 = The ART STYLE REFERENCE (The visual DNA, aesthetic, and medium)",
+        "solid pitch-black background (#000000)",
+        "Generate the finished master apparel graphic now.",
+    ]:
+        assert clause in prompt
+    # Runtime operator settings arrive as an addendum, never rewriting the directive.
+    assert "[RUNTIME OPERATOR SETTINGS" in prompt and "1:1" in prompt
+    # Upload order is the contract: niche = IMAGE 1 first, style = IMAGE 2 second.
+    assert [name for _, name in references] == ["niche_one_IMAGE1.png", "style_ref_IMAGE2.png"]
+
+
 def test_pixel_api_uses_recreation_prompt_not_palette_transfer(worker, monkeypatch):
     client, module = worker
     provider = fake_provider(module, monkeypatch)

@@ -11,13 +11,14 @@ import csv
 import os
 import random
 import re
+import shutil
 import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from . import db, gemini_client, image_lab
+from . import db, gemini_cdp, gemini_client, image_lab
 from .gemini_client import GeminiAuthError, GeminiRenderError, ModelDegradedError
 
 MOCK = os.environ.get("MERCHFLOW_MOCK_ENGINE", "").lower() in {"1", "true", "yes"}
@@ -31,16 +32,40 @@ JITTER = (
     float(os.environ.get("MERCHFLOW_JITTER_MAX", 85)),
 )
 
-FUSION_PROMPT = """Act as a print-on-demand vector artist.
-IMAGE A is an ART-STYLE reference: extract ONLY its color palette, line weight,
-vector shading and surface texture. Completely IGNORE the subject matter of
-Image A — it must never appear in the output.
-IMAGE B is the NICHE SUBJECT: render this exact subject with perfect fidelity,
-redrawn 100% in the extracted style of Image A.
-{TEXT_RULE}
-Composition: single centred subject, clean silhouette edges, apparel design,
-no frames, no watermarks, no mockups.
-Aspect ratio {ASPECT}. Background instruction: {BG}."""
+# ---------------------------------------------------------------------------
+# CLIENT-MANDATED MULTIMODAL DIRECTIVE — injected VERBATIM into every
+# Gemini Pro Style × Niche fusion generation. Do not paraphrase, trim, or
+# reword a single character of the directive body.
+#
+# Reference upload order is contractually bound to this text:
+#   IMAGE 1 (first upload)  = the NICHE SUBJECT   (Dropzone B in Module 01)
+#   IMAGE 2 (second upload) = the ART STYLE        (Dropzone A in Module 01)
+# ---------------------------------------------------------------------------
+FUSION_DIRECTIVE = """[MANDATORY MULTIMODAL DIRECTIVE: STYLE × NICHE COMPLETE FUSION]
+
+I have provided two reference images:
+- IMAGE 1 = The NICHE SUBJECT (The character/object/theme to be drawn)
+- IMAGE 2 = The ART STYLE REFERENCE (The visual DNA, aesthetic, and medium)
+
+YOUR MISSION:
+Completely re-draw and synthesize the core subject of IMAGE 1 entirely inside the exact artistic medium and visual universe of IMAGE 2.
+
+EXECUTION RULES:
+
+1. STYLE EXTRACTION (From IMAGE 2):
+   - Extract the full visual DNA: exact color palette, line weight, shading method, lighting contrast, artistic medium (e.g. vintage screenprint, 90s bootleg rap tee, distressed retro vector, hand-drawn linework, or airbrush texture).
+   - STRICTLY FILTER OUT: Ignore any t-shirt mockups, fabric wrinkles, watermarks, background frames, logos, or overlaid stamps from IMAGE 2.
+
+2. SUBJECT EMBODIMENT (From IMAGE 1):
+   - Capture the essence, character, pose, and distinctive anatomy/features of the subject in IMAGE 1.
+   - Do NOT simply cut and paste IMAGE 1 onto IMAGE 2. You must re-imagine and illustrate the subject from scratch using IMAGE 2's visual grammar, textures, and color hierarchy.
+
+3. PRINT-ON-DEMAND GRAPHIC QUALITY:
+   - Output must be an ultra-high resolution (8K clarity), high-contrast, master apparel graphic design ready for commercial printing.
+   - Razor-sharp edges, vibrant focal subject, zero blur, zero random gibberish or garbled AI text.
+   - Background: Render the isolated graphic cleanly on a pure, solid pitch-black background (#000000) with zero t-shirt collars or garment borders.
+
+Generate the finished master apparel graphic now."""
 
 
 RECREATION_PROMPT = """Recreate the uploaded design concept as fresh, high-detail artwork.
@@ -74,31 +99,40 @@ def _build_prompt(payload: dict) -> str:
         return RECREATION_PROMPT.format(BG=bg, DIRECTION=payload.get("instructions") or "faithful concept recreation")
     text = (payload.get("textOverride") or "").strip()
     text_rule = (
-        f'TEXT OVERRIDE: render exactly the string "{text}" inside the design, '
-        "set in typography matching Image A lettering. Spell it perfectly."
+        f'TEXT OVERRIDE: additionally render exactly the string "{text}" inside the design, '
+        "set in typography matching IMAGE 2's lettering. Spell it perfectly."
         if text
         else "TEXT RULE: generate PURE GRAPHIC ART. Absolutely no letters, words, "
         "numbers or garbled pseudo-text anywhere in the image."
     )
+    # The directive mandates a pitch-black (#000000) backdrop. Only an explicit
+    # operator override below may relax that single clause (e.g. when the local
+    # worker is about to neural-mat the subject onto transparency).
     bg = {
-        "transparent": "subject isolated on a plain backdrop for neural alpha matting; clean edges",
-        "white": "solid white",
-        "black": "solid black",
-    }.get(payload.get("background") or "transparent", "solid white")
-    return FUSION_PROMPT.format(TEXT_RULE=text_rule, ASPECT=(payload.get("aspect") or "4:5"), BG=bg)
+        "transparent": "BACKGROUND OVERRIDE: despite the pitch-black clause above, render the isolated graphic on a plain, uniform, high-contrast backdrop so the local worker can neural-mat it to true transparency; keep edges razor-clean.",
+        "white": "BACKGROUND OVERRIDE: despite the pitch-black clause above, render the isolated graphic on a solid pure white background (RGB 255 255 255) with zero garment borders.",
+    }.get(payload.get("background") or "black")
+    addendum = (
+        "\n\n[RUNTIME OPERATOR SETTINGS — append-only; every clause of the mandatory "
+        "directive above remains in force unless a setting below explicitly overrides it]\n"
+        f"- Canvas aspect ratio: {payload.get('aspect') or '4:5'}.\n"
+        f"- {text_rule}\n"
+        + (f"- {bg}\n" if bg else "")
+    )
+    return FUSION_DIRECTIVE + addendum
 
 
 # --------------------------------------------------------------- clients
-CLIENTS: dict[int, gemini_client.GeminiClient] = {}
+CLIENTS: dict[int, gemini_client.GeminiClient | gemini_cdp.CdpGeminiClient] = {}
 _clients_lock = threading.Lock()
 
 
-def client_for(account_id: int) -> gemini_client.GeminiClient | None:
+def client_for(account_id: int) -> gemini_client.GeminiClient | gemini_cdp.CdpGeminiClient | None:
     with _clients_lock:
         return CLIENTS.get(account_id)
 
 
-def _register_client(account_id: int, client: gemini_client.GeminiClient | None) -> None:
+def _register_client(account_id: int, client: gemini_client.GeminiClient | gemini_cdp.CdpGeminiClient | None) -> None:
     with _clients_lock:
         old = CLIENTS.pop(account_id, None)
         if old:
@@ -117,11 +151,13 @@ class AccountState:
     secure_1psidts: str = field(default="", repr=False)
     login_flow_id: str = ""
     verified_at: float = 0.0
+    engine: str = "cookies"
+    profile_dir: str = field(default="", repr=False)
     status: str = "auth-required"          # ready | active | cooldown | auth-required
     window_usage: int = 0                  # renders inside the current 5h window
     window_started: float = 0.0            # first render of the window
     cooldown_until: float = 0.0            # unix ts — window resets here
-    is_pro: bool = False                   # verified Pro session (snlm0e init)
+    is_pro: bool = False                   # eligible for Pro attempts; provider enforces access
     last_used: float = 0.0
     daily_used: int = 0
     weekly_used: int = 0
@@ -139,6 +175,7 @@ class AccountPool:
         self.lock = threading.RLock()
         self.condition = threading.Condition(self.lock)
         self._busy: set[int] = set()
+        self._logins: set[int] = set()
         self.accounts: list[AccountState] = []
         self._load()
         self._warm_clients()
@@ -148,6 +185,8 @@ class AccountPool:
     def _from_row(row: dict) -> AccountState:
         account = AccountState(**{key: row[key] for key in AccountState.__dataclass_fields__ if key in row})
         account.is_pro = bool(account.is_pro)
+        if account.engine == "cdp" and not Path(account.profile_dir).is_dir():
+            account.status, account.is_pro = "auth-required", False
         if account.status == "active":
             account.status = "cooldown" if account.cooldown_until > time.time() else "ready"
         return account
@@ -170,7 +209,10 @@ class AccountPool:
 
     def _warm_clients(self) -> None:
         for a in self.accounts:
-            if a.secure_1psid:
+            if a.engine == "cdp":
+                if Path(a.profile_dir).is_dir():
+                    _register_client(a.id, gemini_cdp.CdpGeminiClient(a.id, a.provider, a.label, a.profile_dir))
+            elif a.secure_1psid:
                 _register_client(a.id, gemini_client.GeminiClient(a.secure_1psid, a.secure_1psidts or None, a.label))
 
     # ------------------------------ window lifecycle
@@ -187,6 +229,61 @@ class AccountPool:
     def next_free_slot(self) -> int:
         with self.lock:
             return max(db.next_account_id(), max((a.id for a in self.accounts), default=0) + 1)
+
+    def reserve_login(self, account_id: int) -> None:
+        with self.condition:
+            if account_id in self._busy:
+                raise RuntimeError("This account is generating; wait before reconnecting it")
+            if account_id in self._logins:
+                raise RuntimeError("A sign-in window for this account is already open")
+            self._logins.add(account_id)
+
+    def finish_login(self, account_id: int) -> None:
+        with self.condition:
+            self._logins.discard(account_id)
+            self.condition.notify_all()
+
+    def release_profile(self, account_id: int) -> None:
+        client = client_for(account_id)
+        if client is not None:
+            client.close()
+
+    def register_cdp_profile(self, flow) -> dict:
+        """Only an observed browser sign-in followed by a headless session probe
+        can commit a Chrome profile. Failed/cancelled attempts never insert rows.
+        The visible Chrome must be closed before this method is called.
+        """
+        with flow.lock:
+            if flow.state != "pending" or not flow.authentication_observed:
+                return {"ok": False, "authed": False, "reason": "Complete the real Google/Gemini browser login first"}
+        folder = Path(flow.user_data_dir).resolve()
+        root = gemini_cdp.PROFILES_ROOT.resolve()
+        if folder == root or not folder.is_relative_to(root):
+            return {"ok": False, "authed": False, "reason": "Invalid isolated account profile"}
+        candidate = gemini_cdp.CdpGeminiClient(flow.slot, flow.provider, "Google/Gemini login", folder)
+        try:
+            candidate.init()  # no generation: verify the same session headlessly
+            email = (candidate.email or flow.email or "").strip()
+            if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+                raise GeminiAuthError("Could not verify the signed-in Google account email")
+            if flow.email and email.casefold() != flow.email.casefold():
+                raise GeminiAuthError("The headless session does not match the signed-in Google account")
+            candidate.close()
+            with flow.lock, self.condition:
+                if flow.state != "pending":
+                    raise GeminiAuthError("Sign-in was cancelled; no account was saved")
+                if flow.slot in self._busy:
+                    raise GeminiAuthError("This account is generating; wait before reconnecting it")
+                row = db.persist_browser_profile(flow.slot, email, flow.provider, str(folder), flow.id)
+                account = self._from_row(row)
+                self.accounts = sorted([a for a in self.accounts if a.id != account.id] + [account], key=lambda a: a.id)
+                _register_client(account.id, gemini_cdp.CdpGeminiClient(account.id, account.provider, account.label, folder))
+                flow.email, flow.label, flow.state = email, email, "authenticated"
+                self.condition.notify_all()
+            return {"ok": True, "authed": True, "email": email, "label": email, "engine": "cdp", "headless": True}
+        except Exception as exc:
+            candidate.close()
+            return {"ok": False, "authed": False, "reason": str(exc)}
 
     def register_session(self, flow, psid: str, psidts: str, email: str | None) -> dict:
         """Only the real browser sensor may supply an observed login flow.
@@ -226,8 +323,20 @@ class AccountPool:
 
     def remove(self, account_id: int) -> bool:
         with self.condition:
-            if account_id in self._busy:
-                raise RuntimeError("This account is generating; wait before removing it")
+            if account_id in self._busy or account_id in self._logins:
+                raise RuntimeError("This account is generating or signing in; wait before removing it")
+            account = next((a for a in self.accounts if a.id == account_id), None)
+            if account and account.engine == "cdp":
+                self.release_profile(account_id)
+                folder = Path(account.profile_dir).resolve()
+                root = gemini_cdp.PROFILES_ROOT.resolve()
+                if folder == root or not folder.is_relative_to(root):
+                    raise RuntimeError("Refusing to delete a profile outside the isolated account directory")
+                if folder.exists():
+                    try:
+                        shutil.rmtree(folder)
+                    except OSError as exc:
+                        raise RuntimeError("Could not remove the local account profile; close its browser and retry") from exc
             removed = db.delete_account(account_id)
             self.accounts = [a for a in self.accounts if a.id != account_id]
             _register_client(account_id, None)
@@ -239,7 +348,7 @@ class AccountPool:
         with self.lock:
             self._reset_expired_locked()
             return sum(a.is_pro and a.status in {"ready", "active"}
-                       and a.window_usage < WINDOW_CAP and client_for(a.id) is not None
+                       and a.window_usage < WINDOW_CAP and a.id not in self._logins and client_for(a.id) is not None
                        for a in self.accounts)
 
     def acquire(self, *, parallel: bool = False, require_pro: bool = False,
@@ -258,6 +367,7 @@ class AccountPool:
                             and a.window_usage < WINDOW_CAP
                             and (not require_pro or a.is_pro)
                             and a.id not in (exclude or set())
+                            and a.id not in self._logins
                             and client_for(a.id) is not None]
                 free = [a for a in eligible if a.id not in self._busy]
                 if free:
@@ -343,7 +453,7 @@ class AccountPool:
             now = time.time()
             out = []
             for a in self.accounts:
-                if not a.login_flow_id or a.verified_at <= 0 or not a.secure_1psid:
+                if not a.login_flow_id or a.verified_at <= 0 or not (a.secure_1psid or (a.engine == "cdp" and a.profile_dir)):
                     continue
                 cool_left = max(0, int(a.cooldown_until - now)) if a.cooldown_until else 0
                 out.append(
@@ -355,7 +465,10 @@ class AccountPool:
                         "status": a.status,
                         "authed": a.status != "auth-required" and client_for(a.id) is not None,
                         "authSource": "browser-login", "verifiedAt": a.verified_at,
-                        "hasCookies": bool(a.secure_1psid),
+                        "hasCookies": bool(a.secure_1psid), "hasSession": True,
+                        "engine": a.engine,
+                        "transport": "cdp-headless" if a.engine == "cdp" else "httpx-rpc",
+                        "cdpPort": gemini_cdp.cdp_port(a.id) if a.engine == "cdp" else None,
                         "isPro": a.is_pro,
                         "headless": True,
                         "windowUsage": a.window_usage,
@@ -371,6 +484,16 @@ class AccountPool:
                     }
                 )
             return out
+
+
+def shutdown_clients() -> None:
+    with _clients_lock:
+        clients = list(CLIENTS.values())
+    for client in clients:
+        try:
+            client.close()
+        except Exception:
+            pass
 
 
 POOL = AccountPool()
@@ -444,7 +567,7 @@ def run_batch(payload: dict, push: Callable[[dict], None], out_dir: Path) -> dic
                 if client is None:
                     raise GeminiAuthError("No live provider session; connect an account in Account Pool")
                 push({"type": "progress", "job": job_id, "pct": 25, "msg": f"[{acct.label}] sending reference to the image provider"})
-                references = [(niche_bytes, "concept-reference.png")] if recreate else [(style_bytes, "style_ref.png"), (niche_bytes, f"niche_{job_id}.png")]
+                references = [(niche_bytes, "concept-reference.png")] if recreate else [(niche_bytes, f"niche_{job_id}_IMAGE1.png"), (style_bytes, "style_ref_IMAGE2.png")]
                 raw = client.generate_image(prompt, references)
                 POOL.note_render(acct.id)
                 break

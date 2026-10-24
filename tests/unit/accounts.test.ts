@@ -18,6 +18,8 @@ test("empty account message is the exact requested copy", () => {
 
 test("account UI admits only browser-verified SQLite session metadata", () => {
   assert.ok(isConnectedAccount(verified));
+  assert.ok(isConnectedAccount({ ...verified, engine: "cdp", hasCookies: false, hasSession: true }));
+  assert.equal(isConnectedAccount({ ...verified, engine: "cdp", hasCookies: false, hasSession: false }), false);
   for (const value of [null, {}, { id: 1, email: "unverified@example.test", status: "ready" },
     { ...verified, hasCookies: false }, { ...verified, verifiedAt: 0 }, { ...verified, verifiedAt: NaN },
     { ...verified, authSource: "pending" }, { ...verified, id: -1 }, { ...verified, email: "" }]) {

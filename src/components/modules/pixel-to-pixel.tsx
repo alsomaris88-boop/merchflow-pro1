@@ -1,12 +1,12 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { ArrowRight, Check, History, ImageUp, Loader2, Palette, Sparkles, X } from "lucide-react";
+import { ArrowRight, Check, FlaskConical, History, ImageUp, Loader2, Palette, Sparkles, X } from "lucide-react";
 import { Btn, Card, Chip, PageHead, Section, cx } from "@/components/ui";
 import { probeBridge, type BridgeStatus } from "@/lib/bridge";
 import { COLOUR_SWATCHES, generationLabel, normaliseHex, type PixelInput } from "@/lib/p2p-client";
 import { usePixelBatch } from "@/lib/use-p2p-batch";
-import { formatBytes } from "@/lib/designs-store";
+import { formatBytes, sendToPrepare } from "@/lib/designs-store";
 import type { ViewKey } from "@/components/shell";
 
 export default function PixelToPixel({ setView }: { setView: (view: ViewKey) => void }) {
@@ -81,7 +81,7 @@ export default function PixelToPixel({ setView }: { setView: (view: ViewKey) => 
           <fieldset disabled={generation.running}>
             <Section icon={<Palette size={16} />} title="Target background" desc="Strict 1:1 recreation · one input image → exactly one PNG · no variants" />
             <div role="radiogroup" aria-label="Target background colour" className="grid grid-cols-2 gap-3">
-              {COLOUR_SWATCHES.map((option) => <button key={option.hex} type="button" role="radio" aria-label={option.label} aria-checked={colour === option.hex}
+              {COLOUR_SWATCHES.map((option) => <button key={option.hex} type="button" role="radio" aria-label={option.label} aria-checked={colour === option.hex} data-testid={`p2p-bg-${option.hex.slice(1).toLowerCase()}`}
                 onClick={() => setColour(option.hex)} className={cx("rounded-2xl border-2 p-5 text-left font-semibold transition-colors", colour === option.hex ? "border-[#c9f24b]/70 bg-[#c9f24b]/10" : "border-white/15 text-white/60")}>
                 <span className="flex items-center justify-center w-12 h-12 mb-3 rounded-full border border-white/30" style={{ backgroundColor: option.hex }}>{colour === option.hex && <Check size={23} className={option.hex === "#FFFFFF" ? "text-black" : "text-white"} />}</span>
                 <span className="text-base">{option.label}</span><span className="block text-xs font-mono2 text-white/50 mt-1">{option.hex}</span>
@@ -117,6 +117,7 @@ export default function PixelToPixel({ setView }: { setView: (view: ViewKey) => 
                   {job.design.nativeW && <div>Provider {job.design.nativeW} × {job.design.nativeH} · {job.design.upscaled ? "Lanczos-upscaled to print" : "aspect-fit print export"}</div>}
                 </div>}
                 {job.reason && <div className="text-[10px] text-red-200 mt-1 break-words">{job.reason}</div>}
+                {job.design && job.state === "succeeded" && <Btn variant="lime" className="mt-2 py-1.5 text-[11px]" aria-label={`Send ${job.name} to Prepare Designs Lab`} onClick={() => { sendToPrepare([job.design!.id]); setView("prepare"); }}><FlaskConical size={12} />Send to Prepare Designs Lab</Btn>}
               </div>
             </div>)}</div>
           </div>}

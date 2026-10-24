@@ -26,6 +26,8 @@ CREATE TABLE IF NOT EXISTS accounts (
   daily_used INTEGER NOT NULL DEFAULT 0,
   daily_cap INTEGER NOT NULL DEFAULT 200,
   total_generated INTEGER NOT NULL DEFAULT 0,
+  engine TEXT NOT NULL DEFAULT 'cookies',
+  profile_dir TEXT NOT NULL DEFAULT '',
   secure_1psid TEXT NOT NULL DEFAULT '',
   secure_1psidts TEXT NOT NULL DEFAULT '',
   login_flow_id TEXT NOT NULL DEFAULT '',
@@ -85,6 +87,8 @@ DEMO_KEYS = {
 # Existing installations may contain unverified account metadata. New session
 # columns distinguish real browser-linked credentials from that old data.
 ACCOUNT_COLUMNS = {
+    "engine": "TEXT NOT NULL DEFAULT 'cookies'",
+    "profile_dir": "TEXT NOT NULL DEFAULT ''",
     "secure_1psid": "TEXT NOT NULL DEFAULT ''",
     "secure_1psidts": "TEXT NOT NULL DEFAULT ''",
     "login_flow_id": "TEXT NOT NULL DEFAULT ''",
@@ -95,6 +99,11 @@ ACCOUNT_COLUMNS = {
     "cooldown_until": "REAL NOT NULL DEFAULT 0",
     "weekly_used": "INTEGER NOT NULL DEFAULT 0",
 }
+
+
+VERIFIED_SESSION_SQL = """verified_at>0 AND login_flow_id!='' AND trim(email)!=''
+    AND ((engine='cdp' AND profile_dir!='')
+      OR (engine='cookies' AND length(trim(secure_1psid))>=20))"""
 
 
 def conn() -> sqlite3.Connection:
@@ -117,9 +126,23 @@ def init() -> None:
         for name, definition in ACCOUNT_COLUMNS.items():
             if name not in columns:
                 c.execute(f"ALTER TABLE accounts ADD COLUMN {name} {definition}")
+        # One-time removal of identifiable factory demo activity, not a name-
+        # based wipe of user history. Match every original field AND its exact
+        # pre-account timestamp offset; real jobs created later remain untouched.
+        for style, niche, background, label, duration, age in (
+            ("Retro Wavy", "Pickleball", "transparent", "Profile 01", 71000, 240),
+            ("Kawaii", "Axolotl", "white", "Profile 02", 68000, 720),
+            ("Distressed Badge", "Welder Skull", "black", "Profile 03", 74000, 2640),
+            ("Linework", "Celestial Moth", "transparent", "Profile 04", 66000, 5280),
+        ):
+            c.execute("""DELETE FROM jobs WHERE style_name=? AND niche_name=? AND background=?
+                AND account_label=? AND duration_ms=? AND aspect='4:5' AND text_override=''
+                AND status='done' AND EXISTS (SELECT 1 FROM accounts a WHERE a.label=jobs.account_label
+                    AND a.verified_at<=0 AND abs(a.created_at-jobs.created_at-?)<2)""",
+                (style,niche,background,label,duration,age))
         # Never import the former JSON list or trust metadata-only rows. Real
         # designs/jobs/listings are deliberately not deleted by this migration.
-        c.execute("DELETE FROM accounts WHERE verified_at<=0 OR login_flow_id='' OR length(trim(secure_1psid))<20 OR trim(email)=''")
+        c.execute("DELETE FROM accounts WHERE NOT (" + VERIFIED_SESSION_SQL + ")")
         c.execute("CREATE UNIQUE INDEX IF NOT EXISTS verified_account_email ON accounts(lower(email))")
 
 # ------------------------------------------------------------------ helpers
@@ -131,7 +154,7 @@ def _rows(sql: str, params: tuple = ()) -> list[dict]:
 
 def session_rows() -> list[dict]:
     """Private pool-only read. Never return these credential-bearing rows over HTTP."""
-    return _rows("SELECT * FROM accounts WHERE verified_at>0 AND login_flow_id!='' AND length(trim(secure_1psid))>=20 AND trim(email)!='' ORDER BY id")
+    return _rows("SELECT * FROM accounts WHERE " + VERIFIED_SESSION_SQL + " ORDER BY id")
 
 
 def list_accounts() -> list[dict]:
@@ -141,7 +164,8 @@ def list_accounts() -> list[dict]:
         {"id": r["id"], "label": r["label"], "email": r["email"], "provider": r["provider"],
          "status": r["status"], "dailyUsed": r["daily_used"], "dailyCap": r["daily_cap"],
          "totalGenerated": r["total_generated"], "verifiedAt": r["verified_at"],
-         "authSource": "browser-login", "hasCookies": True}
+         "authSource": "browser-login", "hasCookies": bool(r["secure_1psid"]),
+         "hasSession": True, "engine": r["engine"]}
         for r in session_rows()
     ]
 
@@ -168,8 +192,33 @@ def persist_browser_session(account_id: int, email: str, provider: str, psid: st
             ON CONFLICT(id) DO UPDATE SET
               label=excluded.label,email=excluded.email,provider=excluded.provider,status='ready',
               secure_1psid=excluded.secure_1psid,secure_1psidts=excluded.secure_1psidts,
-              login_flow_id=excluded.login_flow_id,verified_at=excluded.verified_at,is_pro=1""",
+              login_flow_id=excluded.login_flow_id,verified_at=excluded.verified_at,is_pro=1,
+              engine='cookies',profile_dir=''""",
             (account_id,email,email,provider,psid,psidts,flow_id,time.time(),time.time()))
+        return dict(c.execute("SELECT * FROM accounts WHERE id=?", (account_id,)).fetchone())
+
+
+def persist_browser_profile(account_id: int, email: str, provider: str, profile_dir: str, flow_id: str) -> dict:
+    """Private, post-verification CDP intake. Credentials stay in Chrome's local
+    encrypted Cookies SQLite, not JSON or browser-facing application responses.
+    """
+    if not email.strip() or not flow_id or not Path(profile_dir).is_dir():
+        raise ValueError("A verified browser login and persistent profile are required")
+    with _lock, conn() as c:
+        existing = c.execute("SELECT id FROM accounts WHERE lower(email)=lower(?)", (email,)).fetchone()
+        if existing and existing["id"] != account_id:
+            raise ValueError("This Google account is already connected; use Reconnect on its existing card")
+        occupied = c.execute("SELECT email FROM accounts WHERE id=?", (account_id,)).fetchone()
+        if occupied and occupied["email"].casefold() != email.casefold():
+            raise ValueError("Sign in with the same Google account when reconnecting an existing account")
+        c.execute("""INSERT INTO accounts
+            (id,label,email,provider,status,engine,profile_dir,login_flow_id,verified_at,is_pro,created_at)
+            VALUES (?,?,?,?,'ready','cdp',?,?,?,1,?)
+            ON CONFLICT(id) DO UPDATE SET label=excluded.label,email=excluded.email,
+              provider=excluded.provider,status='ready',engine='cdp',profile_dir=excluded.profile_dir,
+              secure_1psid='',secure_1psidts='',login_flow_id=excluded.login_flow_id,
+              verified_at=excluded.verified_at,is_pro=1""",
+            (account_id,email,email,provider,str(profile_dir),flow_id,time.time(),time.time()))
         return dict(c.execute("SELECT * FROM accounts WHERE id=?", (account_id,)).fetchone())
 
 

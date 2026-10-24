@@ -6,7 +6,9 @@ export interface ConnectedAccount {
   status: string;
   authSource: "browser-login";
   verifiedAt: number;
-  hasCookies: true;
+  hasCookies: boolean;
+  hasSession?: boolean;
+  engine?: "cdp" | "cookies";
   authed?: boolean;
   isPro?: boolean;
   dailyUsed: number;
@@ -17,14 +19,14 @@ export interface ConnectedAccount {
 }
 
 /** Metadata alone, pending sign-ins and synthetic profiles are not accounts.
- * Credentials stay in the worker's private SQLite database, never the browser.
+ * Credentials stay in private local SQLite/browser profiles, never frontend JavaScript.
  */
 export function isConnectedAccount(value: unknown): value is ConnectedAccount {
   if (!value || typeof value !== "object") return false;
   const item = value as Record<string, unknown>;
   return Number.isInteger(item.id) && Number(item.id) > 0 &&
     typeof item.email === "string" && /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(item.email) &&
-    item.authSource === "browser-login" && item.hasCookies === true &&
+    item.authSource === "browser-login" && (item.hasCookies === true || (item.engine === "cdp" && item.hasSession === true)) &&
     typeof item.verifiedAt === "number" && Number.isFinite(item.verifiedAt) && item.verifiedAt > 0;
 }
 

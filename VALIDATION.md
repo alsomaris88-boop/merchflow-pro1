@@ -1,22 +1,30 @@
 # Pipeline validation — 2026-10-24
 
-## Critical account / single-output / startup refactor
+## Integrated account / single-output / startup refactor on current CDP main
+
+The user-approved integration preserves upstream commits through `fba9f91`:
+raw-CDP Chrome profiles, the byte-identical mandatory Fusion directive and
+niche-first/style-second uploads, and the one-click Send to Prepare handoff.
+The earlier verified `c8408a4` was not force-pushed over those changes.
 
 Current final checks:
 
-- **80 Python tests passed, 1 opt-in real-model smoke skipped** (252.42s).
-  Includes 14 new account/provider regressions and 17 executable/contract
-  launcher cases in total. Existing cutout, Prepare, disk/ZIP, History and
+- **108 Python tests passed, 1 opt-in real-model smoke skipped** (299.69s).
+  Includes 14 account/legacy-provider tests, 13 additional CDP account safeguards,
+  all 13 upstream CDP tests (including real Chromium driving a local Gemini DOM
+  fixture), the mandatory Fusion/upload-order regression, and 18 launcher cases.
+  Existing cutout, Prepare, disk/ZIP, History and
   1/5/20/101 batch regressions continue to pass.
 - **22 TypeScript unit tests passed.** New coverage verifies the exact empty
   message, rejection of unverified metadata, empty/offline account proxy behavior,
   blocked manual account/cookie intake and durable disconnect. Upload manifests
   explicitly request one output per input.
 - **13 Chromium browser tests passed, 1 opt-in 55-file Prepare test skipped**
-  (1.0min), against the actual built static desktop UI and FastAPI. Empty and
+  (59.7s), against the actual built static desktop UI and FastAPI. Empty and
   unverified account lists, pending/cancelled sign-in, browser-launch failures,
   Black/White/default Black, 1/5/20/101 ingestion, live History/SSE, optional ZIP,
-  Listing linkage, reload recovery and repeat-colour generation all pass.
+  Listing linkage, reload recovery, repeat-colour generation and the real saved-ID
+  Send to Prepare handoff all pass.
 - ESLint, TypeScript, Python compilation and whitespace checks passed.
 - Normal Next production build and static desktop build passed; API source
   restoration was verified. The static UI is generated into `out/`.
@@ -24,30 +32,39 @@ Current final checks:
   integration; no test-provider profiles are exposed as connected accounts.
   The isolated validation service was stopped afterward.
 
-Account upgrades remove unverified old metadata without deleting existing
-jobs/listings/design files. No JSON account list is loaded or written. Only an
-observed real Google/Gemini browser flow plus successful headless verification
-can commit a session to SQLite. Failed or cancelled verification inserts no
-account; failed reconnects preserve an existing session. Cookie fields and
-login-flow identifiers are absent from public account/health responses.
+Account upgrades remove unverified metadata and precisely fingerprinted factory
+demo activity without deleting later genuine jobs/listings/design files. Only
+an observed real Google/Gemini browser flow plus successful headless verification
+can commit a session to SQLite. CDP credentials remain in Chrome's encrypted
+local Cookies SQLite, while the app stores private profile/provenance metadata.
+No JSON account list is used. Failed/cancelled verification inserts no account;
+failed reconnects preserve the existing record/client. Duplicate identity
+requires the existing card's Reconnect action instead of creating another row.
+Busy accounts cannot reconnect/unlink, and a login reservation cannot be leased
+for generation. Failed new profiles are cleaned up; unlink deletes the stored
+profile and stays removed after restart. Deletion failures report failure and
+keep the account. Cookies, private profile paths and login-flow identifiers are
+absent from public account/health responses.
 
 The exact newly requested prompt is used with Pitch Black/Pure White. The
 manifest accepts only `outputsPerInput: 1`; requests for 3/variants fail validation.
-One job commits at most one verified PNG/History row. A three-candidate RPC test
-proves only one image download; the parser's stable ordering and original-size
-rendition request are covered without calling the paid provider. Existing
+One job commits at most one verified PNG/History row. Real Chromium against the
+local DOM fixture verifies first-image-only extraction from three candidates,
+full-size download, attachment-menu fallback, exact prompt/references, refusal,
+quota and signed-out failures. Legacy RPC tests also cover stable URL ordering
+and original-size requests without calling the paid provider. Existing
 4500×5400/300-DPI lossless RGBA, <25 MB saving remains intact.
 
-The launcher polls `/api/health` for up to 45 seconds and requires explicit
-HTTP 200 plus worker identity before opening the UI, including with zero linked
-accounts. Tests cover cold connection failure → HTTP 503 → HTTP 200, non-200
-responses, deadline/crash detection and a crash immediately after a healthy
-response. Complete `desktop/engine_boot.log` display/visible console and venv-bound
-requirements refresh remain covered.
+The launcher polls `/docs` then `/api/health` for up to 45 seconds and requires
+HTTP 200 from both plus worker identity before opening the UI, including with
+zero linked accounts. Tests cover cold connection failure → HTTP 503 → HTTP 200, non-200
+responses (including /docs 200 with /health 503), deadline/crash detection and
+a crash immediately after a healthy response. Complete `desktop/engine_boot.log`
+display/visible console and venv-bound requirements refresh remain covered.
 
-**Scope:** Google/CDP and successful provider responses are isolated test doubles;
-SQLite, libvips files, ZIP, SSE and browser UI are real. No live Google login or
-Gemini generation was performed. Executable launcher checks use official
+**Scope:** Google pages/provider responses are isolated local test doubles; CDP
+transport, Chromium, persistent profiles, SQLite, libvips files, ZIP, SSE and the
+desktop browser UI are real. No live Google login or Gemini generation was performed. Executable launcher checks use official
 PowerShell 7.6.8 on Linux; native Windows cmd/PowerShell 5.1 startup still requires
 a target-machine smoke test. The single Python skip and legacy browser skip are
 explicit opt-ins, not hidden failures. Chromium's missing system libraries were
@@ -69,8 +86,8 @@ Checks recorded for that earlier update:
   handoff and fresh identities when regenerating retained files; existing
   SSE/download protections remain covered.
 - **16 Chromium browser tests passed, 1 separately opt-in legacy Prepare test
-  skipped** (1.0min), against the built static desktop UI served by FastAPI. Exact swatches/default Black/custom hex and dynamic
-  ingestion/removal/Clear for 1/5/20/101 pass. Deep integration verifies real SSE
+  skipped** (1.0min), against the built static desktop UI served by FastAPI. The then-current
+  seven presets/custom hex and dynamic ingestion/removal/Clear for 1/5/20/101 pass. Deep integration verifies real SSE
   archive events, physical print files, optional streaming ZIP, selected real-ID
   Listing save and durable History. Reload testing restores an already queued
   batch, completes it server-side and opens History without any auto-download.
@@ -136,11 +153,15 @@ also passed.
 Executable PowerShell checks used **PowerShell 7.6.8 on Linux** with isolated
 health-response test doubles; no production listener or engine was launched by
 these tests. Native `cmd.exe` and Windows PowerShell 5.1 were not available, so
-this is not a Windows startup smoke test. The launcher now waits for the actual
-worker `/api/health` fields (`ok`, `connected`, `unified`), which match the API.
+this is not a Windows startup smoke test. The launcher now polls
+`http://127.0.0.1:8000/docs` followed by `/api/health` for HTTP 200 (the current
+integration restores the required 45-second deadline and worker-identity gate,
+with early abort on the engine-exit marker). The UI is not launched before those
+checks pass; native Windows startup still needs its target-machine smoke test.
+A crashed engine prints the exact contents of `desktop\engine_boot.log`.
 That launcher-only follow-up did not change the frontend or image pipeline;
 its prior validation results are retained above. The Donepixel update now
-re-runs those launcher/image regressions as part of the 80-test passing suite.
+re-runs those launcher/image regressions as part of the current 108-test passing suite.
 
 ## Scope and limits
 
@@ -150,7 +171,7 @@ actual neural cutout is covered separately by the real U2Net smoke and live
 proxy request.
 
 Provider-success tests use clearly isolated deterministic fixtures. **No live
-authenticated Gemini generation was performed**, no account cookies were used,
+authenticated Gemini generation was performed**, no real Google account cookies were used,
 and no paid rendering service was called. BiRefNet's selectable model/cache
 wiring is implemented, but its large model weights were not exercised here.
 The Windows app window, target-machine dependencies and real authenticated

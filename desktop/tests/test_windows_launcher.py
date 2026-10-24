@@ -38,7 +38,9 @@ def test_existing_venv_always_gets_a_requirements_refresh():
 def test_powershell_date_is_an_expression_not_a_get_date_parameter():
     assert "if ((Get-Date) -gt $deadline)" in READY
     assert "Get-Date -gt" not in LAUNCHER
-    assert "/api/health" in READY
+    assert "/api/health" in READY and "/docs" in READY
+    assert READY.index("/docs") < READY.index("/api/health")
+    assert ".AddSeconds(45)" in READY
     assert "[int]$response.StatusCode -eq 200" in READY
     assert "$health.ok -and $health.unified" in READY
     assert "$health.connected -and" not in READY  # zero linked accounts must still boot
@@ -150,7 +152,7 @@ def test_powershell_retries_cold_imports_until_http_200(powershell, tmp_path):
     """ + READY_RESPONSE + " }"
     result = run_ps(powershell, READY, tmp_path, probe)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "PROBE:3" in result.stdout
+    assert "PROBE:3" in result.stdout and "PROBE:4" in result.stdout
 
 
 @pytest.mark.parametrize("status", [201, 202, 204, 503])
@@ -162,5 +164,11 @@ def test_powershell_non_200_never_opens_ui(powershell, tmp_path, status):
 
 def test_powershell_child_crashes_after_http_response_before_browser_open(powershell, tmp_path):
     probe = "function Invoke-WebRequest { Set-Content -LiteralPath $env:ENGINE_EXIT_FILE -Value 7; " + READY_RESPONSE + " }"
+    result = run_ps(powershell, READY, tmp_path, probe)
+    assert result.returncode == 1, result.stdout + result.stderr
+
+
+def test_powershell_docs_200_cannot_mask_non_200_health(powershell, tmp_path):
+    probe = "function Invoke-WebRequest { param($Uri); if ($Uri -like '*/docs') { " + READY_RESPONSE + " } else { Set-Content -LiteralPath $env:ENGINE_EXIT_FILE -Value 1; " + READY_RESPONSE.replace("StatusCode=200", "StatusCode=503") + " } }"
     result = run_ps(powershell, READY, tmp_path, probe)
     assert result.returncode == 1, result.stdout + result.stderr

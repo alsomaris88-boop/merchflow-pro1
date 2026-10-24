@@ -125,4 +125,12 @@ test("retained files can be regenerated on another colour as a fresh archived ba
   await page.getByPlaceholder("filter by niche, style, account…").fill(name);
   await expect(page.locator(`img[alt="${name}"]`)).toHaveCount(2);
   expect(downloads).toBe(0);
+  // Preserve the newer main branch's one-click handoff, using the saved
+  // single-output record rather than a browser-only render or a fresh download.
+  await page.getByRole("button", { name: "Pixel to Pixel", exact: true }).click();
+  await page.getByRole("button", { name: `Send ${second.items[0].name} to Prepare Designs Lab`, exact: true }).click();
+  await expect(page.getByText("Batch queue · 1", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: `Remove ${name}`, exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Prepare designs (1)", exact: true })).toBeEnabled();
+  expect(downloads).toBe(0);
 });

@@ -11,7 +11,7 @@ from types import SimpleNamespace
 import pytest
 from fastapi.testclient import TestClient
 
-from desktop.worker import browser, db, gemini_client, gemini_pool
+from desktop.worker import browser, db, gemini_cdp, gemini_client, gemini_pool
 
 COOKIE = "TEST-ONLY-session-cookie-not-a-real-Google-credential"
 EMAIL = "artist@example.test"
@@ -81,7 +81,7 @@ def test_migration_purges_unverified_metadata_and_preserves_other_data(tmp_path,
 def test_pending_browser_flow_does_not_create_an_account(account_store):
     pool, metrics = account_store
     flow = browser.LoginFlow("chrome", 1)
-    result = browser._persist(flow, COOKIE, "", EMAIL)
+    result = pool.register_session(flow, COOKIE, "", EMAIL)
     assert not result["ok"] and metrics["init"] == 0
     assert not db.list_accounts() and not pool.accounts
 
@@ -89,7 +89,7 @@ def test_pending_browser_flow_does_not_create_an_account(account_store):
 def test_verified_browser_session_is_committed_only_after_gemini_verification(account_store):
     pool, metrics = account_store
     flow = observed_flow(pool)
-    result = browser._persist(flow, COOKIE, "TEST-ONLY-rotating-cookie", EMAIL)
+    result = pool.register_session(flow, COOKIE, "TEST-ONLY-rotating-cookie", EMAIL)
     assert result["ok"] and metrics["init"] == 1 and flow.state == "authenticated"
     rows = db.session_rows()
     assert len(rows) == len(pool.accounts) == 1
@@ -105,7 +105,7 @@ def test_verified_browser_session_is_committed_only_after_gemini_verification(ac
 def test_failed_verification_never_saves_a_row_or_ghost_pool_member(account_store):
     pool, metrics = account_store
     metrics["fail"] = True
-    result = browser._persist(observed_flow(pool), COOKIE, "", EMAIL)
+    result = pool.register_session(observed_flow(pool), COOKIE, "", EMAIL)
     assert not result["ok"] and metrics["closed"] == 1
     assert db.list_accounts() == db.session_rows() == pool.accounts == []
     assert not gemini_pool.CLIENTS
@@ -119,32 +119,32 @@ def test_cancelled_flow_cannot_save_after_network_verification(account_store, mo
         original(client)
         browser.cancel_flow(flow.id)
     monkeypatch.setattr(gemini_client.GeminiClient, "init", cancel_during_init)
-    result = browser._persist(flow, COOKIE, "", EMAIL)
+    result = pool.register_session(flow, COOKIE, "", EMAIL)
     assert not result["ok"] and flow.state == "closed"
     assert not db.list_accounts() and not pool.accounts and not gemini_pool.CLIENTS
 
 
 def test_failed_reconnect_preserves_the_existing_real_session(account_store):
     pool, metrics = account_store
-    assert browser._persist(observed_flow(pool), COOKIE, "", EMAIL)["ok"]
+    assert pool.register_session(observed_flow(pool), COOKIE, "", EMAIL)["ok"]
     before = db.session_rows()
     old_client = gemini_pool.client_for(pool.accounts[0].id)
     metrics["fail"] = True
-    assert not browser._persist(observed_flow(pool), COOKIE + "-bad", "", EMAIL)["ok"]
+    assert not pool.register_session(observed_flow(pool), COOKIE + "-bad", "", EMAIL)["ok"]
     assert db.session_rows() == before and gemini_pool.client_for(pool.accounts[0].id) is old_client
 
 
 def test_repeated_real_login_for_same_google_account_is_not_duplicated(account_store):
     pool, metrics = account_store
-    assert browser._persist(observed_flow(pool), COOKIE, "", EMAIL)["ok"]
-    assert browser._persist(observed_flow(pool), COOKIE + "-renewed", "", EMAIL)["ok"]
+    assert pool.register_session(observed_flow(pool), COOKIE, "", EMAIL)["ok"]
+    assert pool.register_session(observed_flow(pool), COOKIE + "-renewed", "", EMAIL)["ok"]
     assert len(db.list_accounts()) == len(pool.cards()) == len(pool.accounts) == 1
     assert db.session_rows()[0]["secure_1psid"] == COOKIE + "-renewed"
 
 
 def test_real_sessions_and_counters_survive_pool_restart_in_sqlite(account_store):
     pool, metrics = account_store
-    assert browser._persist(observed_flow(pool), COOKIE, "", EMAIL)["ok"]
+    assert pool.register_session(observed_flow(pool), COOKIE, "", EMAIL)["ok"]
     account_id = pool.accounts[0].id
     pool.note_render(account_id)
     restored = gemini_pool.AccountPool()
@@ -156,7 +156,7 @@ def test_real_sessions_and_counters_survive_pool_restart_in_sqlite(account_store
 
 def test_disconnecting_removes_credentials_and_stays_empty_after_restart(account_store):
     pool, metrics = account_store
-    assert browser._persist(observed_flow(pool), COOKIE, "", EMAIL)["ok"]
+    assert pool.register_session(observed_flow(pool), COOKIE, "", EMAIL)["ok"]
     account_id = pool.accounts[0].id
     assert pool.remove(account_id)
     assert not pool.cards() and not db.session_rows() and not gemini_pool.client_for(account_id)
@@ -166,9 +166,9 @@ def test_disconnecting_removes_credentials_and_stays_empty_after_restart(account
 
 def test_pending_real_browser_windows_are_not_database_accounts(account_store, tmp_path, monkeypatch):
     pool, metrics = account_store
-    monkeypatch.setattr(browser, "PROFILE_ROOT", tmp_path / "profiles")
+    monkeypatch.setattr(gemini_cdp, "PROFILES_ROOT", tmp_path / "profiles")
     monkeypatch.setattr(browser, "resolve_exe", lambda provider: "TEST-BROWSER-ONLY")
-    monkeypatch.setattr(browser.subprocess, "Popen", lambda *a, **k: SimpleNamespace(pid=123, poll=lambda: None))
+    monkeypatch.setattr(gemini_cdp, "popen", lambda *a, **k: SimpleNamespace(pid=123, poll=lambda: None))
     monkeypatch.setattr(browser.threading.Thread, "start", lambda self: None)
     first = browser.spawn_login_flow("chrome")
     second = browser.spawn_login_flow("chrome")
@@ -189,7 +189,7 @@ def test_manual_api_intake_is_rejected_and_public_endpoints_never_expose_cookies
             assert client.post(path, json={"id": 1, "email": EMAIL, "psid": COOKIE}).status_code == 405
         assert client.patch("/api/accounts", json={"id": 1, "status": "ready"}).status_code == 405
         assert not db.list_accounts()
-        assert browser._persist(observed_flow(pool), COOKIE, "", EMAIL)["ok"]
+        assert pool.register_session(observed_flow(pool), COOKIE, "", EMAIL)["ok"]
         for path in ("/api/accounts", "/accounts/status", "/api/bridge/accounts", "/health"):
             response = client.get(path)
             assert response.status_code == 200 and COOKIE not in response.text and "secure_1psid" not in response.text

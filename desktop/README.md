@@ -36,9 +36,10 @@ failure, the original launcher console also prints the log and pauses instead
 of disappearing. A fresh exit-status marker lets the readiness check stop
 promptly after a crash; stale status is cleared before each launch.
 
-The launcher polls `http://127.0.0.1:8000/api/health` for up to **45 seconds**,
-allowing libvips/rembg/ONNX imports to finish. Only **HTTP 200** plus this worker's
-`ok`/`unified` markers permits opening Chrome/Edge/the browser. A signed-in Gemini
+The launcher polls `http://127.0.0.1:8000/docs` then `/api/health` for up to
+**45 seconds**, allowing libvips/rembg/ONNX imports to finish. Only **HTTP 200
+from both** plus this worker's `ok`/`unified` markers permits opening
+Chrome/Edge/the browser. A signed-in Gemini
 account is not required for engine readiness: the empty Account Manager must
 also open normally. Connection errors, HTTP 201/202/204/503, malformed JSON,
 startup crashes and deadline expiry do not launch the UI. The exit marker is
@@ -60,43 +61,80 @@ npm run dev
 For a remote/proxied preview, bind the processes to `0.0.0.0`. Browser code always
 uses same-origin URLs; `MERCHFLOW_WORKER_URL` is a **server-side** proxy setting.
 
-## Account Manager — real browser sessions only
+## Account Manager — verified isolated Chrome profiles over CDP
 
-A fresh installation has **zero accounts**, with this exact empty state:
+The Account Manager starts with **zero accounts**; nothing is seeded. Clicking
+**+ Add Gemini Account** launches a real, visible Chrome window:
 
-> No accounts connected. Click [+ Add Gemini Account] to link your Google account.
+```
+chrome --user-data-dir="desktop/profiles/account_<id>" --app="https://gemini.google.com/app"
+       --remote-debugging-port=<9500+id>
+```
 
-There are no seeded accounts, JSON/default profile lists, PostgreSQL fallbacks,
-pretend avatars, fabricated account counters or sample account activity. The old tracked
-`desktop/config/gemini_accounts.json` is removed and is never read/imported.
+You sign in manually (password, 2FA and passkeys all work — it is a genuine
+browser). A CDP sensor polls every 1.5 s; once the tab is on
+`gemini.google.com/app`, the prompt box is present, no *Sign in* button is
+shown and the session is live, the visible browser closes and the same profile is independently verified headlessly before the account is written to SQLite
+(`accounts.engine = 'cdp'`, `accounts.profile_dir`) with a verified timestamp and browser-login provenance.
 
-**Add Gemini Account → choose Chrome/Brave → Open Google sign-in** starts a real
-isolated browser on Gemini, which redirects to Google's login with the proper
-return URL. Passwords/2FA are entered directly into Google. A pending/closed/
-cancelled/failed flow is not an account and never inserts a database row.
-The sensor must observe the real Gemini app, extract its session, and verify it
-headlessly before committing the account. Cancelling during verification blocks
-that commit; a failed reconnect leaves an existing valid session intact.
+Generation opens or reuses **the same profile headlessly**
+(`--headless=new`, DevTools port `9222 + id − 1`; each profile is its own
+Chrome process, so parallel accounts need separate ports). Credentials are
+never requested again and no cookie values are exported into application JSON or frontend JavaScript.
+`desktop/worker/gemini_cdp.py` drives Gemini's normal chat input:
 
-The single credential source is **`~/MerchFlow/merchflow.db`** (`MERCHFLOW_DB`
-overrides it). The private `accounts` table stores real session cookies,
-browser-login provenance, verification time and actual counters. Credentials do
-not go into JSON, frontend storage, account/health responses or logs. Protect the
-local database and its backups; it is local storage, not a claim of encrypted
-SQLite. Database filenames and legacy credential JSON are ignored by Git.
+1. dispatch the reference file(s) to `<input type="file" accept="image/*">`
+   (fallbacks: the attachment menu's intercepted file chooser, then native
+   drag-and-drop onto the rich-textarea);
+2. **Gate 1** — wait for the thumbnail card in the input container;
+3. inject the exact prompt into the rich-textarea with `Input.insertText`;
+4. submit with `button[aria-label="Send message"]` (Enter fallback);
+   **Gate 2** — the user bubble must carry the attached image;
+5. wait for the response, then extract the image at full size: the
+   *Download full size image* button with browser-level
+   `Browser.setDownloadBehavior`, falling back to an in-page `=s0` original
+   fetch, then `canvas.toDataURL` at natural size (thumbnails < 256 px are
+   rejected);
+6. return **exactly one** image — extra images in a response are ignored.
 
-Upgrade migration removes pre-refactor **unverified metadata-only account rows**;
-users of the old JSON store must connect again through the browser. Existing
-jobs, listings, designs and output PNGs are not deleted. Repeat sign-in for the
-same Google identity updates its existing row. Disconnect durably deletes the
-stored session and closes its HTTP client; it is not a temporary UI hide.
+Refusals and text-only answers fail the job; image-limit messages trigger the
+account's cooldown. Disconnecting an idle account closes its headless client and deletes its SQLite row and profile folder. Deletion failures remain visible and do not report a successful disconnect. `desktop/profiles/` holds private live sessions and is git-ignored. No legacy JSON account file is read or written. Gemini's DOM changes over time; all selectors
+live in `gemini_cdp.SELECTORS`. Tests drive real headless Chromium against a
+local DOM stand-in (`tests/support/fake_gemini.py`); a live Google sign-in
+still needs a manual smoke test on Windows.
 
-Both desktop and Next `/api/accounts` read the worker's SQLite-backed list.
-Manual POST/PATCH account creation and pasted-cookie intake return HTTP 405.
-Configured scheduling windows are local budgets, not promised provider quotas
-or evidence of a paid subscription. Real provider access/rate limits still apply.
+**Account admission and upgrade safeguards**
+
+- Fresh databases and pending/failed/cancelled login flows contain **zero** accounts.
+  The exact empty message is:
+  `No accounts connected. Click [+ Add Gemini Account] to link your Google account.`
+- SQLite is the only account authority. Chrome keeps its credentials in the
+  profile's local encrypted Cookies SQLite; the app stores the private profile
+  reference and verified browser-flow provenance, not browser-side tokens.
+  Existing browser-verified legacy SQLite cookie sessions remain compatible;
+  there is no JSON/PostgreSQL/default-profile fallback.
+- Metadata insertion, status spoofing and pasted-cookie HTTP intake return 405.
+  Public account/health responses exclude credential fields, private profile
+  paths and login-flow identifiers. A successfully opened window is still
+  **pending**, never a synthetic successful login.
+- Cancelling during the headless probe cannot commit an account. A failed
+  reconnect preserves the previous record/client. Reconnect is serialized
+  against generation; repeated identity uses the existing card's Reconnect
+  action rather than creating duplicate accounts. New cancelled/failed profile
+  folders are cleaned up; existing reconnect profiles stay intact.
+- Old unverified metadata must be linked once again; its Chrome profile files
+  are not deleted by the schema migration. Precisely fingerprinted factory demo
+  activity is removed without deleting later real jobs/listings/design files.
+- Protect local SQLite/profile files with OS permissions; do not publish the
+  local worker port. Sign-in does not establish paid Pro entitlement or guarantee
+  native 8K provider output. Expired sessions require Reconnect.
 
 ## The four production paths
+
+Module 01 preserves the mandatory `FUSION_DIRECTIVE` verbatim and uploads the
+niche subject as **IMAGE 1**, then the style reference as **IMAGE 2**. Runtime
+operator settings are appended; they never rewrite the directive. Donepixel
+uses its own exact single-reference fidelity prompt, not the fusion directive.
 
 ### Universal cutout
 
@@ -144,7 +182,10 @@ or **Pure White `#FFFFFF`**. These replace the earlier multicolour/custom picker
 
 The manifest explicitly sends `outputsPerInput: 1`; a request for 3 or a variants
 parameter is rejected. Each original has one job and at most one verified master
-PNG/History entry—never 3N variants. Only the first actual generated image asset
+PNG/History entry—never 3N variants. Each archived result retains the upstream
+**Send to Prepare Designs Lab** action, which queues that real disk-backed
+History record without regenerating or downloading it. Only the first actual
+generated image asset
 is downloaded if Gemini returns multiple candidate URLs. Original-resolution
 image downloads are requested rather than forcing an 8192px asset down to 2048.
 The stable response parser deduplicates renditions and excludes uploaded references.
