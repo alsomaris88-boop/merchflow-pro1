@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { NextRequest } from "next/server";
-import { COLOUR_SWATCHES, generationLabel, normaliseHex, submitPixelBatch, type PixelBatch } from "../../src/lib/p2p-client";
+import { COLOUR_SWATCHES, generationLabel, normaliseHex, pixelBatchLabel, retryPixelJob, isBatchActive, submitPixelBatch, type PixelBatch } from "../../src/lib/p2p-client";
 import { clearListingHandoff, listingHandoff, sendToListing } from "../../src/lib/designs-store";
 import { proxyWorker } from "../../src/lib/worker-proxy";
 
@@ -119,4 +119,51 @@ test("regenerating retained files on another colour creates fresh job identities
     assert.equal(uploads, 2); assert.equal(seen.size, 2);
     assert.equal(inputs[0].id, "retained-selection");
   } finally { restoreFetch(); restoreStorage(); }
+});
+
+
+test("failed, partial, zero-image or missing-archive batches never announce Batch complete", () => {
+  const base: PixelBatch = { id: "b", status: "failed", background: "#000000", total: 1,
+    completed: 0, failed: 1, items: [{ id: "j", name: "ref.png", state: "failed", account: "", reason: "GATE 1 FAILED", design: null }] };
+  for (const status of ["failed", "partial", "running", "completed"]) {
+    assert.doesNotMatch(pixelBatchLabel({ ...base, status }), /batch complete/i);
+  }
+  assert.doesNotMatch(pixelBatchLabel({ ...base, status: "completed", failed: 0, items: [] }), /batch complete/i);
+  assert.doesNotMatch(pixelBatchLabel({ ...base, status: "completed", failed: 0,
+    items: [{ ...base.items[0], state: "succeeded", reason: "" }] }), /batch complete/i);
+  assert.ok(isBatchActive({ ...base, status: "retry-uploading" }));
+});
+
+test("Retry targets only the existing failed job and never creates a new batch", async () => {
+  const seen: string[] = [];
+  const restoreFetch = replaceGlobal("fetch", async (url: string, init: RequestInit) => {
+    seen.push(url);
+    assert.equal(url, "/api/bridge/p2p/batches/batch%20id/items/failed%20job/retry");
+    assert.equal(init.method, "POST");
+    assert.equal(init.body, undefined, "retained references need no duplicate upload");
+    return Response.json({ ok: true, batch: { id: "batch id", status: "running" } });
+  });
+  try {
+    assert.equal((await retryPixelJob("batch id", "failed job")).id, "batch id");
+    assert.equal(seen.length, 1);
+  } finally { restoreFetch(); }
+});
+
+test("legacy/missing retry reference sends the unchanged selected binary, never base64", async () => {
+  const file = new File([new Uint8Array([0, 255, 128, 4])], "original.png", { type: "image/png" });
+  const restoreFetch = replaceGlobal("fetch", async (_url: string, init: RequestInit) => {
+    assert.equal(new Headers(init.headers).get("content-type"), "application/octet-stream");
+    assert.equal(init.body, file);
+    assert.deepEqual(new Uint8Array(await (init.body as File).arrayBuffer()), new Uint8Array([0, 255, 128, 4]));
+    return Response.json({ ok: true, batch: { id: "b", status: "running" } });
+  });
+  try { await retryPixelJob("b", "j", file); }
+  finally { restoreFetch(); }
+});
+
+test("Retry surfaces the exact engine error instead of swallowing it", async () => {
+  const reason = "GATE 1 FAILED: the reference thumbnail never rendered in the Gemini input box";
+  const restoreFetch = replaceGlobal("fetch", async () => Response.json({ detail: reason }, { status: 409 }));
+  try { await assert.rejects(retryPixelJob("b", "j"), { message: reason }); }
+  finally { restoreFetch(); }
 });

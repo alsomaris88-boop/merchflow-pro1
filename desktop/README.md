@@ -20,6 +20,17 @@ Ship the generated `out/` folder with the Python desktop package. Run
 `run_windows.bat` from the repository root on Windows; it installs the worker
 dependencies and opens `http://127.0.0.1:8000` in an app window.
 
+### Updating an existing Windows install (upload + live-results fix)
+
+After pulling the updated source, **rebuild and replace `out/`** using
+`npm ci && npm run build:desktop` on the development/build machine. `out/` is a
+generated, git-ignored bundle: pulling Python/TS source alone does not update an
+older packaged UI. Copy that fresh bundle to the Windows package, stop its old
+engine/app window, then run `run_windows.bat` and reload the dashboard. The end
+user still does not need a running Node process. `/api/health` identifies this
+worker as **`2.5.1-multilingual-upload-live-retry`** and advertises `donepixelRetry`.
+Keep existing verified Chrome profiles, local SQLite files and genuine output.
+
 ### Windows startup upgrades and crash logs
 
 `run_windows.bat` refreshes `desktop/requirements.txt` on **every normal launch**,
@@ -86,12 +97,17 @@ never requested again and no cookie values are exported into application JSON or
 1. dispatch the reference file(s) to `<input type="file" accept="image/*">`
    (fallbacks: the attachment menu's intercepted file chooser, then native
    drag-and-drop onto the rich-textarea);
-2. **Gate 1** — wait for the thumbnail card in the input container;
+2. **Gate 1** — wait for newly rendered, loaded reference thumbnails inside the
+   actual composer, including HTTP-backed `img`/`.attachment-card` previews.
+   English/French upload labels plus locale-independent SVG/Material icons and
+   test IDs are supported. Avatars, chat-history images, hidden/broken previews,
+   empty cards and pre-existing composer decorations do not satisfy the gate.
+   A hidden spinner does not block a finished upload; a visible one still does;
 3. inject the exact prompt into the rich-textarea with `Input.insertText`;
-4. submit with `button[aria-label="Send message"]` (Enter fallback);
+4. submit with the composer-scoped Send/Envoyer control (Enter fallback);
    **Gate 2** — the user bubble must carry the attached image;
 5. wait for the response, then extract the image at full size: the
-   *Download full size image* button with browser-level
+   *Download full size image* / French *Télécharger l'image* button with browser-level
    `Browser.setDownloadBehavior`, falling back to an in-page `=s0` original
    fetch, then `canvas.toDataURL` at natural size (thumbnails < 256 px are
    rejected);
@@ -99,7 +115,12 @@ never requested again and no cookie values are exported into application JSON or
 
 Refusals and text-only answers fail the job; image-limit messages trigger the
 account's cooldown. Disconnecting an idle account closes its headless client and deletes its SQLite row and profile folder. Deletion failures remain visible and do not report a successful disconnect. `desktop/profiles/` holds private live sessions and is git-ignored. No legacy JSON account file is read or written. Gemini's DOM changes over time; all selectors
-live in `gemini_cdp.SELECTORS`. Tests drive real headless Chromium against a
+live in `gemini_cdp.SELECTORS`. Direct file-input CDP errors fall back to the
+intercepted chooser and native drag/drop. A partial/still-busy upload never
+gets appended again to make the gate pass with duplicate references. The
+per-strategy thumbnail wait defaults to 45 seconds (`MERCHFLOW_CDP_UPLOAD_TIMEOUT`).
+French account/session, Send, Stop and full-size download labels are supported
+as well. Tests drive real headless Chromium against a
 local DOM stand-in (`tests/support/fake_gemini.py`); a live Google sign-in
 still needs a manual smoke test on Windows.
 
@@ -205,11 +226,35 @@ fabric wrinkles, with only the selected Black/White hex substituted.
 
 **Uploads are bounded, not one enormous base64 JSON:** create a manifest, upload
 original files independently as binary (two at a time), then start the durable
-batch. Inputs are spooled in `output/.p2p-inputs/`; they are removed after their
-jobs/batch finish. Keep the browser open during upload. **Once queued, generation
+batch. Inputs are spooled in `output/.p2p-inputs/`. Successful-job originals
+are removed; **failed originals remain local for explicit Retry**, including
+across UI reloads and worker restarts. Keep the browser open during upload. **Once queued, generation
 is server-owned** and continues through module navigation, reloads and SSE
 disconnections. The last batch can be reopened from Pixel to Pixel. An abandoned
 pre-generation upload can be discarded explicitly.
+
+**Generate immediately displays live cards below the form**, even while the
+manifest POST is still waiting: pulsing skeleton + `Generating 8K artwork...`.
+These are pending UI only, not invented designs or saved records. Once a real
+PNG + History transaction commits, the card shows its actual disk thumbnail,
+**Download** (the existing master) and **Send to Prepare Lab** (its saved ID).
+Nothing auto-downloads. Failures show a prominent red badge with the **full exact
+engine reason** and **Retry**, never a successful batch-complete announcement.
+Mixed/zero-image failures remain partial/failed, and other successful cards stay
+archived and usable.
+
+Retry requeues **only that existing failed job**, with its stored background;
+it does not create a replacement job or regenerate already successful items.
+Duplicate/in-progress/late successful retry requests are idempotent. Retry obeys
+the real-account/libvips/mock-block guards and waits for the active batch to
+settle. If an older build removed the original (or the local source was removed),
+Retry opens a real file chooser to reupload that original as bounded, validated
+binary into the same job. Failed replacement uploads preserve any prior verified
+source. Interrupted retries are marked failed on recovery, never silently replayed.
+Retained failed references live at `output/.p2p-inputs/<batch>/<job>` until a
+successful retry or deliberate local removal; these are private originals, not
+extra generated outputs. Removing one does not remove an archived design, but
+requires reselecting the original to retry.
 
 As each real provider image arrives, a bounded **native libvips streaming** graph
 aspect-fits it onto **4500 × 5400**, using the selected background for padding,
@@ -279,6 +324,7 @@ application. Live provider generation is separate from the local raster tests.
 | POST | `/api/bridge/pixel-to-pixel` | Legacy 8192px recreation API, SSE events |
 | POST | `/api/bridge/p2p/batches` | Create 1:1 manifest: Black/White, `outputsPerInput: 1` |
 | POST | `/api/bridge/p2p/batches/{id}/items/{job}` | Stream one original binary upload (40 MB max) |
+| POST | `/api/bridge/p2p/batches/{id}/items/{job}/retry` | Retry only an existing failed job; empty POST reuses its source, optional octet-stream reselects a missing original |
 | POST | `/api/bridge/p2p/batches/{id}/start` | Idempotently enqueue server-owned parallel generation |
 | GET | `/api/bridge/p2p/batches/{id}` | Persistent batch/job states and verified design records |
 | POST | `/api/bridge/p2p/batches/{id}/discard` | Discard an unfinished pre-generation upload |
@@ -300,6 +346,7 @@ unauthenticated public multi-user service.
 | `MERCHFLOW_OUT` | `<repository>/output` | PNGs, previews and durable History |
 | `MERCHFLOW_DB` | `~/MerchFlow/merchflow.db` | Existing account/job/listing database |
 | `MERCHFLOW_WORKER_URL` | `http://127.0.0.1:8000` | Next.js → worker proxy |
+| `MERCHFLOW_CDP_UPLOAD_TIMEOUT` | `45` | Seconds per strategy to verify new, loaded composer thumbnails |
 | `MERCHFLOW_P2P_PARALLEL` | `8` | Parallel P2P provider calls, capped to eligible account count (1–32) |
 | `MERCHFLOW_REMBG_MODEL` | `u2net` | Default model for direct pipeline callers |
 | `U2NET_HOME` | rembg default | Model weights cache directory |
@@ -363,8 +410,10 @@ MERCHFLOW_E2E_BASE_URL=http://127.0.0.1:8123 MERCHFLOW_E2E_P2P=1 npm run test:e2
 
 The harness is never imported by production. It uses no paid account/cookies,
 and must be stopped after validation. Tests verify live History arrival,
-optional ZIP only, navigation/reload recovery, and real Listing Hub file
-association, including regenerating the same retained files on another colour
+optional ZIP only, navigation/reload recovery, immediate pre-POST pending cards,
+full exact-error badges, no false zero-image completion, retry/reselection with
+no duplicate saved outputs, byte-identical optional PNG Download, saved-ID
+Prepare handoff, and real Listing Hub file association, including regenerating the same retained files on another colour
 with fresh job identities. Python provider fixtures exercise genuine 1/5/20/101 disk archives
 and exact-pixel lossless RGBA roundtrip above 4 MB. These are not a claim of
 successful live Gemini rendering. Linux validation does not replace an actual

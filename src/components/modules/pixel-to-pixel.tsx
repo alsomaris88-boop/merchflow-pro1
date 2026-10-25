@@ -1,12 +1,12 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { ArrowRight, Check, FlaskConical, History, ImageUp, Loader2, Palette, Sparkles, X } from "lucide-react";
+import { ArrowRight, Check, History, ImageUp, Loader2, Palette, Sparkles, X } from "lucide-react";
 import { Btn, Card, Chip, PageHead, Section, cx } from "@/components/ui";
 import { probeBridge, type BridgeStatus } from "@/lib/bridge";
-import { COLOUR_SWATCHES, generationLabel, normaliseHex, type PixelInput } from "@/lib/p2p-client";
+import { COLOUR_SWATCHES, generationLabel, normaliseHex, pixelBatchLabel, type PixelInput } from "@/lib/p2p-client";
 import { usePixelBatch } from "@/lib/use-p2p-batch";
-import { formatBytes, sendToPrepare } from "@/lib/designs-store";
+import { DonepixelResults } from "./donepixel-results";
 import type { ViewKey } from "@/components/shell";
 
 export default function PixelToPixel({ setView }: { setView: (view: ViewKey) => void }) {
@@ -48,14 +48,16 @@ export default function PixelToPixel({ setView }: { setView: (view: ViewKey) => 
     urls.current.clear(); setInputs([]); setInputError("");
   };
   const generate = async () => {
-    await generation.run(inputs, normaliseHex(colour));
+    const started = generation.run(inputs, normaliseHex(colour));
+    requestAnimationFrame(() => document.querySelector('[data-testid="p2p-results"]')?.scrollIntoView({ behavior: "smooth", block: "start" }));
+    await started;
   };
 
   return <div>
     <PageHead kicker="MODULE 03 · DONEPIXEL PIXEL TO PIXEL" title="Your designs. Back on your colour."
       desc="Drop any batch size—1, 5, 20, 50, 100 or more. Available Gemini Pro accounts recreate designs in parallel; exactly one verified PNG per input is saved to output/ and auto-archived in Designs History."
       right={<Chip tone={bridge.connected && !bridge.mock ? "lime" : "neutral"}>{bridge.mock ? "MOCK MODE · BLOCKED" : bridge.connected ? "DISK + LIVE HISTORY" : "ENGINE OFFLINE"}</Chip>} />
-    {(inputError || generation.error) && <div role="alert" className="mb-4 border border-red-400/30 rounded-xl bg-red-500/10 p-4 text-sm text-red-200">{inputError || generation.error}</div>}
+    {(inputError || generation.error) && <div role={inputError || !generation.jobs.length ? "alert" : "status"} className="mb-4 border border-red-400/30 rounded-xl bg-red-500/10 p-4 text-sm text-red-200">{inputError || generation.error}</div>}
     <div className="grid xl:grid-cols-5 gap-4">
       <div className="xl:col-span-3 space-y-4">
         <Card className="p-5">
@@ -77,6 +79,11 @@ export default function PixelToPixel({ setView }: { setView: (view: ViewKey) => 
             </div>)}</div> : <div className="text-center py-12"><ImageUp size={28} className="mx-auto text-[#b9a8ff] mb-3" /><div className="text-sm font-semibold">Drop 1 to 100+ design screenshots</div><div className="text-xs text-white/40 mt-2">PNG · JPEG · WebP and supported image formats · 40 MB per upload</div></div>}
           </div>
         </Card>
+        <Card className="p-4 text-xs text-white/45 leading-relaxed">
+          <strong className="text-white/75">Real files, not a browser download:</strong> streamed libvips export → 4500 × 5400 RGBA PNG → 300 DPI → verified disk write → SQLite History → live update. Lossless compression only; no palette or colour reduction. Files above 4 MB remain valid below the 25 MB ceiling. Strictly one output per input, never candidate sets. The exact prompt requests 8K clarity; actual provider resolution varies, and the final print canvas is 4500 × 5400, with aspect ratio preserved and colour-matched padding.
+        </Card>
+      </div>
+      <div className="xl:col-span-2 space-y-4">
         <Card className="p-5">
           <fieldset disabled={generation.running}>
             <Section icon={<Palette size={16} />} title="Target background" desc="Strict 1:1 recreation · one input image → exactly one PNG · no variants" />
@@ -94,35 +101,20 @@ export default function PixelToPixel({ setView }: { setView: (view: ViewKey) => 
             </Btn>
           </div>
         </Card>
-        <Card className="p-4 text-xs text-white/45 leading-relaxed">
-          <strong className="text-white/75">Real files, not a browser download:</strong> streamed libvips export → 4500 × 5400 RGBA PNG → 300 DPI → verified disk write → SQLite History → live update. Lossless compression only; no palette or colour reduction. Files above 4 MB remain valid below the 25 MB ceiling. Strictly one output per input, never candidate sets. The exact prompt requests 8K clarity; actual provider resolution varies, and the final print canvas is 4500 × 5400, with aspect ratio preserved and colour-matched padding.
-        </Card>
-      </div>
-      <div className="xl:col-span-2 space-y-4">
         <Card className="p-5">
           <Section icon={<History size={16} />} title="Automatic archive" desc="Uploads are spooled to disk; queued generation continues when you switch modules or disconnect from events." />
           <Btn variant="primary" className="w-full justify-center" onClick={() => setView("history")}><History size={14} />Open Designs History <ArrowRight size={14} /></Btn>
           {generation.uploading && <p className="text-xs text-amber-200 mt-3">Keep this browser open until uploads finish. Once queued, the engine owns the batch.</p>}
           {batch && <div className="mt-5">
             <div className="flex flex-wrap gap-2 mb-4"><Chip tone="violet">{batch.total} designs</Chip><Chip tone="lime">{batch.completed} archived</Chip>{batch.failed > 0 && <Chip tone="red">{batch.failed} failed</Chip>}</div>
-            <div data-testid="p2p-batch-status" className="text-xs text-white/50 mb-3">Batch {batch.id.slice(0, 8)} · {batch.status} · {batch.background}</div>
+            <div data-testid="p2p-batch-status" className="text-xs text-white/50 mb-3">{pixelBatchLabel(batch)}<br />Batch {batch.id.slice(0, 8)} · {batch.status} · {batch.background}</div>
             {batch.status === "uploading" && !generation.uploading && <Btn variant="ghost" onClick={() => void generation.discard()}>Discard unfinished upload</Btn>}
-            <div className="space-y-2 max-h-[680px] overflow-y-auto">{batch.items.map((job) => <div key={job.id} className="rounded-xl border border-white/10 p-3 flex items-center gap-3">
-              {job.design ? <>
-                {/* eslint-disable-next-line @next/next/no-img-element */}
-                <img src={job.design.previewUrl} alt={job.name} loading="lazy" className="w-12 h-14 object-contain rounded bg-black/30" />
-              </> : <div className="w-12 h-14 rounded bg-white/5 flex items-center justify-center shrink-0">{["rendering", "saving"].includes(job.state) ? <Loader2 size={16} className="animate-spin text-[#b9a8ff]" /> : <ImageUp size={16} className="text-white/25" />}</div>}
-              <div className="min-w-0 flex-1"><div className="text-xs truncate font-semibold">{job.name}</div><div className={cx("text-[10px] mt-1", job.state === "succeeded" ? "text-[#c9f24b]" : job.state === "failed" ? "text-red-300" : "text-white/40")}>{job.state === "succeeded" ? "Saved to disk + Designs History" : job.state} {job.account && `· ${job.account}`}</div>
-                {job.design && <div className="text-[9px] text-white/35 mt-1">4500 × 5400 · 300 DPI · {formatBytes(job.design.bytes)} · lossless RGBA
-                  {job.design.nativeW && <div>Provider {job.design.nativeW} × {job.design.nativeH} · {job.design.upscaled ? "Lanczos-upscaled to print" : "aspect-fit print export"}</div>}
-                </div>}
-                {job.reason && <div className="text-[10px] text-red-200 mt-1 break-words">{job.reason}</div>}
-                {job.design && job.state === "succeeded" && <Btn variant="lime" className="mt-2 py-1.5 text-[11px]" aria-label={`Send ${job.name} to Prepare Designs Lab`} onClick={() => { sendToPrepare([job.design!.id]); setView("prepare"); }}><FlaskConical size={12} />Send to Prepare Designs Lab</Btn>}
-              </div>
-            </div>)}</div>
+
           </div>}
         </Card>
       </div>
     </div>
+    <DonepixelResults jobs={generation.jobs} busy={generation.running} canRetry={bridge.connected && !bridge.mock}
+      retryErrors={generation.retryErrors} onRetry={(id, file) => void generation.retry(id, file)} setView={setView} />
   </div>;
 }

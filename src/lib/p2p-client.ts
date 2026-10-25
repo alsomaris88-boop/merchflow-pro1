@@ -1,4 +1,4 @@
-import { responseJson, type DesignRecord } from "./designs-store";
+import { isSavedDesign, responseJson, type DesignRecord } from "./designs-store";
 
 export const P2P_EVENT = "merchflow:p2p-updated";
 export const P2P_BATCH_KEY = "merchflow:current-p2p-batch";
@@ -9,13 +9,13 @@ export const COLOUR_SWATCHES = [
 export interface PixelInput { id: string; file: File; url: string }
 export interface PixelJob {
   id: string; name: string; state: string; account: string; reason: string;
-  design: DesignRecord | null;
+  design: DesignRecord | null; retryable?: boolean; local?: boolean;
 }
 export interface PixelBatch {
   id: string; status: string; background: string; total: number;
   completed: number; failed: number; items: PixelJob[];
 }
-export const isBatchActive = (batch: PixelBatch | null) => !!batch && ["uploading", "running"].includes(batch.status);
+export const isBatchActive = (batch: PixelBatch | null) => !!batch && ["uploading", "running", "retry-uploading"].includes(batch.status);
 export const generationLabel = (n: number) => `${n} designs in, ${n} back on your colour. ▷ Generate`;
 export function normaliseHex(value: string): string {
   if (!/^#[0-9a-f]{6}$/i.test(value)) throw new Error("Enter a six-digit hex colour, such as #000000.");
@@ -70,4 +70,27 @@ export async function submitPixelBatch(
 
 export async function discardPixelUpload(id: string): Promise<PixelBatch> {
   return (await responseJson<{ batch: PixelBatch }>(await fetch(`${root}/${encodeURIComponent(id)}/discard`, { method: "POST" }))).batch;
+}
+
+/** Explicit retry of ONE existing failed job; never creates a new saved identity.
+ * A replacement binary is only needed for an old/missing spooled reference.
+ */
+export async function retryPixelJob(batchId: string, jobId: string, file?: File): Promise<PixelBatch> {
+  const result = await responseJson<{ batch: PixelBatch }>(await fetch(
+    `${root}/${encodeURIComponent(batchId)}/items/${encodeURIComponent(jobId)}/retry`, {
+      method: "POST", ...(file ? { headers: { "Content-Type": "application/octet-stream" }, body: file } : {}),
+    }));
+  return result.batch;
+}
+
+/** A provider/transport/partial failure must never be labelled Batch complete. */
+export function pixelBatchLabel(batch: PixelBatch): string {
+  const failures = batch.items.filter((job) => job.state === "failed").length;
+  if (failures || batch.failed || ["failed", "partial"].includes(batch.status)) {
+    return isBatchActive(batch) ? "Generating · some designs failed" : "Generation failed · retry failed designs";
+  }
+  const saved = batch.items.filter((job) => job.state === "succeeded" && isSavedDesign(job.design)).length;
+  if (batch.status === "completed" && saved === batch.total && saved > 0) return "Batch complete · all designs archived";
+  if (batch.status === "completed") return "Saved artwork unavailable · check Designs History";
+  return batch.status === "uploading" ? "Uploading references" : "Generating 8K artwork...";
 }

@@ -60,30 +60,39 @@ CDP_BASE_PORT = int(os.environ.get("MERCHFLOW_CDP_PORT", "9222"))
 LOGIN_BASE_PORT = int(os.environ.get("MERCHFLOW_LOGIN_PORT", "9500"))
 GENERATION_TIMEOUT = float(os.environ.get("MERCHFLOW_CDP_GEN_TIMEOUT", "300"))
 READY_TIMEOUT = float(os.environ.get("MERCHFLOW_CDP_READY_TIMEOUT", "60"))
+UPLOAD_TIMEOUT = float(os.environ.get("MERCHFLOW_CDP_UPLOAD_TIMEOUT", "45"))
 MIN_IMAGE_SIDE = 256
 SESSION_COOKIES = {"__Secure-1PSID", "SID"}
 
 SELECTORS: dict = {
     "editor": 'rich-textarea [contenteditable="true"], rich-textarea .ql-editor, div.ql-editor, '
               'div[contenteditable="true"][role="textbox"], [contenteditable="true"], textarea',
-    "inputContainer": "input-area-v2, input-area, .input-area, .chat-input-container, input-container",
+    "inputContainer": "input-area-v2, input-area, .input-area, .chat-input-container, input-container, "
+                      '.input-area-container, .input-container, .composer, [data-testid="composer"]',
     "fileInput": 'input[type="file"][accept*="image"], input[type="file"]',
-    "uploadButtonAria": ["open upload file menu", "upload", "add file", "attach", "tools", "上传"],
-    "uploadMenuText": ["upload files", "upload file", "upload image", "add image", "上传文件", "上传图片"],
+    "uploadButtonAria": ["open upload file menu", "upload", "add file", "attach", "tools",
+                         "importer", "ajouter", "joindre", "téléverser", "outils", "plus", "+", "上传"],
+    "uploadMenuText": ["upload files", "upload file", "upload image", "add image",
+                       "importer des fichiers", "importer une image", "ajouter des fichiers", "téléverser",
+                       "上传文件", "上传图片"],
     "attachmentChips": [
         "uploader-file-preview", ".file-preview-card", ".attachment-preview", ".uploaded-image",
+        ".attachment-card", ".attachment-thumbnail", ".thumbnail", '[data-testid*="attachment"]',
+        '[data-testid*="file-preview"]', '[data-test-id*="thumbnail"]', "img",
         ".gem-attachment-style-img", '[data-test-id*="attachment"]', '[data-test-id*="file-preview"]',
         'img[src^="blob:"]', 'img[src^="data:image"]',
     ],
     "uploadBusy": 'mat-progress-spinner, mat-progress-bar, [role="progressbar"], .upload-progress, [aria-busy="true"]',
-    "sendAria": ["send message", "send", "submit", "发送"],
-    "stopAria": ["stop response", "stop generating", "stop", "停止"],
+    "sendAria": ["send message", "send", "submit", "envoyer", "发送"],
+    "stopAria": ["stop response", "stop generating", "stop", "arrêter", "interrompre", "停止"],
     "userQuery": "user-query, .user-query-container, [data-test-id=\"user-query\"]",
     "response": "model-response, .model-response, [data-test-id=\"model-response\"]",
     "generatedImages": ["generated-image img", "single-image img", ".generated-image img",
                         ".image-container img", "img.image", "model-response img"],
     "downloadAria": "download full size",
-    "dismissText": ["got it", "acknowledge", "no thanks", "dismiss", "close"],
+    "downloadAriaAlternatives": ["télécharger l'image", "télécharger en taille réelle",
+                                 "télécharger en taille originale", "télécharger l’image"],
+    "dismissText": ["got it", "acknowledge", "no thanks", "dismiss", "close", "compris", "non merci", "fermer"],
     "minSide": MIN_IMAGE_SIDE,
 }
 QUOTA_HINTS = ("reached your limit", "image generation limit", "limit for generating",
@@ -303,16 +312,34 @@ class CDPSession:
 
 # ------------------------------------------------------------- page scripts
 _SEL = json.dumps(SELECTORS)
-_HELPERS = """
+_HELPERS = r"""
 const S = %s;
-const lower = (v) => (v || '').toString().toLowerCase();
-const ariaMatch = (el, words) => { const a = lower(el.getAttribute('aria-label')); return words.some((w) => a.includes(w)); };
+const lower = (v) => (v || '').toString().toLowerCase().replace(/\s+/g, ' ').trim();
+const ariaMatch = (el, words) => { const a = lower(el.getAttribute('aria-label')); return words.some((w) => a.includes(lower(w))); };
 const enabled = (b) => b && !b.disabled && b.getAttribute('aria-disabled') !== 'true';
-const box = () => { const ed = document.querySelector(S.editor);
-  return document.querySelector(S.inputContainer) || (ed && (ed.closest('form,fieldset') || ed.parentElement?.parentElement?.parentElement)) || document; };
+const visible = (el) => {
+  if (!el || !el.getClientRects().length) return false;
+  for (let node = el; node; node = node.parentElement) {
+    const style = getComputedStyle(node);
+    if (node.hidden || style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) return false;
+  }
+  return true;
+};
+const box = () => {
+  const ed = document.querySelector(S.editor);
+  if (!ed) return null;
+  const root = ed.closest('input-area-v2,input-area') || ed.closest(S.inputContainer) || ed.closest('form,fieldset');
+  if (root && root !== document.body && root !== document.documentElement) return root;
+  let node = ed.parentElement;
+  for (let i = 0; i < 4 && node && node !== document.body; i++, node = node.parentElement) {
+    if (node.querySelector('button,input[type="file"]')) return node;
+  }
+  return ed.parentElement !== document.body ? ed.parentElement : null;
+};
 const lastOf = (sel) => { const all = document.querySelectorAll(sel); return all[all.length - 1] || null; };
 const outermost = (els) => els.filter((el) => !els.some((other) => other !== el && other.contains(el)));
 const goodImg = (img) => img.complete && img.naturalWidth >= S.minSide && img.naturalHeight >= S.minSide;
+const downloadButton = (el) => ariaMatch(el, [S.downloadAria, ...S.downloadAriaAlternatives]);
 """ % _SEL
 
 
@@ -323,13 +350,13 @@ def _js(body: str) -> str:
 SESSION_JS = _js("""
   const signIn = [...document.querySelectorAll('a,button')].some((el) => {
     const label = lower((el.innerText || '') + ' ' + (el.getAttribute('aria-label') || '')).trim();
-    return /^sign in\\b/.test(label) || /accounts\\.google\\.com\\/(servicelogin|signin)/i.test(el.getAttribute('href') || '');
+    return /^(sign in|se connecter|connexion)\\b/.test(label) || /accounts\\.google\\.com\\/(servicelogin|signin)/i.test(el.getAttribute('href') || '');
   });
   const rx = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}/;
   let account = null;
   for (const el of document.querySelectorAll('a[aria-label],button[aria-label],img[alt]')) {
     const v = el.getAttribute('aria-label') || el.getAttribute('alt') || '';
-    if (/google account/i.test(v)) { const m = v.match(rx); if (m) { account = m[0]; break; } account = account || 'signed-in'; }
+    if (/google account|compte google/i.test(v)) { const m = v.match(rx); if (m) { account = m[0]; break; } account = account || 'signed-in'; }
   }
   return { href: location.href, ready: document.readyState, editor: !!document.querySelector(S.editor), signIn, account };
 """)
@@ -347,7 +374,7 @@ STATE_JS = _js("""
   const responses = document.querySelectorAll(S.response);
   const last = responses[responses.length - 1] || null;
   const imgs = last ? outermost([...last.querySelectorAll(S.generatedImages.join(','))]).filter(goodImg) : [];
-  const downloads = last ? [...last.querySelectorAll('button')].filter((b) => lower(b.getAttribute('aria-label')).includes(S.downloadAria)).length : 0;
+  const downloads = last ? [...last.querySelectorAll('button')].filter((b) => downloadButton(b)).length : 0;
   const stop = [...document.querySelectorAll('button')].some((b) => ariaMatch(b, S.stopAria) && b.offsetParent !== null);
   const lastQuery = lastOf(S.userQuery);
   return { responses: responses.length, userQueries: document.querySelectorAll(S.userQuery).length,
@@ -356,11 +383,31 @@ STATE_JS = _js("""
            editorText: (document.querySelector(S.editor)?.innerText || document.querySelector(S.editor)?.value || '') };
 """)
 
-GATE1_JS = _js("""
+GATE1_JS = _js(r"""
   const container = box();
-  const chips = outermost([...container.querySelectorAll(S.attachmentChips.join(','))])
-    .filter((el) => el.tagName !== 'IMG' || (el.complete && el.naturalWidth > 0));
-  return { chips: chips.length, busy: !!container.querySelector(S.uploadBusy) };
+  if (!container) return { chips: 0, busy: false, tokens: [], composer: false };
+  const avatar = (el) => el.closest('.avatar,.profile-avatar,[data-avatar],[data-testid*="avatar"],header,nav') ||
+    /^(avatar|profile picture|google account|compte google)(:|$)/.test(lower(el.getAttribute('alt') || el.getAttribute('aria-label')));
+  const all = [...container.querySelectorAll(S.attachmentChips.join(','))].filter((el) => visible(el) && !avatar(el));
+  // Count leaf thumbnails, not their shared list/container. HTTP-backed <img>
+  // previews are valid too, but hidden/broken images and avatars are not.
+  const images = all.filter((el) => el.tagName === 'IMG' && el.complete && el.naturalWidth > 0 &&
+    el.getBoundingClientRect().width > 4 && el.getBoundingClientRect().height > 4);
+  // Empty/text-only cards are not proof of a reference thumbnail.
+  const gate = window.__merchflowAttachmentGate ||= { ids: new WeakMap(), next: 1 };
+  const tokens = images.map((el) => {
+    if (!gate.ids.has(el)) gate.ids.set(el, gate.next++);
+    return gate.ids.get(el) + ':' + (el.currentSrc || el.getAttribute('src') || getComputedStyle(el).backgroundImage || 'card');
+  });
+  const busy = [container, ...container.querySelectorAll(S.uploadBusy)].some((el) => el.matches(S.uploadBusy) && visible(el));
+  return { chips: tokens.length, busy, tokens, composer: true };
+""")
+
+FILE_INPUT_JS = _js(r"""
+  const container = box();
+  if (!container) return null;
+  const inputs = [...container.querySelectorAll(S.fileInput)].filter(enabled);
+  return inputs.find((el) => lower(el.accept).includes('image')) || inputs[0] || null;
 """)
 
 FOCUS_EDITOR_JS = _js("""
@@ -372,15 +419,35 @@ FOCUS_EDITOR_JS = _js("""
   return true;
 """)
 
-CLICK_UPLOAD_JS = _js("""
-  const b = [...document.querySelectorAll('button,[role="button"]')].find((el) => ariaMatch(el, S.uploadButtonAria) && enabled(el));
-  if (!b) return false; b.click(); return true;
+CLICK_UPLOAD_JS = _js(r"""
+  const container = box(); if (!container) return false;
+  const direct = 'button[aria-label*="import" i],button[aria-label*="add" i],button[aria-label*="plus" i],'
+    + 'button[aria-label*="upload" i],button[aria-label*="attach" i],button[aria-label*="joindre" i],'
+    + 'button[data-testid*="upload" i],button[data-test-id*="upload" i],'
+    + 'button[data-testid*="attach" i],button[data-test-id*="attach" i],'
+    + 'button:has(svg[data-icon="plus"]),button:has(svg[data-icon="attachment"]),'
+    + 'button:has(.icon-plus),button:has(.plus-icon),button:has(mat-icon)';
+  const candidates = [...new Set([...container.querySelectorAll(direct), ...container.querySelectorAll('button,[role="button"]')])]
+    .filter((el) => visible(el) && enabled(el));
+  const score = (el) => {
+    const aria = lower(el.getAttribute('aria-label'));
+    const icon = lower([...el.querySelectorAll('svg,mat-icon,[class*="icon"]')].map((node) =>
+      [node.textContent,node.getAttribute('data-icon'),node.getAttribute('fonticon'),node.getAttribute('svgicon'),node.getAttribute('class')].join(' ')).join(' '));
+    const testid = lower(el.getAttribute('data-testid') || el.getAttribute('data-test-id'));
+    if (/upload|attach|import|ajouter|joindre|téléverser/.test(aria + ' ' + testid)) return 5;
+    if (/plus|(^|[\s_-])add([\s_-]|$)|attach|upload|file_upload/.test(icon) || aria === '+' || aria.includes('plus') || el.textContent.trim() === '+') return 4;
+    return ariaMatch(el,S.uploadButtonAria) ? 1 : 0;
+  };
+  const button = candidates.map((el,index) => ({ el,index,score:score(el) })).filter((item) => item.score > 0)
+    .sort((a,b) => b.score-a.score || a.index-b.index)[0]?.el;
+  if (!button) return false; button.click(); return true;
 """)
 
-CLICK_UPLOAD_MENU_JS = _js("""
-  const items = [...document.querySelectorAll('[role="menuitem"], .mat-mdc-menu-item, button, [data-test-id*="uploader"]')];
-  const it = items.find((el) => S.uploadMenuText.some((w) => lower(el.innerText || el.getAttribute('aria-label')).includes(w)));
-  if (!it) return false; it.click(); return true;
+CLICK_UPLOAD_MENU_JS = _js(r"""
+  const items = [...document.querySelectorAll('[role="menuitem"],.mat-mdc-menu-item,button,[data-test-id*="uploader"],[data-testid*="uploader"]')];
+  const item = items.find((el) => visible(el) && enabled(el) &&
+    S.uploadMenuText.some((word) => lower((el.innerText || '') + ' ' + (el.getAttribute('aria-label') || '')).includes(lower(word))));
+  if (!item) return false; item.click(); return true;
 """)
 
 EDITOR_RECT_JS = _js("""
@@ -389,19 +456,20 @@ EDITOR_RECT_JS = _js("""
 """)
 
 SEND_JS = _js("""
-  const b = [...document.querySelectorAll('button')].find((el) => ariaMatch(el, S.sendAria) && !ariaMatch(el, S.stopAria));
+  const container = box(); if (!container) return false;
+  const b = [...container.querySelectorAll('button')].find((el) => visible(el) && ariaMatch(el, S.sendAria) && !ariaMatch(el, S.stopAria));
   if (!enabled(b)) return false; b.click(); return true;
 """)
 
 SCROLL_DOWNLOAD_JS = _js("""
   const last = lastOf(S.response); if (!last) return false;
-  const b = [...last.querySelectorAll('button')].find((el) => lower(el.getAttribute('aria-label')).includes(S.downloadAria));
+  const b = [...last.querySelectorAll('button')].find((el) => downloadButton(el));
   if (!b) return false; b.scrollIntoView({ block: 'center' }); return true;
 """)
 
 CLICK_DOWNLOAD_JS = _js("""
   const last = lastOf(S.response); if (!last) return false;
-  const b = [...last.querySelectorAll('button')].find((el) => lower(el.getAttribute('aria-label')).includes(S.downloadAria));
+  const b = [...last.querySelectorAll('button')].find((el) => downloadButton(el));
   if (!b) return false; b.click(); return true;
 """)
 
@@ -594,53 +662,87 @@ class CdpGeminiClient:
                 close_page(port, target["id"])
 
     # ------------------------------------------------ step 1 + 2: attach
-    def _gate1(self, s: CDPSession, expected: int, timeout: float) -> bool:
+    @staticmethod
+    def _new_chips(state: dict, baseline: set[str]) -> int:
+        tokens = state.get("tokens")
+        if tokens is None:
+            return int(state.get("chips", 0))
+        old_sources = {token.partition(":")[2] for token in baseline}
+        return sum(token not in baseline and token.partition(":")[2] not in old_sources for token in set(tokens))
+
+    def _gate1(self, s: CDPSession, expected: int, timeout: float, baseline: set[str] | None = None) -> bool:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             state = s.evaluate(GATE1_JS) or {}
-            if state.get("chips", 0) >= expected and not state.get("busy"):
+            if self._new_chips(state, baseline or set()) >= expected and not state.get("busy"):
                 return True
             time.sleep(0.2)
         return False
 
     def _attach(self, s: CDPSession, paths: list[str]) -> str:
         expected = len(paths)
-        # Strategy A — the page's own <input type="file" accept="image/*">
-        obj = s.object_id(f"document.querySelector({json.dumps(SELECTORS['fileInput'])})")
-        if obj:
-            s.send("DOM.setFileInputFiles", {"files": paths, "objectId": obj})
-            if self._gate1(s, expected, 15):
-                return "file-input"
-        # Strategy B — the attachment button → native file chooser, intercepted via CDP
+        baseline = set((s.evaluate(GATE1_JS) or {}).get("tokens", []))
+        failure = "GATE 1 FAILED: the reference thumbnail never rendered in the Gemini input box"
+
+        def verify() -> bool:
+            if self._gate1(s, expected, UPLOAD_TIMEOUT, baseline):
+                return True
+            state = s.evaluate(GATE1_JS) or {}
+            # Never append the reference again over a partial/still-busy upload:
+            # duplicate thumbnails could otherwise fool the gate and change IMAGE 1/2.
+            if self._new_chips(state, baseline) or state.get("busy"):
+                raise GeminiRenderError(failure)
+            return False
+
+        def set_input() -> bool:
+            obj = s.object_id(FILE_INPUT_JS)
+            if not obj:
+                return False
+            try:
+                s.send("DOM.setFileInputFiles", {"files": paths, "objectId": obj})
+            except CDPError:
+                return False
+            return verify()
+
+        # A — direct, composer-scoped file input; never an unrelated page input.
+        if set_input():
+            return "file-input"
+        # B — French/English labels and locale-independent plus/attachment icons.
         try:
             s.send("Page.setInterceptFileChooserDialog", {"enabled": True})
             if s.evaluate(CLICK_UPLOAD_JS):
-                chooser = s.wait_event("Page.fileChooserOpened", 2.5)
-                if chooser is None and s.evaluate(CLICK_UPLOAD_MENU_JS):
-                    chooser = s.wait_event("Page.fileChooserOpened", 6)
+                chooser = s.wait_event("Page.fileChooserOpened", 1.0)
+                if chooser is None:
+                    deadline = time.monotonic() + 6
+                    while time.monotonic() < deadline:
+                        if s.evaluate(CLICK_UPLOAD_MENU_JS):
+                            chooser = s.wait_event("Page.fileChooserOpened", 4)
+                            break
+                        time.sleep(0.2)
                 if chooser and chooser.get("backendNodeId"):
-                    s.send("DOM.setFileInputFiles", {"files": paths, "backendNodeId": chooser["backendNodeId"]})
-                    if self._gate1(s, expected, 15):
-                        return "file-chooser"
-                obj = s.object_id(f"document.querySelector({json.dumps(SELECTORS['fileInput'])})")
-                if obj:
-                    s.send("DOM.setFileInputFiles", {"files": paths, "objectId": obj})
-                    if self._gate1(s, expected, 15):
-                        return "file-input-after-menu"
+                    try:
+                        s.send("DOM.setFileInputFiles", {"files": paths, "backendNodeId": chooser["backendNodeId"]})
+                    except CDPError:
+                        pass
+                    else:
+                        if verify():
+                            return "file-chooser"
+                if set_input():
+                    return "file-input-after-menu"
         finally:
             try:
                 s.send("Page.setInterceptFileChooserDialog", {"enabled": False})
             except CDPError:
                 pass
-        # Strategy C — native drag-and-drop onto the rich-textarea
+        # C — real native drag-and-drop. No thumbnail is ever fabricated.
         rect = s.evaluate(EDITOR_RECT_JS)
         if rect:
             data = {"items": [], "files": paths, "dragOperationsMask": 1}
             for kind in ("dragEnter", "dragOver", "drop"):
                 s.send("Input.dispatchDragEvent", {"type": kind, "x": rect["x"], "y": rect["y"], "data": data})
-            if self._gate1(s, expected, 15):
+            if verify():
                 return "drag-drop"
-        raise GeminiRenderError("GATE 1 FAILED: the reference thumbnail never rendered in the Gemini input box")
+        raise GeminiRenderError(failure)
 
     # ---------------------------------------------- step 3 + 4: prompt
     def _type_prompt(self, s: CDPSession, prompt: str) -> None:

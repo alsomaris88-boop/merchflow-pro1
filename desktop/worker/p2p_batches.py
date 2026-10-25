@@ -81,6 +81,7 @@ def snapshot(out_dir: Path, batch_id: str) -> dict:
         item = dict(row)
         data = item.pop("data")
         item["design"] = json.loads(data) if data else None
+        item["retryable"] = item["state"] == "failed" and (_input_dir(out_dir, batch_id) / item["id"]).is_file()
         items.append(item)
     return {**batch, "items": items, "total": len(items),
             "completed": sum(j["state"] == "succeeded" for j in items),
@@ -91,7 +92,7 @@ def set_state(out_dir: Path, batch_id: str, job_id: str, state: str, *, reason: 
     with connect(out_dir) as conn:
         conn.execute("UPDATE p2p_jobs SET state=?, reason=?, account=CASE WHEN ?='' THEN account ELSE ? END "
                      "WHERE id=? AND batch_id=? AND state!='succeeded'",
-                     (state, reason[:800], account, account, job_id, batch_id))
+                     (state, reason, account, account, job_id, batch_id))
         _changed(conn, batch_id)
 
 
@@ -178,8 +179,13 @@ def _run_item(out_dir: Path, batch: dict, job: dict) -> None:
         _export(raw, out_dir, job, batch["background"], account, prompt, started)
     except Exception as exc:
         set_state(out_dir, batch["id"], job["id"], "failed", reason=str(exc))
-    finally:
-        source_path.unlink(missing_ok=True)
+    else:
+        # Failed/uncertain work retains its verified original for explicit Retry,
+        # including across a UI reload or worker restart. Success is never retried.
+        try:
+            source_path.unlink(missing_ok=True)
+        except OSError:
+            pass  # cleanup must not turn a durable archive into a reported failure
 
 
 def _finish(out_dir: Path, batch_id: str) -> None:
@@ -188,7 +194,11 @@ def _finish(out_dir: Path, batch_id: str) -> None:
     with connect(out_dir) as conn:
         conn.execute("UPDATE p2p_batches SET status=? WHERE id=?", (status, batch_id))
         _changed(conn, batch_id)
-    shutil.rmtree(_input_dir(out_dir, batch_id), ignore_errors=True)
+    folder = _input_dir(out_dir, batch_id)
+    try:
+        folder.rmdir()  # only remove an empty spool; failed references must survive
+    except OSError:
+        pass
 
 
 def _run(out_dir: Path, batch_id: str) -> None:
@@ -204,17 +214,17 @@ def _run(out_dir: Path, batch_id: str) -> None:
     except Exception as exc:
         with connect(out_dir) as conn:
             conn.execute("UPDATE p2p_jobs SET state='failed',reason=? WHERE batch_id=? AND state NOT IN ('succeeded','failed')",
-                         (str(exc)[:800], batch_id))
+                         (str(exc), batch_id))
     finally:
-        try:
-            _finish(out_dir, batch_id)
-        finally:
-            with _START_LOCK:
+        # Terminal status and lease release are indivisible with respect to Retry.
+        with _START_LOCK:
+            try:
+                _finish(out_dir, batch_id)
+            finally:
                 _ACTIVE.pop((str(out_dir.resolve()), batch_id), None)
 
 
 def start(out_dir: Path, batch_id: str) -> dict:
-    key = (str(out_dir.resolve()), batch_id)
     with _START_LOCK:
         with connect(out_dir) as conn:
             batch = _batch(conn, batch_id)
@@ -226,16 +236,14 @@ def start(out_dir: Path, batch_id: str) -> dict:
             conn.execute("UPDATE p2p_jobs SET state='queued' WHERE batch_id=? AND state='uploaded'", (batch_id,))
             conn.execute("UPDATE p2p_batches SET status='running' WHERE id=?", (batch_id,))
             _changed(conn, batch_id)
-        thread = threading.Thread(target=_run, args=(out_dir, batch_id), daemon=True, name=f"p2p-{batch_id[:8]}")
-        _ACTIVE[key] = thread
-        thread.start()
+        _spawn(out_dir, batch_id)
     return snapshot(out_dir, batch_id)
 
 
 def recover(out_dir: Path) -> None:
     """Do not silently repeat paid/uncertain renders after a worker restart."""
     with connect(out_dir) as conn:
-        batches = [row[0] for row in conn.execute("SELECT id FROM p2p_batches WHERE status IN ('uploading','running')")]
+        batches = [row[0] for row in conn.execute("SELECT id FROM p2p_batches WHERE status IN ('uploading','running','retry-uploading')")]
     for batch_id in batches:
         with _START_LOCK:
             if (str(out_dir.resolve()), batch_id) in _ACTIVE:
@@ -243,7 +251,80 @@ def recover(out_dir: Path) -> None:
         with connect(out_dir) as conn:
             conn.execute("UPDATE p2p_jobs SET state='failed',reason='Worker restarted before completion; already archived designs are safe. Retry unfinished images.' "
                          "WHERE batch_id=? AND state NOT IN ('succeeded','failed')", (batch_id,))
+        for temp in _input_dir(out_dir, batch_id).glob("*.part"):
+            temp.unlink(missing_ok=True)
         _finish(out_dir, batch_id)
+
+
+def _spawn(out_dir: Path, batch_id: str) -> None:
+    """Caller holds _START_LOCK. Only queued jobs enter this attempt."""
+    key = (str(out_dir.resolve()), batch_id)
+    thread = threading.Thread(target=_run, args=(out_dir, batch_id), daemon=True, name=f"p2p-{batch_id[:8]}")
+    _ACTIVE[key] = thread
+    try:
+        thread.start()
+    except Exception as exc:
+        _ACTIVE.pop(key, None)
+        with connect(out_dir) as conn:
+            conn.execute("UPDATE p2p_jobs SET state='failed',reason=? WHERE batch_id=? AND state='queued'",
+                         (f"Could not start generation worker: {exc}", batch_id))
+        _finish(out_dir, batch_id)
+        raise
+
+
+async def _store_upload(request: Request, destination: Path) -> None:
+    """Bounded binary spool; verify before replacing a retained original."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temp = destination.parent / f"{destination.name}.{uuid.uuid4().hex}.part"
+    try:
+        length = 0
+        with temp.open("xb") as stream:
+            async for chunk in request.stream():
+                length += len(chunk)
+                if length > MAX_UPLOAD_BYTES:
+                    raise HTTPException(413, "Each image must be 40 MB or smaller")
+                stream.write(chunk)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if not length:
+            raise HTTPException(400, "Empty image upload")
+        with Image.open(temp) as check:
+            check.verify()
+        os.replace(temp, destination)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+def _claim_retry(out_dir: Path, batch_id: str, job_id: str, replacing: bool) -> bool:
+    """Claim only the failed item. Duplicate/in-flight/successful retries are no-ops."""
+    with _START_LOCK, connect(out_dir) as conn:
+        batch = _batch(conn, batch_id)
+        job = conn.execute("SELECT state FROM p2p_jobs WHERE id=? AND batch_id=?", (job_id, batch_id)).fetchone()
+        if job is None:
+            raise HTTPException(404, "Batch item not found")
+        if job["state"] in {"succeeded", "queued", "rendering", "saving", "retry-uploading"}:
+            return False
+        if batch["status"] not in {"failed", "partial"} or job["state"] != "failed":
+            raise HTTPException(409, "Wait for the active batch to finish before retrying a failed design")
+        require_engine()
+        if not replacing and not (_input_dir(out_dir, batch_id) / job_id).is_file():
+            raise HTTPException(409, "The original upload is unavailable. Choose the original image again to retry.")
+        conn.execute("UPDATE p2p_jobs SET state='retry-uploading',reason='' WHERE id=? AND batch_id=?", (job_id, batch_id))
+        conn.execute("UPDATE p2p_batches SET status='retry-uploading' WHERE id=?", (batch_id,))
+        _changed(conn, batch_id)
+        return True
+
+
+def _queue_retry(out_dir: Path, batch_id: str, job_id: str) -> None:
+    with _START_LOCK:
+        with connect(out_dir) as conn:
+            changed = conn.execute("UPDATE p2p_jobs SET state='queued',reason='',account='',ms=0 "
+                                   "WHERE id=? AND batch_id=? AND state='retry-uploading'", (job_id, batch_id))
+            if changed.rowcount != 1:
+                raise HTTPException(409, "Retry state changed; refresh the saved batch before retrying")
+            conn.execute("UPDATE p2p_batches SET status='running' WHERE id=?", (batch_id,))
+            _changed(conn, batch_id)
+        _spawn(out_dir, batch_id)
 
 
 def install_routes(app: FastAPI, get_out) -> None:
@@ -276,37 +357,40 @@ def install_routes(app: FastAPI, get_out) -> None:
             if job["state"] == "uploading":
                 raise HTTPException(409, "This image upload is already in progress")
             conn.execute("UPDATE p2p_jobs SET state='uploading' WHERE id=?", (job_id,))
-        folder = _input_dir(out_dir, batch_id)
-        destination = folder / job_id
-        temp = folder / f"{job_id}.{uuid.uuid4().hex}.part"
+        destination = _input_dir(out_dir, batch_id) / job_id
         try:
-            folder.mkdir(parents=True, exist_ok=True)
-            length = 0
-            with temp.open("xb") as stream:
-                async for chunk in request.stream():
-                    length += len(chunk)
-                    if length > MAX_UPLOAD_BYTES:
-                        raise HTTPException(413, "Each image must be 40 MB or smaller")
-                    stream.write(chunk)
-            if not length:
-                raise HTTPException(400, "Empty image upload")
-            with Image.open(temp) as check:
-                check.verify()
-            os.replace(temp, destination)
+            await _store_upload(request, destination)
             set_state(out_dir, batch_id, job_id, "uploaded")
             return {"ok": True}
         except asyncio.CancelledError:
-            destination.unlink(missing_ok=True)
             set_state(out_dir, batch_id, job_id, "failed", reason="Image upload was interrupted")
             raise
         except Exception as exc:
-            destination.unlink(missing_ok=True)
             set_state(out_dir, batch_id, job_id, "failed", reason=str(getattr(exc, "detail", exc)))
             if isinstance(exc, HTTPException):
                 raise
             raise HTTPException(400, f"Invalid image upload: {exc}") from exc
-        finally:
-            temp.unlink(missing_ok=True)
+
+    @app.post(root + "/{batch_id}/items/{job_id}/retry")
+    async def retry_item(batch_id: str, job_id: str, request: Request):
+        out_dir = get_out()
+        replacing = request.headers.get("content-type", "").lower().startswith("application/octet-stream")
+        claimed = await asyncio.to_thread(_claim_retry, out_dir, batch_id, job_id, replacing)
+        if not claimed:
+            return {"ok": True, "batch": await asyncio.to_thread(snapshot, out_dir, batch_id)}
+        try:
+            if replacing:
+                await _store_upload(request, _input_dir(out_dir, batch_id) / job_id)
+            await asyncio.to_thread(_queue_retry, out_dir, batch_id, job_id)
+        except (Exception, asyncio.CancelledError) as exc:
+            reason = "Retry upload was interrupted" if isinstance(exc, asyncio.CancelledError) else str(getattr(exc, "detail", exc))
+            set_state(out_dir, batch_id, job_id, "failed", reason=reason)
+            with _START_LOCK:
+                _finish(out_dir, batch_id)
+            if isinstance(exc, (HTTPException, asyncio.CancelledError)):
+                raise
+            raise HTTPException(400, f"Could not retry image: {exc}") from exc
+        return {"ok": True, "batch": await asyncio.to_thread(snapshot, out_dir, batch_id)}
 
     @app.post(root + "/{batch_id}/start")
     async def start_batch(batch_id: str):
@@ -323,6 +407,7 @@ def install_routes(app: FastAPI, get_out) -> None:
                 raise HTTPException(409, "An upload is still in progress; wait for it to finish")
             conn.execute("UPDATE p2p_jobs SET state='failed',reason='Unfinished upload discarded' WHERE batch_id=?", (batch_id,))
         await asyncio.to_thread(_finish, out_dir, batch_id)
+        shutil.rmtree(_input_dir(out_dir, batch_id), ignore_errors=True)
         return {"ok": True, "batch": await asyncio.to_thread(snapshot, out_dir, batch_id)}
 
     @app.get("/api/bridge/events")

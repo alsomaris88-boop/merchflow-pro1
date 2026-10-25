@@ -1,13 +1,82 @@
-# Pipeline validation — 2026-10-24
+# Pipeline validation — 2026-10-25
 
-## Integrated account / single-output / startup refactor on current CDP main
+## Current fix: multilingual upload, strict Gate 1 and live Donepixel results
+
+Built on published `6e46af3` without rewriting approved CDP/Fusion/Prepare work.
+Worker identity: `2.5.1-multilingual-upload-live-retry`.
+
+- English/French upload-menu vocabulary plus direct SVG-plus, Material-attachment
+  and test-ID controls. Composer-scoped direct input errors can fall back to the
+  real intercepted file chooser or native drag/drop. French session/Send/Stop/
+  full-size download controls are covered too.
+- Gate 1 accepts loaded HTTP thumbnails, not only blob/data URLs, and counts
+  distinct leaf images instead of their shared container. No document-wide
+  fallback, avatars/history, invisible/broken previews, empty/text-only cards,
+  pre-existing decorations or same-source decoration re-renders can satisfy it.
+  Nested text-only wrappers cannot hide sibling previews in the real input-area.
+  Visible upload progress still blocks; hidden spinners do not. Partial uploads
+  fail rather than appending duplicate IMAGE 1/2 references.
+- Generate renders pending skeleton cards **before the manifest POST returns**,
+  with the exact `Generating 8K artwork...` label. Success cards use real saved
+  thumbnails and provide Download + Send to Prepare Lab. Failed cards expose
+  prominent red, full exact reasons and real Retry; no zero-image/partial failure
+  is announced as Batch complete.
+- Failed originals are retained for explicit per-existing-job retry across
+  reload/recovery. Optional bounded binary reselection repairs old/missing
+  sources. Successful jobs are not regenerated; concurrent/late duplicate retry
+  requests do not create another PNG/History entry. Failed replacement uploads
+  preserve the previous verified original. Recovery never silently replays an
+  uncertain paid render. Successful-job source cleanup leaves real archives intact.
+
+Final automated results:
+
+- **124 Python tests passed, 1 opt-in neural-model smoke skipped** (383.62s).
+  Includes all **23 CDP tests**, six French-only/icon/test-ID/drag-drop/direct-CDP-
+  error upload modes, HTTP thumbnails, negative/busy/nested-wrapper gates,
+  unchanged Fusion words/Unicode and IMAGE 1/2 bytes/order; all account/launcher/
+  image regressions; and six additional real disk/SQLite retry/error tests.
+- **26 TypeScript tests passed**, including exact-error retry propagation,
+  bounded unchanged binary reselection, no new retry job identity and defensive
+  failed/partial/zero-image/missing-archive completion labels.
+- **17 Chromium desktop browser tests passed, 1 opt-in legacy 55-file Prepare
+  case skipped** (1.6m), against the actual fresh static export + FastAPI. New
+  cases hold the initial POST/retry response to verify immediate pending-only
+  cards, real saved thumbnails, exact in-viewport red error + Retry, failed-card
+  recovery after reload, per-failed-job/legacy-file-reselection retry without
+  duplicate History, byte-identical actual PNG Download and saved-ID Prepare.
+  Existing fresh-empty accounts, Black/White, 1/5/20/101 ingestion, repeat-colour,
+  SSE/History, ZIP/Listing and navigation/reload tests also pass.
+- Both **normal Next production build** and **static desktop export** pass;
+  API source restoration, ESLint, TypeScript, compileall and whitespace pass.
+- Mandatory Fusion directive and exact Donepixel fidelity prompt audited
+  unchanged; the Generator component, neural image pipeline, output-store
+  transaction/encoding and Windows launcher remain untouched.
+- Real `/api/accounts` and `/api/bridge/accounts` lists remain empty after native
+  fixture-backed integration; no test provider is exposed as a connected account.
+  The temporary fixture service is stopped and its temporary data removed.
+
+Test provider/DOM responses are **explicit isolated local fixtures**, not live Google. Real
+Chromium/CDP, Chrome SQLite profiles, libvips, disk/SQLite History, SSE, browser
+Download and Prepare/Listing handoff are exercised. No live authenticated Gemini
+or native Windows smoke is claimed. Optional neural-model and legacy 55-file
+Prepare smokes remain separate opt-ins. The exact fidelity prompt and the
+mandatory Fusion literal/generator are unchanged. Black/White, one saved output
+per successful input, 1–100+, lossless RGBA/300 DPI/<25 MB and Windows 45-second
+HTTP-200/boot-log/venv guards remain covered.
+
+**Deployment:** rebuild/replace the generated `out/` with
+`npm ci && npm run build:desktop` before restarting the Windows package;
+`git pull` alone cannot update an older git-ignored UI bundle. Preserve genuine
+profiles, SQLite and output. See `desktop/README.md`.
+
+## Published baseline `6e46af3`: account / single-output / startup CDP integration
 
 The user-approved integration preserves upstream commits through `fba9f91`:
 raw-CDP Chrome profiles, the byte-identical mandatory Fusion directive and
 niche-first/style-second uploads, and the one-click Send to Prepare handoff.
 The earlier verified `c8408a4` was not force-pushed over those changes.
 
-Current final checks:
+Checks recorded for that published baseline:
 
 - **108 Python tests passed, 1 opt-in real-model smoke skipped** (299.69s).
   Includes 14 account/legacy-provider tests, 13 additional CDP account safeguards,
@@ -161,7 +230,8 @@ checks pass; native Windows startup still needs its target-machine smoke test.
 A crashed engine prints the exact contents of `desktop\engine_boot.log`.
 That launcher-only follow-up did not change the frontend or image pipeline;
 its prior validation results are retained above. The Donepixel update now
-re-runs those launcher/image regressions as part of the current 108-test passing suite.
+re-runs those launcher/image regressions as part of the published CDP baseline's 108-test passing suite; the current
+fix reruns them too (results above).
 
 ## Scope and limits
 

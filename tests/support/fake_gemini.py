@@ -29,16 +29,16 @@ def png(size: tuple[int, int], colour: tuple[int, int, int]) -> bytes:
     return buf.getvalue()
 
 
-PAGE = """<!doctype html><html><head><meta charset="utf-8"><title>Gemini</title></head><body>
+PAGE = """<!doctype html><html><head><meta charset="utf-8"><title>Gemini</title><style>.ql-editor{white-space:pre-wrap;min-height:40px}</style></head><body>
 <header>%(account)s</header>
 <main id="chat"></main>
 <input-area-v2>
   <div id="chips"></div>
   <rich-textarea><div class="ql-editor" contenteditable="true" role="textbox" aria-label="Enter a prompt here"></div></rich-textarea>
-  <button aria-label="Open upload file menu" id="upload">+</button>
+  %(upload_button)s
   <div id="menu"></div>
   %(file_input)s
-  <button aria-label="Send message" id="send" disabled>send</button>
+  <button aria-label="%(send_label)s" id="send" disabled>send</button>
 </input-area-v2>
 <script>
 const CFG = %(cfg)s;
@@ -46,12 +46,13 @@ const files = []; let busy = false, turn = 0;
 const editor = document.querySelector('.ql-editor'), send = document.getElementById('send');
 setInterval(() => { send.disabled = !editor.innerText.trim() || busy; }, 80);
 function addFiles(list) {
+  if (CFG.rejectUpload) return;
   busy = true;
   const bar = document.createElement('div'); bar.setAttribute('role', 'progressbar'); document.getElementById('chips').appendChild(bar);
-  for (const f of list) {
+  for (const f of Array.from(list).slice(0, CFG.maxUploadFiles || undefined)) {
     files.push(f);
-    const card = document.createElement('div'); card.className = 'file-preview-card';
-    const img = document.createElement('img'); img.src = URL.createObjectURL(f); card.appendChild(img);
+    const card = document.createElement('div'); card.className = CFG.httpThumbnail ? 'attachment-card' : 'file-preview-card';
+    const img = document.createElement('img'); img.src = CFG.httpThumbnail ? '/img/0-1=s512' : URL.createObjectURL(f); img.style.cssText = 'width:80px;height:96px;object-fit:contain'; card.appendChild(img);
     document.getElementById('chips').appendChild(card);
   }
   setTimeout(() => { bar.remove(); busy = false; }, 300);
@@ -59,13 +60,15 @@ function addFiles(list) {
 function wire(input) { input.addEventListener('change', () => addFiles(input.files)); }
 const staticInput = document.getElementById('file'); if (staticInput) wire(staticInput);
 document.getElementById('upload').addEventListener('click', () => {
-  const item = document.createElement('button'); item.setAttribute('role', 'menuitem'); item.textContent = 'Upload files';
+  const item = document.createElement('button'); item.setAttribute('role', 'menuitem'); item.textContent = CFG.locale === 'fr' ? 'Importer des fichiers' : 'Upload files';
   item.addEventListener('click', () => {
     const input = document.createElement('input'); input.type = 'file'; input.accept = 'image/*'; input.multiple = true;
     wire(input); input.click();
   });
   document.getElementById('menu').replaceChildren(item);
 });
+editor.addEventListener('dragover', (event) => event.preventDefault());
+editor.addEventListener('drop', (event) => { event.preventDefault(); addFiles(event.dataTransfer.files); });
 send.addEventListener('click', async () => {
   const text = editor.innerText;
   const q = document.createElement('user-query'); q.textContent = text;
@@ -74,7 +77,7 @@ send.addEventListener('click', async () => {
   const fd = new FormData(); fd.append('prompt', text); files.forEach((f, n) => fd.append('file' + n, f, f.name));
   await fetch('/submit', { method: 'POST', body: fd });
   editor.innerHTML = ''; files.length = 0; document.getElementById('chips').replaceChildren();
-  const stop = document.createElement('button'); stop.setAttribute('aria-label', 'Stop response'); document.body.appendChild(stop);
+  const stop = document.createElement('button'); stop.setAttribute('aria-label', CFG.locale === 'fr' ? 'Arrêter la réponse' : 'Stop response'); document.body.appendChild(stop);
   turn += 1;
   setTimeout(() => {
     const r = document.createElement('model-response');
@@ -86,7 +89,7 @@ send.addEventListener('click', async () => {
         const g = document.createElement('generated-image');
         const img = document.createElement('img'); img.src = '/img/' + turn + '-' + k + '=s512'; g.appendChild(img);
         if (CFG.download) {
-          const b = document.createElement('button'); b.setAttribute('aria-label', 'Download full size image');
+          const b = document.createElement('button'); b.setAttribute('aria-label', CFG.locale === 'fr' ? "Télécharger l'image en taille originale" : 'Download full size image');
           b.addEventListener('click', () => { const a = document.createElement('a'); a.href = '/img/' + turn + '-' + k + '=s0?dl=1'; a.download = ''; document.body.appendChild(a); a.click(); a.remove(); });
           g.appendChild(b);
         }
@@ -106,6 +109,10 @@ class FakeGemini:
         self.reply = "image"       # image | refuse | quota
         self.images = 1            # generated images per response (to prove only ONE is kept)
         self.download = True       # render "Download full size image" buttons
+        self.locale = "en"
+        self.http_thumbnail = False
+        self.reject_upload = False
+        self.max_upload_files = 0
         self.delay_ms = 1200
         self.submissions: list[dict] = []
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), self._handler())
@@ -142,11 +149,25 @@ class FakeGemini:
                     return
                 if path == "/app" or path.startswith("/app/"):
                     signed = "SID=fixture-session" in (self.headers.get("Cookie") or "")
-                    account = ('<a href="#" aria-label="Google Account: Fixture User (fixture.user@gmail.com)">FU</a>'
-                               if signed else '<a href="/login">Sign in</a>')
+                    account_label = "Compte Google" if fake.locale == "fr" else "Google Account"
+                    signin = "Se connecter" if fake.locale == "fr" else "Sign in"
+                    account = (f'<a href="#" aria-label="{account_label}: Fixture User (fixture.user@gmail.com)">FU</a>'
+                               if signed else f'<a href="/login">{signin}</a>')
                     file_input = '<input type="file" accept="image/*" multiple hidden id="file">' if fake.mode == "input" else ""
-                    cfg = json.dumps({"reply": fake.reply, "images": fake.images, "download": fake.download, "delayMs": fake.delay_ms})
-                    body = PAGE % {"account": account, "file_input": file_input, "cfg": cfg}
+                    icon = {"svg": '<svg data-icon="plus"><path d="M0 0h10v10z" /></svg>',
+                            "mat": '<mat-icon fonticon="attach_file">attach_file</mat-icon>'}.get(fake.mode, "+")
+                    label = "Importer une image" if fake.locale == "fr" else "Open upload file menu"
+                    attrs = 'aria-label="' + label + '"' if fake.mode not in {"svg", "mat", "testid", "drop"} else ""
+                    if fake.mode == "testid":
+                        attrs = 'data-testid="attachment-upload-button"'
+                    if fake.mode == "drop":
+                        attrs = 'hidden'
+                    upload = f'<button {attrs} id="upload">{icon if fake.mode != "testid" else ""}</button>'
+                    cfg = json.dumps({"reply": fake.reply, "images": fake.images, "download": fake.download,
+                                      "delayMs": fake.delay_ms, "locale": fake.locale,
+                                      "httpThumbnail": fake.http_thumbnail, "rejectUpload": fake.reject_upload, "maxUploadFiles": fake.max_upload_files})
+                    body = PAGE % {"account": account, "file_input": file_input, "cfg": cfg,
+                                   "upload_button": upload, "send_label": "Envoyer le message" if fake.locale == "fr" else "Send message"}
                     self._send(200, body.encode(), "text/html; charset=utf-8")
                     return
                 if path.startswith("/img/"):
@@ -170,7 +191,8 @@ class FakeGemini:
                 for part in message.iter_parts():
                     name = part.get_param("name", header="content-disposition")
                     if name == "prompt":
-                        prompt = part.get_content()
+                        # Browser FormData is UTF-8 with CRLF-normalised text fields.
+                        prompt = part.get_payload(decode=True).decode(part.get_content_charset() or "utf-8").replace("\r\n", "\n")
                     elif name and name.startswith("file"):
                         files.append((part.get_filename(), part.get_payload(decode=True)))
                 fake.submissions.append({"prompt": prompt, "files": files})

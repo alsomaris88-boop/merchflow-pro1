@@ -274,3 +274,148 @@ def test_parallel_leases_exclude_busy_and_unverified_accounts(worker):
     with ThreadPoolExecutor(max_workers=8) as executor:
         ids = list(executor.map(acquire, range(20)))
     assert set(ids) == {1, 2} and not pool._busy
+
+
+GATE1_REASON = "GATE 1 FAILED: the reference thumbnail never rendered in the Gemini input box"
+
+
+def test_retry_only_failed_job_retains_source_and_never_duplicates_successful_archives(worker, monkeypatch):
+    client, module, pool, metrics = worker
+    calls, call_lock = [], threading.Lock()
+    retry_entered, release = threading.Event(), threading.Event()
+    def render(reference, background, dispatch):
+        with call_lock:
+            calls.append(reference)
+            attempt = len(calls)
+        dispatch("TEST FIXTURE ONLY")
+        if attempt == 1:
+            raise RuntimeError(GATE1_REASON)
+        if attempt > 3:
+            retry_entered.set()
+            assert release.wait(20)
+        return reference, "TEST FIXTURE ONLY", gemini_pool.donepixel_prompt(background)
+    monkeypatch.setattr(gemini_pool, "render_donepixel", render)
+    batch_id = create_upload_start(client, 3)
+    first = finish(client, batch_id)
+    assert first["status"] == "partial" and first["completed"] == 2 and first["failed"] == 1
+    failed = next(job for job in first["items"] if job["state"] == "failed")
+    assert failed["reason"] == GATE1_REASON and failed["retryable"]
+    source = module.OUT_DIR / ".p2p-inputs" / batch_id / failed["id"]
+    assert source.read_bytes() == reference_png()
+    saved = {job["id"]: job["design"]["id"] for job in first["items"] if job["design"]}
+    url = f'/api/bridge/p2p/batches/{batch_id}/items/{failed["id"]}/retry'
+    try:
+        response = client.post(url)
+        assert response.status_code == 200, response.text
+        assert retry_entered.wait(5)
+        with ThreadPoolExecutor(max_workers=6) as executor:
+            assert all(status == 200 for status in executor.map(lambda _: client.post(url).status_code, range(12)))
+        assert len(calls) == 4, "only the one failed input may be dispatched again"
+    finally:
+        release.set()
+    done = finish(client, batch_id)
+    assert done["status"] == "completed" and done["completed"] == 3 and done["failed"] == 0
+    assert {job["id"]: job["design"]["id"] for job in done["items"] if job["id"] in saved} == saved
+    assert len(output_store.list_designs(module.OUT_DIR)) == 3
+    assert len(list(module.OUT_DIR.glob("p2p_*.png"))) == 3
+    assert len([event for _, event in output_store.read_events(module.OUT_DIR, 0) if event["type"] == "design.saved"]) == 3
+    assert not source.exists()
+    assert client.post(url).status_code == 200  # late/lost duplicate response is a no-op too
+    assert len(calls) == 4 and len(output_store.list_designs(module.OUT_DIR)) == 3
+
+
+def test_failed_and_interrupted_retry_survive_restart_without_automatic_paid_dispatch(worker, monkeypatch):
+    client, module, pool, metrics = worker
+    original = gemini_pool.render_donepixel
+    def fail(*args):
+        raise RuntimeError(GATE1_REASON)
+    monkeypatch.setattr(gemini_pool, "render_donepixel", fail)
+    batch_id = create_upload_start(client, 1)
+    failed = finish(client, batch_id)
+    assert failed["status"] == "failed" and not failed["completed"]
+    job = failed["items"][0]
+    assert job["reason"] == GATE1_REASON and job["retryable"]
+    assert not output_store.list_designs(module.OUT_DIR)
+    assert p2p_batches._claim_retry(module.OUT_DIR, batch_id, job["id"], False)
+    assert p2p_batches.snapshot(module.OUT_DIR, batch_id)["status"] == "retry-uploading"
+    partial = module.OUT_DIR / ".p2p-inputs" / batch_id / f'{job["id"]}.interrupted.part'
+    partial.write_bytes(b"not a complete original")
+    p2p_batches.recover(module.OUT_DIR)
+    recovered = p2p_batches.snapshot(module.OUT_DIR, batch_id)
+    assert recovered["status"] == "failed" and recovered["items"][0]["retryable"]
+    assert "Worker restarted" in recovered["items"][0]["reason"]
+    assert not partial.exists() and not metrics["calls"]
+    monkeypatch.setattr(gemini_pool, "render_donepixel", original)
+    response = client.post(f'/api/bridge/p2p/batches/{batch_id}/items/{job["id"]}/retry')
+    assert response.status_code == 200, response.text
+    done = finish(client, batch_id)
+    assert done["completed"] == 1 and len(metrics["calls"]) == 1
+    assert len(output_store.list_designs(module.OUT_DIR)) == 1
+
+
+def test_retry_missing_legacy_upload_requires_real_reselection_and_validates_binary(worker):
+    client, module, pool, metrics = worker
+    batch_id = create_upload_start(client, 1, corrupt=True)
+    first = finish(client, batch_id)
+    job = first["items"][0]
+    assert first["status"] == "failed" and not job["retryable"]
+    url = f'/api/bridge/p2p/batches/{batch_id}/items/{job["id"]}/retry'
+    assert client.post(url).status_code == 409
+    bad = client.post(url, content=b"still not an image", headers={"Content-Type": "application/octet-stream"})
+    assert bad.status_code == 400 and not metrics["calls"]
+    assert p2p_batches.snapshot(module.OUT_DIR, batch_id)["status"] == "failed"
+    valid = client.post(url, content=reference_png(), headers={"Content-Type": "application/octet-stream"})
+    assert valid.status_code == 200, valid.text
+    done = finish(client, batch_id)
+    assert done["items"][0]["id"] == job["id"] and done["completed"] == 1
+    assert len(metrics["calls"]) == len(output_store.list_designs(module.OUT_DIR)) == 1
+    assert not list(module.OUT_DIR.rglob("*.part"))
+    assert client.post(f'/api/bridge/p2p/batches/{batch_id}/items/not-a-job/retry').status_code == 404
+
+
+def test_failed_replacement_preserves_original_and_retry_honours_production_guards(worker, monkeypatch):
+    client, module, pool, metrics = worker
+    original = gemini_pool.render_donepixel
+    monkeypatch.setattr(gemini_pool, "render_donepixel", lambda *args: (_ for _ in ()).throw(RuntimeError(GATE1_REASON)))
+    batch_id = create_upload_start(client, 1)
+    job = finish(client, batch_id)["items"][0]
+    source = module.OUT_DIR / ".p2p-inputs" / batch_id / job["id"]
+    url = f'/api/bridge/p2p/batches/{batch_id}/items/{job["id"]}/retry'
+    monkeypatch.setattr(p2p_batches, "MAX_UPLOAD_BYTES", 10)
+    assert client.post(url, content=reference_png(), headers={"Content-Type": "application/octet-stream"}).status_code == 413
+    assert source.read_bytes() == reference_png() and not list(module.OUT_DIR.rglob("*.part"))
+    monkeypatch.setattr(gemini_pool, "MOCK", True)
+    assert client.post(url).status_code == 409
+    monkeypatch.setattr(gemini_pool, "MOCK", False)
+    for account in pool.accounts:
+        account.is_pro = False
+    assert client.post(url).status_code == 409
+    for account in pool.accounts:
+        account.is_pro = True
+    monkeypatch.setattr(gemini_pool, "render_donepixel", original)
+    assert client.post(url).status_code == 200
+    assert finish(client, batch_id)["completed"] == 1
+    assert len(output_store.list_designs(module.OUT_DIR)) == 1
+
+
+def test_zero_images_never_become_completed(worker, monkeypatch):
+    client, module, pool, metrics = worker
+    class EmptyProvider:
+        def generate_image(self, *args):
+            return b""
+    monkeypatch.setattr(gemini_pool, "client_for", lambda _: EmptyProvider())
+    first = finish(client, create_upload_start(client, 1))
+    assert first["status"] == "failed" and first["completed"] == 0
+    assert first["items"][0]["reason"] == "Provider returned no image"
+    assert not output_store.list_designs(module.OUT_DIR)
+
+
+def test_long_exact_failure_reason_is_not_truncated_or_replaced_with_zero_images(worker, monkeypatch):
+    client, module, pool, metrics = worker
+    reason = GATE1_REASON + "\n" + "Échec réel détaillé. " * 80
+    def fail(*args):
+        raise RuntimeError(reason)
+    monkeypatch.setattr(gemini_pool, "render_donepixel", fail)
+    second = finish(client, create_upload_start(client, 1))
+    assert second["status"] == "failed" and second["items"][0]["reason"] == reason
+    assert not output_store.list_designs(module.OUT_DIR)

@@ -266,8 +266,10 @@ def test_refusal_and_quota_fail_loudly_without_fake_output(live):
         client.generate_image("Recreate this.", [(png(), "ref.png")])
 
 
-def test_signed_out_profile_raises_auth_error(live):
+@pytest.mark.parametrize("locale", ["en", "fr"])
+def test_signed_out_profile_raises_auth_error(live, locale):
     fake, pool, _ = live
+    fake.locale = locale
     udir = gemini_cdp.profile_dir(5)
     udir.mkdir(parents=True)
     client = gemini_cdp.CdpGeminiClient(5, "chrome", user_data_dir=udir)
@@ -276,3 +278,102 @@ def test_signed_out_profile_raises_auth_error(live):
             client.generate_image("Recreate this.", [(png(), "ref.png")])
     finally:
         client.close()
+
+
+# ---------------------------------------- French / icon-only / strict gate regression
+def test_upload_selector_vocabulary_includes_requested_french_and_universal_controls():
+    assert set(["open upload file menu", "upload", "add file", "attach", "tools", "importer",
+                "ajouter", "joindre", "téléverser", "outils", "plus", "+"]) <= set(gemini_cdp.SELECTORS["uploadButtonAria"])
+    assert set(["upload files", "upload file", "upload image", "add image", "importer des fichiers",
+                "importer une image", "ajouter des fichiers", "téléverser"]) <= set(gemini_cdp.SELECTORS["uploadMenuText"])
+
+
+@pytest.mark.parametrize("mode", ["chooser", "svg", "mat", "testid", "drop", "input-cdp-error"])
+def test_french_and_icon_only_uploads_verify_http_thumbnails_and_preserve_image1_image2(live, monkeypatch, mode):
+    fake, pool, _ = live
+    fake.locale, fake.http_thumbnail, fake.delay_ms = "fr", True, 300
+    fake.mode = "input" if mode == "input-cdp-error" else mode
+    if mode == "input-cdp-error":
+        original = gemini_cdp.CDPSession.send
+        failed = []
+        def fail_first_file_set(session, method, *args, **kwargs):
+            if method == "DOM.setFileInputFiles" and not failed:
+                failed.append(True)
+                raise gemini_cdp.CDPError("TEST ONLY: direct file input rejected; chooser must still work")
+            return original(session, method, *args, **kwargs)
+        monkeypatch.setattr(gemini_cdp.CDPSession, "send", fail_first_file_set)
+    client = signed_in_profile(pool)
+    niche, style = png(colour=(1, 8, 3)), png(colour=(4, 2, 9))
+    result = client.generate_image(gemini_pool.FUSION_DIRECTIVE,
+                                   [(niche, "niche_IMAGE1.png"), (style, "style_IMAGE2.png")])
+    assert client.email == "fixture.user@gmail.com"  # French Compte Google was actually read
+    assert Image.open(io.BytesIO(result)).size == fake_gemini.FULL
+    assert client.last_extraction["method"] == "download-full-size", "French download control must work too"
+    [sent] = fake.submissions
+    # contenteditable/FormData normalises paragraph whitespace; every directive
+    # word and Unicode symbol must survive, with the literal separately unchanged.
+    assert " ".join(sent["prompt"].split()) == " ".join(gemini_pool.FUSION_DIRECTIVE.split())
+    assert [name for name, _ in sent["files"]] == ["01_niche_IMAGE1.png", "02_style_IMAGE2.png"]
+    assert [data for _, data in sent["files"]] == [niche, style]
+
+
+def test_real_browser_gate_rejects_avatar_history_hidden_broken_empty_and_preexisting_images(live):
+    fake, pool, _ = live
+    client = signed_in_profile(pool)
+    port = client._ensure_browser()
+    target, session = client._open_tab(port)
+    try:
+        client._wait_ready(session)
+        session.evaluate("""(() => {
+          const root = document.querySelector('input-area-v2');
+          // A nested text-only .input-container must not hide sibling previews.
+          const inner = document.createElement('div'); inner.className='input-container';
+          root.appendChild(inner); inner.appendChild(root.querySelector('rich-textarea'));
+          const make = (parent, attrs) => { const img = Object.assign(document.createElement('img'), attrs);
+            img.style.cssText='width:80px;height:96px'; parent.appendChild(img); return img; };
+          make(document.querySelector('header'), { src:'/img/0-1=s512', alt:'Google Account' });
+          make(document.querySelector('#chat'), { src:'/img/0-1=s512' });
+          const avatar = make(root, { src:'/img/0-1=s512', className:'avatar' });
+          const hidden = document.createElement('div'); hidden.hidden=true; root.appendChild(hidden);
+          make(hidden,{src:'/img/0-1=s512'});
+          const transparent = document.createElement('div'); transparent.style.opacity='0'; root.appendChild(transparent);
+          make(transparent,{src:'/img/0-1=s512'});
+          make(root,{src:'/missing.png',className:'attachment-thumbnail'});
+          const empty = document.createElement('div'); empty.className='attachment-card'; empty.textContent='not a thumbnail'; root.appendChild(empty);
+          return true;
+        })()""")
+        time.sleep(0.3)
+        assert session.evaluate(gemini_cdp.GATE1_JS)["chips"] == 0
+        assert not client._gate1(session, 1, 0.3)
+        # Decorative image already in the composer cannot satisfy the NEW upload.
+        session.evaluate("""(() => { const img=document.createElement('img'); img.id='brand'; img.src='/img/0-1=s512';
+          img.style.cssText='width:80px;height:96px'; document.querySelector('input-area-v2').appendChild(img); })()""")
+        time.sleep(0.3)
+        baseline = set(session.evaluate(gemini_cdp.GATE1_JS)["tokens"])
+        assert len(baseline) == 1
+        session.evaluate("document.querySelector('#brand').replaceWith(document.querySelector('#brand').cloneNode(true))")
+        assert not client._gate1(session, 1, 0.3, baseline), "framework re-render of the same logo must not pass"
+        session.evaluate("""(() => { const img=document.createElement('img'); img.src='/img/0-2=s512';
+          img.setAttribute('aria-hidden','true'); img.style.cssText='width:80px;height:96px';
+          document.querySelector('input-area-v2').appendChild(img);
+          const bar=document.createElement('div'); bar.id='upload-bar'; bar.setAttribute('role','progressbar');
+          bar.style.cssText='display:none;width:20px;height:20px'; document.querySelector('input-area-v2').appendChild(bar); })()""")
+        time.sleep(0.3)
+        assert client._gate1(session, 1, 0.5, baseline), "real HTTP thumbnail + hidden spinner must pass"
+        session.evaluate("document.querySelector('#upload-bar').style.display='block'")
+        assert not client._gate1(session, 1, 0.3, baseline), "a real in-progress upload must still block"
+        session.evaluate("document.querySelector('rich-textarea').remove()")
+        assert session.evaluate(gemini_cdp.GATE1_JS)["chips"] == 0, "never fall back to the entire chat/document"
+    finally:
+        session.close()
+        gemini_cdp.close_page(port, target["id"])
+
+
+def test_partial_upload_never_appends_duplicate_references_to_fool_gate1(live, monkeypatch):
+    fake, pool, _ = live
+    fake.max_upload_files = 1
+    monkeypatch.setattr(gemini_cdp, "UPLOAD_TIMEOUT", 0.7)
+    client = signed_in_profile(pool)
+    with pytest.raises(GeminiRenderError, match="GATE 1 FAILED: the reference thumbnail never rendered"):
+        client.generate_image(gemini_pool.FUSION_DIRECTIVE, [(png(), "IMAGE1.png"), (png(), "IMAGE2.png")])
+    assert fake.submissions == [], "no prompt/send is allowed before genuine complete attachment verification"
