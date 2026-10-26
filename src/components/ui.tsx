@@ -220,10 +220,12 @@ export function CharMeter({ value, max }: { value: number; max: number }) {
 }
 
 /* --------------------------------- Toggle ---------------------------------- */
-export function Toggle({ on, set, label }: { on: boolean; set: (v: boolean) => void; label?: string }) {
+export function Toggle({ on, set, label, ariaLabel }: { on: boolean; set: (v: boolean) => void; label?: string; ariaLabel?: string }) {
   return (
     <button
       onClick={() => set(!on)}
+      aria-label={ariaLabel}
+      aria-pressed={on}
       className="flex items-center gap-2.5 group"
       type="button"
     >

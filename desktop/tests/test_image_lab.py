@@ -92,6 +92,85 @@ def test_missing_rembg_is_an_error_never_a_heuristic_fallback(tmp_path, monkeypa
     assert output_store.list_designs(tmp_path) == []
 
 
+@pytest.mark.parametrize("background", [
+    (0, 0, 0), (255, 255, 255), (255, 110, 20), (5, 20, 80), (60, 240, 20),
+])
+def test_auto_color_flood_fill_removes_flat_border_and_preserves_or_clears_holes(background):
+    source = Image.new("RGBA", (64, 64), (*background, 255))
+    draw = ImageDraw.Draw(source)
+    draw.ellipse((12, 12, 52, 52), outline=(240, 20, 180, 255), width=6)
+
+    keep, detected = image_lab.remove_background_color(source, precision="keep_holes")
+    everywhere, _ = image_lab.remove_background_color(source, precision="everywhere")
+    assert detected == background
+    assert keep.getpixel((0, 0))[3] == 0
+    assert keep.getpixel((32, 12))[3] == 255
+    assert keep.getpixel((32, 32))[3] == 255, "the enclosed counter is retained in Keep holes mode"
+    assert everywhere.getpixel((32, 32))[3] == 0, "Everywhere clears matching pixels inside counters too"
+    assert everywhere.getpixel((32, 12))[3] == 255
+
+
+def test_without_ai_mode_skips_rembg_and_reports_sampled_background(tmp_path, monkeypatch):
+    source = Image.new("RGBA", (64, 64), (250, 120, 20, 255))
+    ImageDraw.Draw(source).rectangle((18, 18, 46, 46), fill=(240, 20, 180, 255))
+    monkeypatch.setattr(image_lab, "remove_background", lambda *args, **kwargs: pytest.fail("rembg must not run in without_ai mode"))
+    raw, report = image_lab.process_design(png_bytes(source), {
+        "remove": True, "mode": "without_ai", "precision": "keep_holes",
+        "resizeForPrint": False, "despeckle": False,
+    }, tmp_path, "auto-color")
+    with Image.open(io.BytesIO(raw)) as output:
+        assert output.getpixel((0, 0))[3] == 0
+    assert report["cutoutModel"] is None
+    assert report["cutoutMode"] == "without_ai"
+    assert report["detectedBg"] == [250, 120, 20]
+
+
+def test_streaming_prepare_fails_closed_without_libvips(tmp_path, monkeypatch):
+    monkeypatch.setattr(image_lab, "HAS_VIPS", False)
+    with pytest.raises(RuntimeError, match="requires the native libvips runtime"):
+        image_lab.process_design(png_bytes(Image.new("RGBA", (8, 8))), {
+            "remove": False, "resizeForPrint": False,
+        }, tmp_path, "no-fallback", return_bytes=False)
+    assert output_store.list_designs(tmp_path) == []
+
+
+def test_streaming_prepare_exports_verified_print_png_without_materializing_return_bytes(tmp_path, monkeypatch):
+    if not image_lab.HAS_VIPS:
+        pytest.skip("Requires native libvips")
+    source = Image.new("RGBA", (64, 48), (0, 0, 0, 0))
+    ImageDraw.Draw(source).rectangle((8, 6, 55, 41), fill=(230, 20, 80, 255))
+    monkeypatch.setattr(image_lab, "remove_background", lambda image, model: image)
+    raw, report = image_lab.process_design(png_bytes(source), {
+        "remove": True, "mode": "with_ai", "despeckle": False,
+        "resizeForPrint": True, "placement": "top", "defringe": 1,
+    }, tmp_path, "streamed-print", return_bytes=False)
+    assert raw == b""
+    design = report["design"]
+    assert design["w"] == 4500 and design["h"] == 5400
+    assert design["encoder"] == "libvips-png" and design["lossless"] is True
+    assert report["engine"] == "pyvips-streaming"
+    with Image.open(design["path"]) as output:
+        assert output.size == (4500, 5400) and output.mode == "RGBA"
+        assert output.info["dpi"] == pytest.approx((300, 300), abs=0.02)
+        output.verify()
+    with Image.open(design["path"]) as output:
+        assert output.getpixel((0, 0))[3] == 0
+    assert output_store.list_designs(tmp_path) == [design]
+
+
+def test_streaming_upscale_is_optional_and_records_real_output_dimensions(tmp_path):
+    if not image_lab.HAS_VIPS:
+        pytest.skip("Requires native libvips")
+    source = Image.new("RGBA", (12, 10), (40, 80, 120, 255))
+    raw, report = image_lab.process_design(png_bytes(source), {
+        "remove": False, "upscale": True, "upscaleFactor": 4,
+        "resizeForPrint": False, "despeckle": False,
+    }, tmp_path, "four-x", return_bytes=False)
+    assert raw == b""
+    assert (report["design"]["w"], report["design"]["h"]) == (48, 40)
+    assert report["upscaled"] is True and report["upscaleFactor"] == 4
+
+
 def test_inference_failure_and_empty_foreground_fail_the_job(tmp_path, monkeypatch):
     monkeypatch.setattr(image_lab, "_session", lambda model: object())
     monkeypatch.setattr(image_lab, "_rembg_remove", lambda image, **kwargs: Image.new("RGBA", image.size))

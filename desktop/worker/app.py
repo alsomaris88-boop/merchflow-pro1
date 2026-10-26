@@ -38,7 +38,7 @@ from pydantic import BaseModel, Field
 
 from . import browser, db, elite_tools, gemini_cdp, gemini_pool, image_lab, output_store, p2p_batches, trademark_shield, trends_local
 
-WORKER_VERSION = "2.5.3-multitab-dynamic-batch"
+WORKER_VERSION = "2.5.4-prepare-3card-streaming"
 
 OUT_DIR = Path(os.environ.get("MERCHFLOW_OUT") or (Path(__file__).resolve().parents[2] / "output")).resolve()
 OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -393,7 +393,9 @@ class ProcessReq(BaseModel):
 async def process(req: ProcessReq) -> JSONResponse:
     try:
         raw = _decode(req.image)
-        _, report = await asyncio.to_thread(image_lab.process_design, raw, req.settings, OUT_DIR, req.name)
+        _, report = await asyncio.to_thread(
+            image_lab.process_design, raw, req.settings, OUT_DIR, req.name, return_bytes=False,
+        )
         return JSONResponse({"ok": True, "design": report["design"], "report": report})
     except HTTPException:
         raise

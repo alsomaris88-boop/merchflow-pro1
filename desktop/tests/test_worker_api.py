@@ -77,13 +77,31 @@ def test_invalid_images_and_arbitrary_download_paths_are_rejected(worker):
 
 def test_process_returns_error_not_fake_success_on_disk_failure(worker, monkeypatch):
     client, module = worker
-    def fail(*args):
+    def fail(*args, **kwargs):
         raise OSError("disk is read-only")
     monkeypatch.setattr(image_lab, "process_design", fail)
     response = client.post("/process", json={"image": image_data()})
     assert response.status_code == 500 and response.json()["ok"] is False
     assert "read-only" in response.json()["reason"]
     assert client.get("/api/bridge/designs").json()["items"] == []
+
+
+def test_prepare_api_uses_streamed_libvips_save_and_returns_verified_history_record(worker):
+    client, module = worker
+    response = client.post("/api/bridge/process", json={
+        "image": image_data(), "name": "streamed-api",
+        "settings": {"remove": False, "resizeForPrint": False, "despeckle": False},
+    })
+    assert response.status_code == 200, response.text
+    body = response.json()
+    design = body["design"]
+    assert design["saved"] is True and design["w"] == 64 and design["h"] == 40
+    assert body["report"]["engine"] == "pyvips-streaming"
+    assert Path(design["path"]).is_file() and Path(design["previewPath"]).is_file()
+    assert client.get("/api/bridge/designs").json()["items"] == [design]
+    with Image.open(design["path"]) as output:
+        assert output.size == (64, 40) and output.mode == "RGBA"
+        assert output.info["dpi"] == pytest.approx((300, 300), abs=0.02)
 
 
 def test_no_authenticated_provider_never_creates_a_design(worker):

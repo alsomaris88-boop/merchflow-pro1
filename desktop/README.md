@@ -20,21 +20,17 @@ Ship the generated `out/` folder with the Python desktop package. Run
 `run_windows.bat` from the repository root on Windows; it installs the worker
 dependencies and opens `http://127.0.0.1:8000` in an app window.
 
-### Updating an existing Windows install (silent clipboard + live results)
+### Updating an existing Windows install (Prepare Lab performance release)
 
-This release changes the Python worker only. If the Windows package already
-contains the live-card UI from `963f530`, replace/pull the updated worker source,
-stop its old engine/app window, run `run_windows.bat`, and reload; no UI rebuild
-is required for this concurrency change. `/api/health` identifies the worker as
-**`2.5.3-multitab-dynamic-batch`** and reports the parallel/tab limits.
+This release changes both the Python worker and the Prepare Lab UI. Pull/replace
+the worker source and rebuild the static UI with `npm ci && npm run build:desktop`;
+copy the generated `out/` to the Windows package, stop its old engine/app window,
+run `run_windows.bat`, and reload. `/api/health` identifies the worker as
+**`2.5.4-prepare-3card-streaming`** and reports the parallel/tab limits.
 
-`out/` is generated and git-ignored. When shipping a fresh complete package or
-upgrading an older UI, rebuild and replace it on the development machine with
-`npm ci && npm run build:desktop`; pulling UI source alone cannot update an
-older packaged bundle. Copy the fresh `out/` to the Windows package, stop its
-old engine/app window, run `run_windows.bat`, and reload. The end user still does
-not need a running Node process. Keep genuine verified Chrome profiles, SQLite
-credentials, and existing output intact; never replace their private state.
+`out/` is generated and git-ignored. Do not replace genuine verified Chrome
+profiles, SQLite credentials, or existing output during an update. The end user
+still does not need a running Node process.
 
 ### Windows startup upgrades and crash logs
 
@@ -95,8 +91,12 @@ shown and the session is live, the visible browser closes and the same profile i
 
 Generation opens or reuses **the same profile headlessly**
 (`--headless=new`, DevTools port `9222 + id − 1`; each profile is its own
-Chrome process, so parallel accounts need separate ports). Credentials are
-never requested again and no cookie values are exported into application JSON or frontend JavaScript.
+Chrome process, so parallel accounts need separate ports). Headless launches add
+background-work/renderer flags (`--disable-gpu`, extensions, sync, background
+networking, occlusion/render backgrounding, and others); visible sign-in Chrome
+keeps its regular launch behavior. These are workload hints, not a hard memory
+limit or an 80MB-per-tab guarantee. Credentials are never requested again and
+no cookie values are exported into application JSON or frontend JavaScript.
 `desktop/worker/gemini_cdp.py` drives Gemini's normal chat input:
 
 1. Read each real reference on the server, sniff its actual image MIME without
@@ -191,35 +191,41 @@ niche subject as **IMAGE 1**, then the style reference as **IMAGE 2**. Runtime
 operator settings are appended; they never rewrite the directive. Donepixel
 uses its own exact single-reference fidelity prompt, not the fusion directive.
 
-### Universal cutout
+### Background removal and print output
 
-`desktop/worker/image_lab.py` uses **rembg / ONNX**, with U2Net or
-`birefnet-general`. It does not sample/key a border colour and never silently
-falls back to a colour heuristic. Matting handles arbitrary-colour and textured
-backdrops, preserves existing alpha holes, and decontaminates partial-edge RGB.
-A real `cv2.erode` applies a **1–2 pixel alpha choke at final export resolution**,
-not multiple erosions on a tiny source image. Micro-dot cleanup is optional and
-off by default to protect disconnected fine details.
+`desktop/worker/image_lab.py` offers two explicit modes. **With AI** remains the
+Prepare default and uses real rembg/ONNX with selectable U2Net or
+`birefnet-general`; its alpha edges retain the OpenCV 1–2px final-resolution
+choke. It preserves existing transparent
+counters and handles textured/uneven backdrops better than a colour key. First
+use may download model weights; missing dependencies, inference failures and
+empty masks fail visibly, never as synthetic successes.
 
-The first use downloads the chosen model's official weights. BiRefNet requires
-more memory than U2Net. Missing dependencies, unavailable weights and empty
-foreground masks fail the job visibly. Semantic matting is not infallible:
-review fine artwork against light and dark backgrounds and try the other model
-when the subject is difficult. There is no claim that every conceivable artwork
-will be segmented perfectly.
+**Without AI** bypasses rembg/ONNX entirely. It samples the image border median
+and uses OpenCV exterior flood fill to remove a flat background. `Keep holes`
+leaves enclosed background-coloured counters untouched; `Everywhere` also clears
+matching pixels inside those counters. This fast mode is intended for solid
+backdrops (including black, white, orange, navy and lime), not photographic or
+textured backgrounds. Its speed depends on image size and hardware; the UI does
+not promise a fixed 0.03-second runtime.
 
-### Batch Prepare Lab and streaming ZIP
+The Prepare Lab now has three focused cards: **Remove the background** (default
+ON; With AI/Without AI and precision), **Upscale** (default OFF; optional 2×/4×/8×
+Lanczos interpolation), and **Resize for printing** (default ON; 4500×5400 at
+300 DPI with a 350px top collar margin). Lanczos is resampling, not learned
+super-resolution; it does not invent detail. With print resizing enabled, the
+selected upscale factor is applied to the print canvas, so 8× creates a very
+large output. With resizing off, the cutout/source pixel dimensions are kept
+before optional scaling.
 
-The canonical component is `src/components/modules/prepare-lab.tsx`; the old
-component path is a compatibility re-export. The multi-file input and drop zone
-keep **all** dropped files, including 50+ images. One complete pipeline finishes
-before the next starts. A bad file fails individually without dropping the
-remaining batch. Successful outputs are retained when retrying failed files.
-
-Each master is a genuine **4500×5400 PNG with embedded 300 DPI pHYs metadata**.
-Optional distress, garment and product raster variants also go through verified
-PNG saving and durable History. Maximum compression changes the actual encoder
-level; the UI does not invent savings or memory-use percentages.
+The local `/api/bridge/process` path builds and writes its final RGBA PNG through
+libvips to disk, verifies dimensions, alpha-capable mode and DPI, and then
+registers the saved file in History; it does not return an archive-sized PNG
+buffer to the UI. The pipeline still loads the source/cutout and uses OpenCV for
+the final alpha choke, so RAM and latency vary with image size and machine—no
+18MB peak-memory claim is made. The multi-file queue retains every input, even
+50+, and processes one complete design at a time; each failure stays isolated.
+ZIP export streams saved PNGs from disk.
 
 **Download all (N)** obtains a short-lived download ticket and streams one ZIP64
 archive from disk to the browser download manager. The worker copies in 256 KB

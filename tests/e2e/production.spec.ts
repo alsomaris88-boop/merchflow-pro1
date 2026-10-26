@@ -31,8 +31,7 @@ test("55 real print PNGs are queued sequentially, streamed in one ZIP, and hande
   await page.getByRole("button", { name: "Prepare Designs Lab", exact: true }).click();
   // This exercises actual resize/save/ZIP endpoints without needing model
   // inference 55 times. Real U2Net matting has a separate opt-in smoke test.
-  await page.getByRole("button", { name: "Universal rembg cutout", exact: true }).click();
-  await page.getByRole("button", { name: "pHash duplicate check in this batch", exact: true }).click();
+  await page.getByRole("button", { name: "Remove background", exact: true }).click();
   await page.locator("#lab-files").setInputFiles([
     ...Array.from({ length: 55 }, () => ({ name: `${prefix}.png`, mimeType: "image/png", buffer })),
     { name: "broken.png", mimeType: "image/png", buffer: Buffer.from("invalid-image-fixture") },
@@ -78,6 +77,37 @@ test("55 real print PNGs are queued sequentially, streamed in one ZIP, and hande
   await page.reload();
   await page.getByRole("button", { name: "Designs History", exact: true }).click();
   await expect(page.getByText(`${prefix}`, { exact: true }).first()).toBeVisible();
+});
+
+test("Prepare Lab exposes the three safe defaults, mode/precision choices, and opt-in scaling", async ({ page }) => {
+  await mockNoProvider(page);
+  await page.goto("/");
+  await page.getByRole("button", { name: "Prepare Designs Lab", exact: true }).click();
+
+  const remove = page.getByRole("button", { name: "Remove background", exact: true });
+  const upscale = page.getByRole("button", { name: "Upscale", exact: true });
+  const resize = page.getByRole("button", { name: "Resize for printing", exact: true });
+  await expect(remove).toHaveAttribute("aria-pressed", "true");
+  await expect(upscale).toHaveAttribute("aria-pressed", "false");
+  await expect(resize).toHaveAttribute("aria-pressed", "true");
+  const neural = page.getByRole("combobox", { name: "Neural matting model" });
+  const choke = page.getByRole("combobox", { name: "Alpha choke" });
+  await expect(neural).toHaveValue("u2net");
+  await expect(choke).toHaveValue("1");
+  await neural.selectOption("birefnet-general");
+  await choke.selectOption("2");
+
+  await page.getByRole("button", { name: "Without AI · Fast ⚡", exact: true }).click();
+  await expect(page.getByRole("button", { name: "Keep holes", exact: true })).toBeEnabled();
+  await page.getByRole("button", { name: "Everywhere", exact: true }).click();
+  await expect(page.getByRole("button", { name: "Everywhere", exact: true })).toHaveAttribute("aria-pressed", "true");
+
+  await upscale.click();
+  const fourX = page.getByRole("button", { name: "4×", exact: true });
+  await expect(fourX).toBeVisible();
+  await fourX.click();
+  await expect(fourX).toHaveAttribute("aria-pressed", "true");
+  await expect(page.getByText(/final 18000 × 21600 px/)).toBeVisible();
 });
 
 test("provider authentication errors stay failed; there is no simulated generator output", async ({ page }) => {

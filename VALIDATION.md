@@ -1,6 +1,51 @@
 # Pipeline validation — 2026-10-26
 
-## Current fix: 10× dynamic Donepixel workers and concurrent Gemini tabs
+## Current integration: Prepare Lab streaming pipeline and headless Chrome flags
+
+Built on published `bba33c8740c0b5b38f9d76609ad72b7094ad33d8`, retaining its
+10-worker dynamic Donepixel scheduling, multi-tab Gemini pool, and all
+`b2e2361` silent-paste/original-only/no-false-cooldown contracts. Worker identity:
+`2.5.4-prepare-3card-streaming`.
+
+- Headless generation Chrome receives the requested background/render flags;
+  visible account-login Chrome does not. Unit tests assert the launch contract
+  and that visible login omits these flags. Playwright exercised the UI with
+  isolated local fixtures, not Gemini's generation browser. No 80MB-per-tab
+  ceiling was measured; memory remains machine/workload dependent.
+- The existing batch scheduler/pool already provides `MAX_PARALLEL=10` and ten
+  per-account slots by default (each bounded/configurable 1–32), dynamically
+  capped by queued jobs and eligible account capacity. Its leases, rolling-window
+  reservations and monotonic auth/quota safeguards remain unchanged.
+- Prepare has three cards: removal ON (With AI remains the regression-safe
+  default, with selectable U2Net/BiRefNet and 1–2px choke; Without AI uses
+  border-median/OpenCV exterior flood fill), Upscale OFF, and print resize ON
+  (4500×5400, 300 DPI, 350px collar margin). Keep-holes and everywhere are
+  tested across black, white, orange, navy and lime backgrounds. Without AI
+  never invokes rembg; With AI retains the real rembg path.
+- The desktop process endpoint streams final sizing/PNG encoding through libvips
+  to disk and fails closed rather than reverting to Pillow if the native runtime
+  is missing. OpenCV's 1–2px final alpha choke is tiled in 128-row strips, retaining
+  the actual OpenCV operation without a full-resolution Python RGBA output copy.
+  Lanczos 2×/4×/8× options are ordinary resampling, not learned super-resolution.
+- A local 4500×5400 flat-color cutout benchmark measured **1.2377s** for the
+  border-color step in this container. This is not the proposed 0.03s target.
+  Similarly, total end-to-end peak RAM was not measured and an 18MB whole-pipeline
+  claim is not made. Very large upscale outputs can take substantial time/disk.
+- The static UI export and normal Next production build passed; History→Prepare
+  handoff was covered by the full static-worker browser run.
+
+Validation results:
+
+- **181 Python passed, 1 opt-in test skipped** (542.60s; one Starlette/httpx
+  deprecation warning).
+- **26 TypeScript unit tests passed.** ESLint, typecheck, compileall and
+  `git diff --check` passed.
+- **19 Chromium E2E tests passed** (5.3m), including the isolated local fixture
+  provider, Retry, strict failure states, History/Prepare handoff and a 55-file
+  real libvips/disk/SQLite/ZIP Prepare run. No live Gemini/paid rendering or
+  native-Windows production smoke was used.
+
+## Retained baseline: 10× dynamic Donepixel workers and concurrent Gemini tabs
 
 Worker identity: `2.5.3-multitab-dynamic-batch`, built atop published
 `b2e236145d3b7b495e7e2fab1071439087cd8ab8` (`2.5.2` silent-paste/original-only

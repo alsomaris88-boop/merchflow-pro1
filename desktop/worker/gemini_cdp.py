@@ -182,7 +182,25 @@ def chrome_args(exe: str, user_data_dir: Path | str, port: int, *, headless: boo
         "--disable-features=Translate,MediaRouter",
     ]
     if headless:
-        args += ["--headless=new", "--window-size=1440,1000", "--mute-audio", "about:blank"]
+        # Keep the multi-tab worker lean without changing visible sign-in
+        # windows. These flags reduce background/renderer work, but Chrome's
+        # actual memory use remains workload- and machine-dependent.
+        args += [
+            "--headless=new",
+            "--window-size=1440,1000",
+            "--disable-gpu",
+            "--disable-extensions",
+            "--disable-background-networking",
+            "--disable-sync",
+            "--disable-translate",
+            "--mute-audio",
+            "--hide-scrollbars",
+            "--disable-renderer-backgrounding",
+            "--disable-backgrounding-occluded-windows",
+            "--disable-ipc-flooding-protection",
+            "--disable-dev-shm-usage",
+            "about:blank",
+        ]
     else:
         args += ["--window-size=560,820", f"--app={url}"]
     extra = os.environ.get("MERCHFLOW_CHROME_EXTRA_ARGS", "").strip()

@@ -9,6 +9,8 @@ import { PRODUCTS, analyzeContrast, applyDistressKnockout, buildDarkVariant, can
 
 interface Settings {
   remove: boolean;
+  mode: "without_ai" | "with_ai";
+  precision: "keep_holes" | "everywhere";
   model: "u2net" | "birefnet-general";
   defringe: 1 | 2;
   despeckle: boolean;
@@ -17,6 +19,9 @@ interface Settings {
   halftone: boolean;
   lpi: number;
   ink: string;
+  upscale: boolean;
+  upscaleFactor: 2 | 4 | 8;
+  resizeForPrint: boolean;
   distress: boolean;
   distressIntensity: number;
   darkLightSplit: boolean;
@@ -27,8 +32,10 @@ interface Settings {
   dedupe: boolean;
 }
 const DEFAULTS: Settings = {
-  remove: true, model: "u2net", defringe: 1, despeckle: false,
-  placement: "top", compress: true, halftone: false, lpi: 48, ink: "#E8E2D2",
+  remove: true, mode: "with_ai", precision: "keep_holes", model: "u2net",
+  defringe: 1, despeckle: false, placement: "top", compress: true,
+  halftone: false, lpi: 48, ink: "#E8E2D2", upscale: false,
+  upscaleFactor: 2, resizeForPrint: true,
   distress: false, distressIntensity: 0.45, darkLightSplit: false, splitStrategy: "auto",
   polycanvas: false, products: ["hoodie", "popsocket", "tote"], vectorize: false, dedupe: true,
 };
@@ -58,6 +65,14 @@ function downloadPng(design: DesignRecord) {
   document.body.appendChild(anchor);
   anchor.click();
   anchor.remove();
+}
+
+function SettingChoice({ selected, onClick, label, disabled = false }: { selected: boolean; onClick: () => void; label: string; disabled?: boolean }) {
+  return <button type="button" aria-pressed={selected} onClick={onClick} disabled={disabled}
+    className={cx("rounded-lg border px-3 py-2 text-xs font-semibold transition-colors disabled:pointer-events-none disabled:opacity-35",
+      selected ? "border-[#c9f24b]/60 bg-[#c9f24b]/10 text-[#c9f24b]" : "border-white/10 bg-black/20 text-white/55 hover:text-white/85")}>
+    {label}
+  </button>;
 }
 
 export default function PrepareLab() {
@@ -180,7 +195,7 @@ export default function PrepareLab() {
     try {
       const status = await probeBridge();
       setBridge(status);
-      if (!status.connected) throw new Error("Local engine offline. Start run_windows.bat; no colour-key or simulated fallback is used.");
+      if (!status.connected) throw new Error("Local engine offline. Start run_windows.bat; processing never falls back to simulated output.");
       for (const item of pending) {
         setSelected(item.id);
         setQueue((q) => q.map((i) => i.id === item.id ? { ...i, status: "running", error: undefined } : i));
@@ -192,7 +207,13 @@ export default function PrepareLab() {
             body: JSON.stringify({ image, name: item.name, settings }),
           });
           const result = await responseJson<{ design: DesignRecord; report: { coverage?: number; specks?: number } }>(res);
-          if (!isSavedDesign(result.design) || result.design.w !== 4500 || result.design.h !== 5400) throw new Error("Engine did not verify a 4500×5400, 300 DPI PNG on disk.");
+          if (!isSavedDesign(result.design)) throw new Error("Engine did not verify a 300 DPI PNG on disk.");
+          if (settings.resizeForPrint) {
+            const factor = settings.upscale ? settings.upscaleFactor : 1;
+            if (result.design.w !== 4500 * factor || result.design.h !== 5400 * factor) {
+              throw new Error("Engine output dimensions do not match the selected print/upscale settings.");
+            }
+          }
           announceDesignsChanged();
           setQueue((q) => q.map((i) => i.id === item.id ? { ...i, saved: result.design } : i));
           const elite = await runElite(result.design, catalog);
@@ -234,8 +255,8 @@ export default function PrepareLab() {
   };
 
   return <div>
-    <PageHead kicker="MODULE 04 · PREPARE DESIGNS LAB" title="Universal cutout · batch print pipeline"
-      desc="Drop 1–50+ images. Neural matting → Lanczos resize → 4500×5400 at 300 DPI → verified PNG and History. Files run sequentially; Download all streams one ZIP from disk."
+    <PageHead kicker="MODULE 04 · PREPARE DESIGNS LAB" title="Prepare Lab · three-card print pipeline"
+      desc="Queue 1–50+ designs, choose background removal, optional 2×/4×/8× Lanczos resampling, and print sizing. The worker processes sequentially and streams verified PNGs to History."
       right={<Chip tone={bridge.connected ? "lime" : "neutral"}>{bridge.connected ? <PlugZap size={11} /> : <WifiOff size={11} />}{bridge.connected ? "LOCAL ENGINE" : "ENGINE OFFLINE"}</Chip>} />
     {error && <div role="alert" className="mb-4 rounded-xl border border-red-400/30 bg-red-500/10 p-4 text-sm text-red-200">{error}</div>}
     {notice && <div role="status" className="mb-4 rounded-xl border border-[#c9f24b]/30 p-3 text-xs text-[#c9f24b]">{notice}</div>}
@@ -271,45 +292,75 @@ export default function PrepareLab() {
         </Card>
         <fieldset disabled={running} className="space-y-4 disabled:opacity-60">
           <Card className="p-5 space-y-4">
-            <Toggle on={settings.remove} set={(remove) => setSettings((s) => ({ ...s, remove }))} label="Universal rembg cutout" />
-            {settings.remove && <>
-              <Field label="Neural matting model">
+            <div className="flex items-start justify-between gap-3">
+              <Section icon={<ImageUp size={16} />} title="Remove the background" desc="Choose fast border-colour removal or neural matting." />
+              <Toggle ariaLabel="Remove background" on={settings.remove} set={(remove) => setSettings((s) => ({ ...s, remove }))} label={settings.remove ? "ON" : "OFF"} />
+            </div>
+            {settings.remove && <div className="space-y-4">
+              <div>
+                <div className="text-[11px] font-mono2 uppercase tracking-[0.14em] text-white/45 mb-1.5">Mode</div>
+                <div role="group" aria-label="Background removal mode" className="grid grid-cols-2 gap-2">
+                  <SettingChoice selected={settings.mode === "without_ai"} onClick={() => setSettings((s) => ({ ...s, mode: "without_ai" }))} label="Without AI · Fast ⚡" />
+                  <SettingChoice selected={settings.mode === "with_ai"} onClick={() => setSettings((s) => ({ ...s, mode: "with_ai" }))} label="With AI · Neural 🧠" />
+                </div>
+              </div>
+              <div>
+                <div className="flex items-baseline justify-between mb-1.5">
+                  <span className="text-[11px] font-mono2 uppercase tracking-[0.14em] text-white/45">Precision</span>
+                  <span className="text-[10px] font-mono2 text-white/30">{settings.mode === "without_ai" ? "solid-colour mode" : "AI matting preserves natural counters"}</span>
+                </div>
+                <div role="group" aria-label="Cutout precision" className="grid grid-cols-2 gap-2">
+                  <SettingChoice selected={settings.precision === "keep_holes"} disabled={settings.mode !== "without_ai"} onClick={() => setSettings((s) => ({ ...s, precision: "keep_holes" }))} label="Keep holes" />
+                  <SettingChoice selected={settings.precision === "everywhere"} disabled={settings.mode !== "without_ai"} onClick={() => setSettings((s) => ({ ...s, precision: "everywhere" }))} label="Everywhere" />
+                </div>
+              </div>
+              {settings.mode === "with_ai" && <Field label="Neural model">
                 <Select aria-label="Neural matting model" value={settings.model} onChange={(e) => setSettings((s) => ({ ...s, model: e.target.value as Settings["model"] }))}>
-                  <option value="u2net">U2Net · universal</option><option value="birefnet-general">BiRefNet · general / fine detail</option>
+                  <option value="u2net">U2Net · universal</option>
+                  <option value="birefnet-general">BiRefNet · general / fine detail</option>
                 </Select>
-              </Field>
-              <Field label="Alpha choke" hint="at final export resolution">
+              </Field>}
+              <Field label="Alpha edge choke" hint="at final export resolution">
                 <Select aria-label="Alpha choke" value={settings.defringe} onChange={(e) => setSettings((s) => ({ ...s, defringe: Number(e.target.value) as 1 | 2 }))}>
-                  <option value={1}>1 px · fine lettering and hair</option><option value={2}>2 px · stronger edge cleanup</option>
+                  <option value={1}>1 px · fine lettering</option>
+                  <option value={2}>2 px · stronger cleanup</option>
                 </Select>
               </Field>
-              <p className="text-[11px] text-white/40 leading-relaxed">Semantic matting handles coloured and textured backdrops. No colour-key fallback or hole filling. First use downloads model weights.</p>
-            </>}
-            <Toggle on={settings.despeckle} set={(despeckle) => setSettings((s) => ({ ...s, despeckle }))} label="Remove isolated micro-dots (<4 source pixels)" />
+              <p className="text-[11px] text-white/45 leading-relaxed">
+                {settings.mode === "without_ai"
+                  ? "Auto-samples solid black, white, orange, navy, lime, or other flat borders. Use With AI for textured or uneven backdrops."
+                  : "U2Net neural matting runs locally; its model weights may download the first time. Existing transparent counters are retained."}
+              </p>
+            </div>}
           </Card>
+
           <Card className="p-5 space-y-4">
-            <div className="text-sm font-bold flex gap-2 items-center"><FlaskConical size={14} /> Print output</div>
-            <div className="rounded-lg border border-[#c9f24b]/25 p-3 font-mono2 text-[11px] text-[#c9f24b]">4500 × 5400 px · embedded 300 DPI · PNG</div>
-            <Field label="Placement"><Select aria-label="Placement" value={settings.placement} onChange={(e) => setSettings((s) => ({ ...s, placement: e.target.value as Settings["placement"] }))}>
-              <option value="top">Top · 350px collar margin</option><option value="center">Centred</option>
-            </Select></Field>
-            <Toggle on={settings.compress} set={(compress) => setSettings((s) => ({ ...s, compress }))} label="Maximum lossless PNG compression" />
-            <div className="text-[11px] text-white/35">Actual size is measured after saving; no invented reduction percentages.</div>
-            <Toggle on={settings.halftone} set={(halftone) => setSettings((s) => ({ ...s, halftone }))} label="Halftone screen print" />
-            {settings.halftone && <><Field label={`Density · ${settings.lpi} LPI`}><input aria-label="Halftone density" type="range" min={40} max={55} value={settings.lpi} onChange={(e) => setSettings((s) => ({ ...s, lpi: Number(e.target.value) }))} /></Field>
-              <Field label="Ink"><input aria-label="Ink colour" type="color" value={settings.ink} onChange={(e) => setSettings((s) => ({ ...s, ink: e.target.value }))} /></Field></>}
+            <div className="flex items-start justify-between gap-3">
+              <Section icon={<Zap size={16} />} title="Upscale" desc="Optional 2×, 4×, or 8× Lanczos resampling." />
+              <Toggle ariaLabel="Upscale" on={settings.upscale} set={(upscale) => setSettings((s) => ({ ...s, upscale }))} label={settings.upscale ? "ON" : "OFF"} />
+            </div>
+            {settings.upscale ? <>
+              <div>
+                <div className="text-[11px] font-mono2 uppercase tracking-[0.14em] text-white/45 mb-1.5">Scale</div>
+                <div role="group" aria-label="Upscale factor" className="grid grid-cols-3 gap-2">
+                  {([2, 4, 8] as const).map((factor) => <SettingChoice key={factor} selected={settings.upscaleFactor === factor}
+                    onClick={() => setSettings((s) => ({ ...s, upscaleFactor: factor }))} label={`${factor}×`} />)}
+                </div>
+              </div>
+              <p className="text-[11px] text-white/45 leading-relaxed">Lanczos interpolation resamples pixels; it does not invent AI detail. Very large print canvases may take longer and use more disk space.</p>
+            </> : <p className="text-[11px] text-white/45">Skipped while OFF for faster batching.</p>}
           </Card>
+
           <Card className="p-5 space-y-4">
-            <div className="text-sm font-bold">Elite production tools</div>
-            <Toggle on={settings.dedupe} set={(dedupe) => setSettings((s) => ({ ...s, dedupe }))} label="pHash duplicate check in this batch" />
-            <Toggle on={settings.distress} set={(distress) => setSettings((s) => ({ ...s, distress }))} label="Vintage distress knockout" />
-            {settings.distress && <Field label={`Distress · ${Math.round(settings.distressIntensity * 100)}%`}><input aria-label="Distress intensity" type="range" min={10} max={90} value={settings.distressIntensity * 100} onChange={(e) => setSettings((s) => ({ ...s, distressIntensity: Number(e.target.value) / 100 }))} /></Field>}
-            <Toggle on={settings.darkLightSplit} set={(darkLightSplit) => setSettings((s) => ({ ...s, darkLightSplit }))} label="Dark / light apparel variants" />
-            {settings.darkLightSplit && <Select aria-label="Dark garment strategy" value={settings.splitStrategy} onChange={(e) => setSettings((s) => ({ ...s, splitStrategy: e.target.value as Settings["splitStrategy"] }))}><option value="auto">Auto contrast check</option><option value="stroke">Outer stroke</option><option value="cream">Vintage cream ink</option></Select>}
-            <Toggle on={settings.polycanvas} set={(polycanvas) => setSettings((s) => ({ ...s, polycanvas }))} label="Multi-product canvases" />
-            {settings.polycanvas && <div className="flex flex-wrap gap-2">{PRODUCTS.map((spec) => <label key={spec.key} className="text-[11px] flex gap-1"><input type="checkbox" checked={settings.products.includes(spec.key)} onChange={(e) => setSettings((s) => ({ ...s, products: e.target.checked ? [...s.products, spec.key] : s.products.filter((p) => p !== spec.key) }))} />{spec.label}</label>)}</div>}
-            <Toggle on={settings.vectorize} set={(vectorize) => setSettings((s) => ({ ...s, vectorize }))} label="Save true SVG vector (vtracer)" />
-            <p className="text-[11px] text-white/35">Every raster variant is saved to disk and History. SVG requires the local vector engine.</p>
+            <div className="flex items-start justify-between gap-3">
+              <Section icon={<FlaskConical size={16} />} title="Resize for printing" desc="Print-ready PNG canvas with embedded 300 DPI metadata." />
+              <Toggle ariaLabel="Resize for printing" on={settings.resizeForPrint} set={(resizeForPrint) => setSettings((s) => ({ ...s, resizeForPrint }))} label={settings.resizeForPrint ? "ON" : "OFF"} />
+            </div>
+            <div className="rounded-lg border border-[#c9f24b]/25 p-3 font-mono2 text-[11px] text-[#c9f24b]">
+              {settings.resizeForPrint
+                ? `Base target 4500 × 5400 px @ 300 DPI · 350 px collar margin${settings.upscale ? ` · final ${4500 * settings.upscaleFactor} × ${5400 * settings.upscaleFactor} px` : ""}`
+                : `OFF · preserve source dimensions${settings.upscale ? ` · then ${settings.upscaleFactor}×` : ""}`}
+            </div>
           </Card>
         </fieldset>
         <Btn variant="lime" className="w-full justify-center" onClick={() => void runBatch()} disabled={!waiting || running || ingesting || !bridge.connected}>
@@ -320,7 +371,9 @@ export default function PrepareLab() {
       </div>
       <div className="xl:col-span-2 space-y-4">
         <div className="grid sm:grid-cols-2 gap-4">{[false, true].map((output) => <Card key={String(output)} className="p-4">
-          <div className="font-mono2 text-[10px] tracking-widest text-white/45 mb-3">{output ? "SAVED OUTPUT · 4500×5400" : "INPUT"}</div>
+          <div className="font-mono2 text-[10px] tracking-widest text-white/45 mb-3">
+            {output ? `SAVED OUTPUT · ${current?.saved ? `${current.saved.w}×${current.saved.h}` : "PRINT READY"}` : "INPUT"}
+          </div>
           <div className="checkerboard border border-white/10 rounded-xl aspect-[5/6] flex items-center justify-center relative overflow-hidden">
             {(output ? current?.saved : current) ? <>
               {/* eslint-disable-next-line @next/next/no-img-element */}

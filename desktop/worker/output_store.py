@@ -115,6 +115,82 @@ def save_image(
         raise
 
 
+def save_vips_image(image, out_dir: Path, name: str, metadata: dict | None = None, *, ms: int = 0, compress: bool = True) -> dict:
+    """Stream a prepared libvips graph directly to a verified History PNG.
+
+    Unlike :func:`save_image`, this path does not materialize the full encoded
+    master in Python memory. It is used by the desktop Prepare endpoint, which
+    returns only the saved-design record. Resampling and PNG encoding stay in
+    libvips; the browser can still fetch the exact disk-backed original later.
+    """
+    import pyvips
+
+    metadata = metadata or {}
+    if image.bands != 4 or image.format != "uchar":
+        raise ValueError("Prepared print output must be 8-bit RGBA")
+    if image.width < 1 or image.height < 1:
+        raise ValueError("Prepared print output has invalid dimensions")
+
+    save_started = time.perf_counter()
+    out_dir = out_dir.resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    design_id = uuid.uuid4().hex
+    path = out_dir / f"{safe_name(name)}_{image.width}x{image.height}_{design_id}.png"
+    temp = path.with_suffix(".png.part")
+    thumb = out_dir / ".previews" / f"{design_id}.png"
+    thumb_temp = thumb.with_suffix(".png.part")
+    try:
+        image = image.copy(xres=DPI / 25.4, yres=DPI / 25.4)
+        image.pngsave(str(temp), compression=9 if compress else 1, interlace=False,
+                      palette=False, bitdepth=8, filter=248)
+        with temp.open("r+b") as fp:
+            os.fsync(fp.fileno())
+        with Image.open(temp) as check:
+            if check.format != "PNG" or check.size != (image.width, image.height) or check.mode != "RGBA":
+                raise OSError("Prepared PNG dimensions, format, or RGBA mode verification failed")
+            if any(abs(d - DPI) > 0.1 for d in check.info.get("dpi", (0, 0))):
+                raise OSError("Prepared PNG DPI verification failed")
+            check.verify()
+        thumb.parent.mkdir(exist_ok=True)
+        preview = pyvips.Image.thumbnail(str(temp), 384, height=384, size="down")
+        preview.pngsave(str(thumb_temp), compression=6, palette=False)
+        del preview
+        with Image.open(thumb_temp) as check:
+            check.verify()
+        os.replace(temp, path)
+        os.replace(thumb_temp, thumb)
+        record = {
+            "id": design_id, "name": str(name)[:160],
+            "niche": str(metadata.get("niche", name))[:160],
+            "style": str(metadata.get("style", "Prepared print"))[:160],
+            "source": str(metadata.get("source", "prepare")),
+            "aspect": str(metadata.get("aspect", f"{image.width}:{image.height}")),
+            "background": str(metadata.get("background", "transparent")),
+            "prompt": str(metadata.get("prompt", ""))[:12000],
+            "account": str(metadata.get("account", "local"))[:80],
+            "w": image.width, "h": image.height, "dpi": DPI,
+            "bytes": path.stat().st_size,
+            "ms": ms + round((time.perf_counter() - save_started) * 1000),
+            "saved": True, "path": str(path), "previewPath": str(thumb),
+            "createdAt": round(time.time() * 1000),
+            "fileUrl": f"/api/bridge/designs/{design_id}",
+            "previewUrl": f"/api/bridge/designs/{design_id}?preview=1",
+            "lossless": True, "mode": "RGBA", "encoder": "libvips-png",
+            **{key: metadata[key] for key in (
+                "upscaled", "upscaleFactor", "cutoutMode", "detectedBg", "resizeForPrint",
+            ) if key in metadata},
+        }
+        with _connect(out_dir) as conn:
+            conn.execute("INSERT INTO designs VALUES (?, ?, ?)",
+                         (design_id, record["createdAt"], json.dumps(record)))
+            publish_event(conn, {"type": "design.saved", "design": record})
+        return record
+    except Exception:
+        for file in (temp, path, thumb_temp, thumb):
+            file.unlink(missing_ok=True)
+        raise
+
+
 def save_raw(raw: bytes, out_dir: Path, name: str, meta: dict | None = None) -> tuple[bytes, dict]:
     with Image.open(io.BytesIO(raw)) as image:
         image.load()  # truncated or invalid uploads must fail before registration
