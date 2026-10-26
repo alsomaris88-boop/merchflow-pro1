@@ -22,7 +22,8 @@ from . import db, gemini_cdp, gemini_client, image_lab
 from .gemini_client import GeminiAuthError, GeminiAutomationError, GeminiRefusalError, GeminiRenderError, ModelDegradedError
 
 MOCK = os.environ.get("MERCHFLOW_MOCK_ENGINE", "").lower() in {"1", "true", "yes"}
-SLOTS_PER_ACCOUNT = max(1, min(32, int(os.environ.get("MERCHFLOW_GEMINI_SLOTS_PER_ACCOUNT", "10"))))
+SLOTS_PER_ACCOUNT = max(1, min(32, int(os.environ.get("MERCHFLOW_GEMINI_SLOTS_PER_ACCOUNT", "2"))))
+TAB_LAUNCH_STAGGER_SECONDS = 2.5
 
 # ---- Configured local scheduling budgets -------------------------------------------
 WINDOW_SECONDS = int(os.environ.get("MERCHFLOW_WINDOW_SECONDS", 5 * 3600))
@@ -178,6 +179,7 @@ class AccountPool:
         # Each entry is the number of active per-account generation leases.
         # CDP requests use distinct tabs and distinct CDP WebSocket sessions.
         self._busy: dict[int, int] = {}
+        self._tab_launch_deadlines: dict[int, float] = {}
         self._jitter_deadlines: dict[int, float] = {}
         self._jitter_released: set[int] = set()
         self._logins: set[int] = set()
@@ -368,21 +370,21 @@ class AccountPool:
 
     def acquire(self, *, parallel: bool = False, require_pro: bool = False,
                 exclude: set[int] | None = None, timeout: float = 300) -> AccountState:
-        """Reserve one concurrent tab and one unit of rolling-window capacity.
+        """Reserve one tab and rolling-window unit, staggering same-account launches.
 
-        An account can hold up to ``SLOTS_PER_ACCOUNT`` independent CDP/HTTP
-        renders. No reservation can push committed plus in-flight renders over
-        the local Pro-window cap. Expired/auth-invalid/degraded sessions remain
-        ineligible, and parallel scheduling balances load across accounts.
+        Each account holds at most ``SLOTS_PER_ACCOUNT`` CDP/HTTP renders. A
+        second concurrently leased tab waits 2.5 seconds after the previous
+        launch reservation, smoothing Chrome/CPU startup without serializing the
+        provider render itself. Window reservations remain atomic and bounded.
         """
         deadline = time.monotonic() + timeout
-        with self.condition:
-            while True:
+        while True:
+            account = None
+            launch_delay = 0.0
+            with self.condition:
                 self._reset_expired_locked()
-                # `eligible` means the account still has committed window
-                # budget; `free` below also reserves budget against sibling
-                # in-flight jobs. A worker waits if every remaining unit is
-                # reserved, since a sibling may fail and release its slot.
+                # `eligible` means the account has committed window budget;
+                # `free` also reserves capacity against sibling in-flight jobs.
                 eligible = [
                     a for a in self.accounts
                     if a.status in {"ready", "active"}
@@ -401,34 +403,65 @@ class AccountPool:
                     else:
                         account = free[0]
                     lease_count = self._busy.get(account.id, 0)
+                    now = time.monotonic()
                     if lease_count == 0:
-                        # A burst of parallel tabs shares one randomized account
-                        # wait rather than serializing and sleeping once per tab.
-                        # Maximum-speed P2P leases are already bounded by the
-                        # slot count and real provider/window guards; do not
-                        # impose the legacy 65–85s per-account delay between
-                        # waves of one large batch. Serial legacy callers retain
-                        # their established randomized start spacing.
+                        # A first tab starts immediately for parallel batches;
+                        # legacy serial callers retain their established jitter.
                         delay = 0.0 if parallel else max(0.0, account.last_used + random.uniform(*JITTER) - time.time())
-                        self._jitter_deadlines[account.id] = time.monotonic() + delay
+                        self._jitter_deadlines[account.id] = now + delay
                         self._jitter_released.discard(account.id)
+                        self._tab_launch_deadlines[account.id] = now + delay
+                    else:
+                        launch_at = max(now, self._tab_launch_deadlines.get(account.id, now)) + TAB_LAUNCH_STAGGER_SECONDS
+                        launch_delay = launch_at - now
+                        if launch_delay > max(0.0, deadline - now):
+                            raise RuntimeError("Timed out waiting for an available Pro account slot; check Account Pool")
+                        self._tab_launch_deadlines[account.id] = launch_at
                     self._busy[account.id] = lease_count + 1
                     account.status = "active"
                     if not account.window_started:
                         account.window_started = time.time()
-                    return account
-                if not eligible:
-                    raise RuntimeError("No available authenticated Pro account; check Account Pool, provider limits and cooldowns")
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
+                else:
+                    if not eligible:
+                        raise RuntimeError("No available authenticated Pro account; check Account Pool, provider limits and cooldowns")
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise RuntimeError("Timed out waiting for an available Pro account slot; check Account Pool")
+                    self.condition.wait(min(remaining, 1.0))
+                    continue
+
+            if account is None:
+                continue
+            if launch_delay:
+                try:
+                    time.sleep(launch_delay)
+                except BaseException:
+                    self.release(account.id)
+                    raise
+                if time.monotonic() > deadline:
+                    self.release(account.id)
                     raise RuntimeError("Timed out waiting for an available Pro account slot; check Account Pool")
-                self.condition.wait(min(remaining, 1.0))
+                with self.condition:
+                    still_eligible = (
+                        any(current.id == account.id for current in self.accounts)
+                        and account.status in {"ready", "active"}
+                        and account.window_usage < WINDOW_CAP
+                        and (not require_pro or account.is_pro)
+                        and account.id not in (exclude or set())
+                        and account.id not in self._logins
+                        and client_for(account.id) is not None
+                    )
+                if not still_eligible:
+                    self.release(account.id)
+                    continue
+            return account
 
     def release(self, account_id: int) -> None:
         with self.condition:
             lease_count = self._busy.get(account_id, 0)
             if lease_count <= 1:
                 self._busy.pop(account_id, None)
+                self._tab_launch_deadlines.pop(account_id, None)
                 self._jitter_deadlines.pop(account_id, None)
                 self._jitter_released.discard(account_id)
             else:

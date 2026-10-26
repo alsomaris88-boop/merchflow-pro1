@@ -125,6 +125,15 @@ def test_without_ai_mode_skips_rembg_and_reports_sampled_background(tmp_path, mo
     assert report["detectedBg"] == [250, 120, 20]
 
 
+def test_without_ai_empty_foreground_raises_the_actionable_error(tmp_path):
+    source = Image.new("RGBA", (32, 32), (0, 0, 0, 255))
+    with pytest.raises(ValueError, match="^No foreground remaining; try With AI mode or adjust tolerance\\.$"):
+        image_lab.process_design(png_bytes(source), {
+            "remove": True, "mode": "without_ai", "despeckle": False,
+        }, tmp_path, "all-background")
+    assert output_store.list_designs(tmp_path) == []
+
+
 def test_streaming_prepare_fails_closed_without_libvips(tmp_path, monkeypatch):
     monkeypatch.setattr(image_lab, "HAS_VIPS", False)
     with pytest.raises(RuntimeError, match="requires the native libvips runtime"):
@@ -134,18 +143,29 @@ def test_streaming_prepare_fails_closed_without_libvips(tmp_path, monkeypatch):
     assert output_store.list_designs(tmp_path) == []
 
 
-def test_vips_alpha_choke_returns_its_in_memory_mask_and_correctly_erodes_rgba():
+def test_prepare_erodes_native_cutout_before_final_print_resampling(tmp_path, monkeypatch):
     if not image_lab.HAS_VIPS or not image_lab.HAS_CV:
         pytest.skip("Requires native libvips and OpenCV")
-    source = Image.new("RGBA", (7, 7), (120, 40, 200, 255))
-    vips_source, source_bytes = image_lab._vips_from_image(source)
-    result, mask_bytes, coverage = image_lab._vips_choke_alpha(vips_source, 1)
-    assert isinstance(source_bytes, bytes) and len(source_bytes) == 7 * 7 * 4
-    assert isinstance(mask_bytes, bytes) and len(mask_bytes) == 7 * 7
-    with Image.frombytes("RGBA", (7, 7), bytes(result.write_to_memory())) as output:
-        assert output.getpixel((0, 0))[3] == 0
-        assert output.getpixel((3, 3)) == (120, 40, 200, 255)
-    assert 0 < coverage < 100
+    source = Image.new("RGBA", (64, 48), (0, 0, 0, 0))
+    ImageDraw.Draw(source).rectangle((8, 6, 55, 41), fill=(120, 40, 200, 255))
+    choke_sizes = []
+    real_choke = image_lab.choke_alpha
+
+    def record_native_choke(image, pixels):
+        choke_sizes.append(image.size)
+        return real_choke(image, pixels)
+
+    monkeypatch.setattr(image_lab, "remove_background", lambda image, model: image)
+    monkeypatch.setattr(image_lab, "choke_alpha", record_native_choke)
+    _, report = image_lab.process_design(png_bytes(source), {
+        "remove": True, "mode": "with_ai", "despeckle": False,
+        "resizeForPrint": True, "placement": "top", "defringe": 1,
+    }, tmp_path, "native-choke", return_bytes=False)
+    assert choke_sizes == [(48, 36)]  # foreground crop and choke are both native pixels
+    assert (report["nativeW"], report["nativeH"]) == (64, 48)
+    assert (report["design"]["w"], report["design"]["h"]) == (4500, 5400)
+    assert (report["design"]["nativeW"], report["design"]["nativeH"]) == (64, 48)
+    assert not list(tmp_path.glob("merchflow-alpha-*.raw"))
 
 
 def test_streaming_prepare_exports_verified_print_png_without_materializing_return_bytes(tmp_path, monkeypatch):
@@ -188,7 +208,7 @@ def test_streaming_upscale_is_optional_and_records_real_output_dimensions(tmp_pa
 def test_inference_failure_and_empty_foreground_fail_the_job(tmp_path, monkeypatch):
     monkeypatch.setattr(image_lab, "_session", lambda model: object())
     monkeypatch.setattr(image_lab, "_rembg_remove", lambda image, **kwargs: Image.new("RGBA", image.size))
-    with pytest.raises(RuntimeError, match="empty foreground"):
+    with pytest.raises(ValueError, match="^No foreground remaining; try With AI mode or adjust tolerance\\.$"):
         image_lab.process_design(png_bytes(Image.new("RGBA", (32, 32), "orange")), {}, tmp_path)
     assert output_store.list_designs(tmp_path) == []
 
@@ -204,7 +224,7 @@ def test_prepare_exports_real_4500x5400_png_at_300dpi(tmp_path, neural_mask):
         assert output.size == (4500, 5400)
         assert output.info["dpi"] == pytest.approx((300, 300), abs=0.02)
         assert output.getpixel((0, 0))[3] == 0
-        assert output.getchannel("A").getbbox()[1] == 351  # 350px collar + one export pixel choke
+        assert output.getchannel("A").getbbox()[1] == 350  # choke ran at native size before print placement
 
 
 @pytest.mark.parametrize("background", ["transparent", "black", "white", "original"])

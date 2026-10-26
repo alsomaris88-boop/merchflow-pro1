@@ -92,5 +92,5 @@ export function pixelBatchLabel(batch: PixelBatch): string {
   const saved = batch.items.filter((job) => job.state === "succeeded" && isSavedDesign(job.design)).length;
   if (batch.status === "completed" && saved === batch.total && saved > 0) return "Batch complete · all designs archived";
   if (batch.status === "completed") return "Saved artwork unavailable · check Designs History";
-  return batch.status === "uploading" ? "Uploading references" : "Generating 8K artwork...";
+  return batch.status === "uploading" ? "Uploading references" : "Generating native-resolution artwork...";
 }

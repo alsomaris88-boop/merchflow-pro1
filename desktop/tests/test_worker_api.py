@@ -130,6 +130,53 @@ def test_prepare_api_processes_history_design_from_worker_disk_by_id(worker):
     assert len(output_store.list_designs(module.OUT_DIR)) == 2
 
 
+def test_prepare_expands_native_history_after_cutout_and_choke(worker):
+    client, module = worker
+    native = Image.new("RGBA", (64, 40), (250, 120, 20, 255))
+    from PIL import ImageDraw
+    ImageDraw.Draw(native).rectangle((18, 8, 46, 32), fill=(240, 20, 180, 255))
+    buffer = io.BytesIO(); native.save(buffer, "PNG")
+    saved = client.post("/api/bridge/designs", json={
+        "image": "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode(),
+        "name": "native-history",
+    })
+    assert saved.status_code == 200, saved.text
+    original = saved.json()["design"]
+    assert (original["w"], original["h"]) == (64, 40)
+
+    response = client.post("/api/bridge/process", json={
+        "designId": original["id"], "name": "native-prepare",
+        "settings": {"remove": True, "mode": "without_ai", "precision": "keep_holes",
+                      "colorTolerance": 24, "despeckle": False, "defringe": 1,
+                      "resizeForPrint": True},
+    })
+    assert response.status_code == 200, response.text
+    body = response.json()
+    prepared = body["design"]
+    assert (prepared["w"], prepared["h"], prepared["dpi"]) == (4500, 5400, 300)
+    assert (prepared["nativeW"], prepared["nativeH"]) == (64, 40)
+    assert Path(original["path"]).is_file() and Path(prepared["path"]).is_file()
+    with Image.open(prepared["path"]) as output:
+        assert output.size == (4500, 5400) and output.mode == "RGBA"
+        assert output.info["dpi"] == pytest.approx((300, 300), abs=0.02)
+
+
+def test_empty_background_cutout_returns_actionable_client_error_not_500(worker):
+    client, module = worker
+    native = Image.new("RGBA", (64, 40), (0, 0, 0, 255))
+    buffer = io.BytesIO(); native.save(buffer, "PNG")
+    response = client.post("/api/bridge/process", json={
+        "image": "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode(),
+        "settings": {"remove": True, "mode": "without_ai", "resizeForPrint": True},
+    })
+    assert response.status_code == 422
+    assert response.json() == {
+        "ok": False,
+        "reason": "No foreground remaining; try With AI mode or adjust tolerance.",
+    }
+    assert output_store.list_designs(module.OUT_DIR) == []
+
+
 def test_prepare_api_returns_not_found_for_unknown_history_design_id(worker):
     client, _ = worker
     response = client.post("/api/bridge/process", json={

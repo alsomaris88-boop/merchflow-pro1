@@ -26,7 +26,7 @@ This release changes both the Python worker and the Prepare Lab UI. Pull/replace
 the worker source and rebuild the static UI with `npm ci && npm run build:desktop`;
 copy the generated `out/` to the Windows package, stop its old engine/app window,
 run `run_windows.bat`, and reload. `/api/health` identifies the worker as
-**`2.5.6-zero-disk-choke`** and reports the parallel/tab limits.
+**`2.5.7-native-first-two-slot`** and reports the parallel/tab limits.
 
 `out/` is generated and git-ignored. Do not replace genuine verified Chrome
 profiles, SQLite credentials, or existing output during an update. The end user
@@ -268,12 +268,15 @@ uploaded reference to the real image provider. Eligible authenticated Pro
 sessions get atomic per-tab leases and share the batch across both accounts and
 independent headless tabs within each account.
 The dynamic worker count is `min(MERCHFLOW_P2P_PARALLEL, ready Pro accounts ×
-SLOTS_PER_ACCOUNT, queued jobs)`: default maximum **10 designs at once**, never
-more than the queued batch size. `MERCHFLOW_P2P_PARALLEL` is configurable from
-1–32 (default 10); `MERCHFLOW_GEMINI_SLOTS_PER_ACCOUNT` defaults to 10 and is
-configurable from 1–32. The pool reserves an individual tab slot **and** its
-rolling-window quota before dispatch, so 10 concurrent requests cannot spend the
-same final local Pro-window allowance. Unverified, non-Pro, auth-required and
+SLOTS_PER_ACCOUNT, queued jobs)`: the per-batch maximum remains **10 designs at
+once**, never more than queued jobs or eligible account capacity.
+`MERCHFLOW_P2P_PARALLEL` remains configurable from 1–32 (default 10);
+`MERCHFLOW_GEMINI_SLOTS_PER_ACCOUNT` now defaults to **2** (configurable 1–32).
+Concurrent leases on the same account are staggered by **2.5 seconds** to smooth
+Chrome/tab startup; sufficiently many eligible accounts can still fill the
+separate per-batch ceiling. The pool reserves an individual tab slot **and** its
+rolling-window quota before dispatch, so sibling requests cannot spend the same
+last local Pro-window allowance. Unverified, non-Pro, auth-required and
 quota/cooldown accounts are excluded. A genuine quota/degradation signal blocks
 new leases, cannot be shortened by another tab's generic network error, and
 survives sibling success; verified auth-required state cannot be erased by a
@@ -287,12 +290,12 @@ per-account lock to prevent two tabs from saving/returning each other's PNG.
 Gemini's HTTP client similarly snapshots token/request IDs under a small state
 lock while the upload and image RPC network requests remain independent.
 The legacy sequential scheduler retains its randomized account jitter; dynamic
-parallel P2P bursts bypass that 65–85-second per-account delay, staying bounded
-by tab slots, the local window cap, and genuine provider auth/quota signals. Existing fusion calls still use the pool. Flash
-model-degradation failures remain real quota signals; no provider quota bypass or
-throughput guarantee is claimed. Up to ten concurrent 8K renders can still
-increase local memory/CPU/network use and may expose provider-side rate limits;
-operators can lower either slot setting if needed. The prompt is
+parallel P2P bursts bypass that 65–85-second per-account delay, while same-account
+tab launches retain the 2.5-second stagger. Flash model-degradation failures
+remain real quota signals; no provider quota bypass or throughput guarantee is
+claimed. Up to ten provider calls across sufficiently many accounts can still
+increase local CPU/network use and may expose provider-side rate limits; operators
+can lower either slot setting. The prompt is
 the exact requested faithful-artwork/no-variations text, including cleanup of
 fabric wrinkles, with only the selected Black/White hex substituted.
 
@@ -306,7 +309,7 @@ disconnections. The last batch can be reopened from Pixel to Pixel. An abandoned
 pre-generation upload can be discarded explicitly.
 
 **Generate immediately displays live cards below the form**, even while the
-manifest POST is still waiting: pulsing skeleton + `Generating 8K artwork...`.
+manifest POST is still waiting: pulsing skeleton + `Generating native-resolution artwork...`.
 These are pending UI only, not invented designs or saved records. Once a real
 PNG + History transaction commits, the card shows its actual disk thumbnail,
 **Download** (the existing master) and **Send to Prepare Lab** (its saved ID).
@@ -328,20 +331,33 @@ successful retry or deliberate local removal; these are private originals, not
 extra generated outputs. Removing one does not remove an archived design, but
 requires reselecting the original to retry.
 
-As each real provider image arrives, a bounded **native libvips streaming** graph
-aspect-fits it onto **4500 × 5400**, using the selected background for padding,
-without cropping. Native dimensions/upscaling are disclosed. The prompt requests
-8K clarity, but provider-native 8K is not guaranteed and the new final print
-canvas is 4500 × 5400—not an advertised native 8K export. No matting, palette
-reduction or recolouring substitute is applied to the provider artwork.
+As each real provider image arrives, the worker normalizes its orientation and
+colour profile, then archives the provider's decoded **native dimensions** as a
+lossless RGBA PNG. No 4500 × 5400 print canvas, upscaling or padding is applied
+during generation. History records `nativeW`, `nativeH`, actual pixel dimensions
+and file size, plus a small verified preview; the browser uses that preview and
+does not fetch the full native PNG until the user explicitly downloads it. The
+prompt requests 8K clarity, but provider-native resolution varies and is never
+claimed as a guarantee.
 
-The master is a **lossless RGBA PNG, 300 DPI**, written directly to disk as
-`output/p2p_<filename>_<UTC timestamp>_<collision suffix>.png`. Compression does
-not quantize colours or remove alpha. Per the clarified requirement, **4 MB is
-not a rejection threshold**: files below **25,000,000 bytes** are accepted.
-A larger lossless file fails visibly rather than degrading pixels silently.
-The generator's creative changes/resampling are distinct from lossless encoding;
-there is no promise that a generative provider reproduces source pixels exactly.
+Native masters are streamed to disk as
+`output/p2p_<filename>_<native-width>x<native-height>_<design-id>.png` with
+lossless RGBA encoding and compression level 6; no palette or colour reduction
+is used. The record retains the app's 300 DPI metadata contract, but it is not a
+print-sized canvas. Files below the existing **25,000,000-byte** P2P ceiling are
+accepted; larger lossless renders fail visibly rather than being degraded.
+The native image and its History record are committed before the success event.
+
+When the saved design is sent to Prepare Lab, the worker reads its original PNG
+from disk by `designId`. Background removal (real U2Net/BiRefNet or the explicit
+Without AI OpenCV flood-fill mode), despeckle and the 1–2px OpenCV alpha choke
+run at native/source resolution. If no foreground remains, Prepare returns the
+actionable error `No foreground remaining; try With AI mode or adjust tolerance.`
+Only after the cutout is validated does libvips Lanczos3-resize and pad it onto
+the selected print canvas (4500 × 5400 @ 300 DPI by default), streaming the final
+PNG directly to disk with compression level 6. The earlier 18MB/15MB memory
+ceilings and sub-second timing targets are not claimed without matching
+measurements; resource use still depends on input size and cutout mode.
 
 The PNG and thumbnail must verify before a SQLite transaction inserts `designs`,
 marks the persistent batch job successful and writes its durable SSE outbox
@@ -420,7 +436,7 @@ unauthenticated public multi-user service.
 | `MERCHFLOW_WORKER_URL` | `http://127.0.0.1:8000` | Next.js → worker proxy |
 | `MERCHFLOW_CDP_UPLOAD_TIMEOUT` | `45` | Seconds per gate to verify each silent paste/drop reference thumbnail |
 | `MERCHFLOW_P2P_PARALLEL` | `10` | Per-batch concurrent provider calls, dynamically capped to jobs and Pro accounts × per-account slots (1–32) |
-| `MERCHFLOW_GEMINI_SLOTS_PER_ACCOUNT` | `10` | Independent concurrent headless tabs/RPC slots per eligible Gemini account (1–32) |
+| `MERCHFLOW_GEMINI_SLOTS_PER_ACCOUNT` | `2` | Independent concurrent headless tabs/RPC slots per eligible Gemini account (1–32); same-account launches are staggered 2.5 seconds |
 | `MERCHFLOW_REMBG_MODEL` | `u2net` | Default model for direct pipeline callers |
 | `U2NET_HOME` | rembg default | Model weights cache directory |
 | `OMP_NUM_THREADS` | runtime default | ONNX CPU thread tuning |

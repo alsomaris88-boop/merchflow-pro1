@@ -326,7 +326,7 @@ export default function PrepareLab() {
                   <option value="birefnet-general">BiRefNet · general / fine detail</option>
                 </Select>
               </Field>}
-              <Field label="Alpha edge choke" hint="at final export resolution">
+              <Field label="Alpha edge choke" hint="at native/source resolution">
                 <Select aria-label="Alpha choke" value={settings.defringe} onChange={(e) => setSettings((s) => ({ ...s, defringe: Number(e.target.value) as 1 | 2 }))}>
                   <option value={1}>1 px · fine lettering</option>
                   <option value={2}>2 px · stronger cleanup</option>

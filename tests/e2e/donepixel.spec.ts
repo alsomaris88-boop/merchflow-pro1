@@ -43,7 +43,11 @@ test("batch survives navigation; SSE populates History, ZIP stays optional, and 
   for (const item of batch.items) {
     expect(item.design.saved).toBe(true);
     const raw = await readFile(item.design.path);
-    expect(raw.readUInt32BE(16)).toBe(4500); expect(raw.readUInt32BE(20)).toBe(5400);
+    expect(raw.readUInt32BE(16)).toBe(item.design.nativeW);
+    expect(raw.readUInt32BE(20)).toBe(item.design.nativeH);
+    expect(item.design.w).toBe(item.design.nativeW);
+    expect(item.design.h).toBe(item.design.nativeH);
+    expect(item.design.upscaled).toBe(false);
     expect(raw[25]).toBe(6); // actual RGBA, never indexed/palette PNG
   }
   const downloadEvent = page.waitForEvent("download");
@@ -57,7 +61,7 @@ test("batch survives navigation; SSE populates History, ZIP stays optional, and 
   await page.getByRole("button", { name: "Select all", exact: true }).click();
   await page.getByRole("button", { name: "Send to Listing Hub (3)", exact: true }).click();
   await expect(page.getByText("3 designs from History", { exact: true })).toBeVisible();
-  await page.getByRole("button", { name: `List ${prefix}-1`, exact: true }).click();
+  await page.getByRole("button", { name: `List ${prefix}-1.png`, exact: true }).click();
   await page.getByRole("button", { name: "Generate dual listing", exact: true }).click();
   const savedResponse = page.waitForResponse((response) => response.url().endsWith("/api/bridge/listings") && response.request().method() === "POST");
   await page.getByRole("button", { name: "Save to library", exact: true }).click();
@@ -88,7 +92,7 @@ test("queued Pixel batch survives reload and restores its disk-backed History wi
   await expect.poll(async () => (await (await request.get(`/api/bridge/p2p/batches/${id}`)).json()).batch.status,
     { timeout: 40000, intervals: [750] }).toBe("completed");
   await page.getByRole("button", { name: "Open Designs History", exact: true }).click();
-  await expect(page.locator(`img[alt="${name}"]`)).toHaveCount(1);
+  await expect(page.locator(`img[alt="${name}.png"]`)).toHaveCount(1);
   expect(downloads).toBe(0);
 });
 
@@ -120,17 +124,24 @@ test("retained files can be regenerated on another colour as a fresh archived ba
   expect(first.items[0].id).not.toBe(second.items[0].id);
   expect(first.items[0].design.id).not.toBe(second.items[0].design.id);
   expect(first.completed).toBe(1); expect(second.completed).toBe(1);
-  for (const batch of [first, second]) expect((await readFile(batch.items[0].design.path)).readUInt32BE(16)).toBe(4500);
+  for (const batch of [first, second]) {
+    const design = batch.items[0].design;
+    const png = await readFile(design.path);
+    expect(png.readUInt32BE(16)).toBe(design.nativeW);
+    expect(png.readUInt32BE(20)).toBe(design.nativeH);
+    expect(design.w).toBe(design.nativeW);
+    expect(design.h).toBe(design.nativeH);
+  }
   await page.getByRole("button", { name: "Open Designs History", exact: true }).click();
   await page.getByPlaceholder("filter by niche, style, account…").fill(name);
-  await expect(page.locator(`img[alt="${name}"]`)).toHaveCount(2);
+  await expect(page.locator(`img[alt="${name}.png"]`)).toHaveCount(2);
   expect(downloads).toBe(0);
   // Preserve the newer main branch's one-click handoff, using the saved
   // single-output record rather than a browser-only render or a fresh download.
   await page.getByRole("button", { name: "Pixel to Pixel", exact: true }).click();
   await page.getByRole("button", { name: `Send ${second.items[0].name} to Prepare Designs Lab`, exact: true }).click();
   await expect(page.getByText("Batch queue · 1", { exact: true })).toBeVisible();
-  await expect(page.getByRole("button", { name: `Remove ${name}`, exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: `Remove ${name}.png`, exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "Prepare designs (1)", exact: true })).toBeEnabled();
   expect(downloads).toBe(0);
 });
@@ -181,7 +192,7 @@ test("Generate shows pending cards BEFORE create responds, then real artwork, ex
     await page.getByRole("button", { name: "2 designs in, 2 back on your colour. ▷ Generate", exact: true }).click();
     await requested;
     await expect(page.getByTestId("p2p-result-card")).toHaveCount(2);
-    await expect(page.getByText("Generating 8K artwork...", { exact: true })).toHaveCount(2);
+    await expect(page.getByText("Generating native-resolution artwork...", { exact: true })).toHaveCount(2);
     await expect(page.getByTestId("p2p-generating").first().locator(".animate-pulse").first()).toBeVisible();
     await expect(page.getByTestId("p2p-generated-artwork")).toHaveCount(0);
     expect(await page.evaluate(() => localStorage.getItem("merchflow:current-p2p-batch"))).toBeNull();
@@ -204,7 +215,10 @@ test("Generate shows pending cards BEFORE create responds, then real artwork, ex
   await download.saveAs(savedPath);
   const raw = await readFile(savedPath);
   expect(raw.equals(await readFile(first.design.path))).toBe(true);
-  expect(raw.readUInt32BE(16)).toBe(4500); expect(raw.readUInt32BE(20)).toBe(5400);
+  expect(raw.readUInt32BE(16)).toBe(first.design.nativeW);
+  expect(raw.readUInt32BE(20)).toBe(first.design.nativeH);
+  expect(first.design.w).toBe(first.design.nativeW);
+  expect(first.design.h).toBe(first.design.nativeH);
   const history = (await (await request.get("/api/bridge/designs")).json()).items.filter((d: { batchId: string }) => d.batchId === id);
   expect(history).toHaveLength(2);
   expect(new Set(history.map((d: { id: string }) => d.id))).toEqual(new Set(done.items.map((j: { design: { id: string } }) => j.design.id)));

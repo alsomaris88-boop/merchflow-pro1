@@ -80,7 +80,7 @@ export default function PixelToPixel({ setView }: { setView: (view: ViewKey) => 
           </div>
         </Card>
         <Card className="p-4 text-xs text-white/45 leading-relaxed">
-          <strong className="text-white/75">Real files, not a browser download:</strong> streamed libvips export → 4500 × 5400 RGBA PNG → 300 DPI → verified disk write → SQLite History → live update. Lossless compression only; no palette or colour reduction. Files above 4 MB remain valid below the 25 MB ceiling. Strictly one output per input, never candidate sets. The exact prompt requests 8K clarity; actual provider resolution varies, and the final print canvas is 4500 × 5400, with aspect ratio preserved and colour-matched padding.
+          <strong className="text-white/75">Real files, not a browser download:</strong> stream the provider-native RGBA PNG to disk → verify → SQLite History → live update. Native dimensions and actual file size are recorded; no pre-upscale or print-canvas allocation occurs during generation. Prepare Lab later performs cutout at native resolution, then streams the selected print canvas (4500 × 5400 @ 300 DPI by default) to disk. Lossless compression only; no palette or colour reduction. Files below the existing 25 MB ceiling are accepted. Strictly one output per input, never candidate sets; the prompt requests 8K clarity, but provider-native resolution varies.
         </Card>
       </div>
       <div className="xl:col-span-2 space-y-4">

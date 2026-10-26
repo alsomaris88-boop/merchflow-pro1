@@ -38,7 +38,7 @@ from pydantic import BaseModel, Field
 
 from . import browser, db, elite_tools, gemini_cdp, gemini_pool, image_lab, output_store, p2p_batches, trademark_shield, trends_local
 
-WORKER_VERSION = "2.5.6-zero-disk-choke"
+WORKER_VERSION = "2.5.7-native-first-two-slot"
 
 OUT_DIR = Path(os.environ.get("MERCHFLOW_OUT") or (Path(__file__).resolve().parents[2] / "output")).resolve()
 OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -406,6 +406,8 @@ async def process(req: ProcessReq) -> JSONResponse:
         raise
     except FileNotFoundError as exc:
         return JSONResponse({"ok": False, "reason": str(exc)}, status_code=404)
+    except ValueError as exc:
+        return JSONResponse({"ok": False, "reason": str(exc)}, status_code=422)
     except Exception as exc:
         return JSONResponse({"ok": False, "reason": str(exc)}, status_code=500)
 

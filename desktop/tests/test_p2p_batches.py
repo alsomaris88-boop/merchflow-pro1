@@ -5,6 +5,7 @@ claimed by this suite. The production mock switch remains blocked.
 """
 import io
 import json
+import os
 from pathlib import Path
 import threading
 import time
@@ -17,6 +18,11 @@ import pytest
 from fastapi.testclient import TestClient
 
 from desktop.worker import gemini_pool, image_lab, output_store, p2p_batches
+
+
+def test_slot_default_is_two_and_environment_override_is_bounded():
+    expected = max(1, min(32, int(os.environ.get("MERCHFLOW_GEMINI_SLOTS_PER_ACCOUNT", "2"))))
+    assert gemini_pool.SLOTS_PER_ACCOUNT == expected
 
 
 def reference_png():
@@ -34,6 +40,7 @@ def worker(tmp_path, monkeypatch):
     monkeypatch.setattr(module, "OUT_DIR", tmp_path / "output")
     monkeypatch.setattr(module.db, "DB_PATH", tmp_path / "app.sqlite")
     module.db.init()
+    monkeypatch.setattr(gemini_pool, "TAB_LAUNCH_STAGGER_SECONDS", 0.0)
     pool = gemini_pool.AccountPool()
     pool.accounts = [gemini_pool.AccountState(id=i, status="ready", is_pro=True) for i in (1, 2, 3)]
     monkeypatch.setattr(gemini_pool, "POOL", pool)
@@ -98,7 +105,7 @@ def finish(client, batch_id):
 
 
 @pytest.mark.parametrize("size", [1, 5, 20, 101])
-def test_dynamic_batches_archive_every_real_print_before_success_and_without_browser_download(worker, size):
+def test_dynamic_batches_archive_every_native_provider_image_before_success(worker, size):
     client, module, pool, metrics = worker
     batch_id = create_upload_start(client, size, colour="#FFFFFF")
     # No SSE subscription and no active Pixel component is required to finish.
@@ -111,11 +118,14 @@ def test_dynamic_batches_archive_every_real_print_before_success_and_without_bro
     assert all(r["batchId"] == batch_id and r["lossless"] for r in history)
     for record in history:
         path = Path(record["path"])
-        assert path.parent == module.OUT_DIR and path.name.startswith("p2p_same-design_")
+        assert path.parent == module.OUT_DIR and path.name.startswith("p2p_same-design_50x60_")
+        assert record["nativeW"] == record["w"] == 50
+        assert record["nativeH"] == record["h"] == 60
+        assert record["upscaled"] is False
         assert record["bytes"] == path.stat().st_size < 25_000_000
         assert Path(record["previewPath"]).is_file()
         with Image.open(path) as image:
-            assert image.size == (4500, 5400) and image.mode == "RGBA"
+            assert image.size == (50, 60) and image.mode == "RGBA"
             assert image.info["dpi"] == pytest.approx((300, 300), abs=0.02)
     events = []
     cursor = 0
@@ -159,7 +169,7 @@ def test_archive_failure_is_not_retried_at_provider_or_reported_as_saved(worker,
     client, module, pool, metrics = worker
     def fail(*args, **kwargs):
         raise OSError("Disk full fixture")
-    monkeypatch.setattr(output_store, "save_vips_print", fail)
+    monkeypatch.setattr(output_store, "save_vips_image", fail)
     result = finish(client, create_upload_start(client, 2))
     assert result["completed"] == 0 and result["failed"] == 2
     assert len(metrics["calls"]) == 2
@@ -473,6 +483,21 @@ def test_sibling_quota_cooldown_cannot_be_cleared_by_successful_inflight_render(
     assert pool.accounts[account.id-1].window_usage>=gemini_pool.WINDOW_CAP
     assert not pool._busy
 
+
+
+def test_acquiring_an_additional_same_account_lease_staggers_the_tab_start(worker, monkeypatch):
+    _, _, pool, _ = worker
+    pool.accounts = pool.accounts[:1]
+    monkeypatch.setattr(gemini_pool, "SLOTS_PER_ACCOUNT", 2)
+    monkeypatch.setattr(gemini_pool, "TAB_LAUNCH_STAGGER_SECONDS", 0.08)
+    first = pool.acquire(parallel=True, require_pro=True)
+    started = time.monotonic()
+    second = pool.acquire(parallel=True, require_pro=True, timeout=1)
+    assert second.id == first.id
+    assert time.monotonic() - started >= 0.07
+    assert pool._busy[first.id] == 2
+    pool.release(second.id); pool.release(first.id)
+    assert not pool._busy and not pool._tab_launch_deadlines
 
 
 def test_parallel_tabs_bypass_serial_jitter_and_share_an_immediate_deadline(worker,monkeypatch):

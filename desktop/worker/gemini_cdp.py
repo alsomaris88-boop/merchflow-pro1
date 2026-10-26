@@ -688,21 +688,49 @@ class CdpGeminiClient:
 
     def close(self) -> None:
         with self._browser_lock:
-            info = devtools_version(self.port) if (self._proc is not None or self._attached) else None
-            if info and info.get("webSocketDebuggerUrl"):
+            proc = self._proc
+            try:
                 try:
-                    s = CDPSession(info["webSocketDebuggerUrl"], timeout=3)
-                    s.send("Browser.close", timeout=5)
-                    s.close()
+                    info = devtools_version(self.port) if (proc is not None or self._attached) else None
                 except Exception:
-                    pass
-            if self._proc is not None:
-                try:
-                    self._proc.wait(timeout=8)
-                except Exception:
-                    self._proc.kill()
-            self._proc = None
-            self._attached = False
+                    info = None
+                if info and info.get("webSocketDebuggerUrl"):
+                    try:
+                        s = CDPSession(info["webSocketDebuggerUrl"], timeout=3)
+                        s.send("Browser.close", timeout=5)
+                        s.close()
+                    except Exception:
+                        pass
+                if proc is not None:
+                    try:
+                        proc.wait(timeout=3)
+                    except Exception:
+                        if IS_WIN:
+                            try:
+                                result = subprocess.run(
+                                    ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                    check=False, timeout=10,
+                                )
+                                if result.returncode != 0:
+                                    proc.kill()
+                            except Exception:
+                                try:
+                                    proc.kill()
+                                except Exception:
+                                    pass
+                        else:
+                            try:
+                                proc.kill()
+                            except Exception:
+                                pass
+                        try:
+                            proc.wait(timeout=3)
+                        except Exception:
+                            pass
+            finally:
+                self._proc = None
+                self._attached = False
 
     # ------------------------------------------------------------- page
     def _open_tab(self, port: int) -> tuple[dict, CDPSession]:

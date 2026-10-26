@@ -145,6 +145,79 @@ def test_sqlite_profile_is_restored_as_lazy_headless_cdp_worker(isolated):
 
 
 # ---------------------------------------------------------- launch contract
+def test_client_close_kills_only_its_windows_process_tree_after_graceful_wait(monkeypatch):
+    class OwnedProcess:
+        pid = 4321
+
+        def __init__(self):
+            self.wait_calls = []
+            self.killed = False
+
+        def wait(self, timeout):
+            self.wait_calls.append(timeout)
+            if len(self.wait_calls) == 1:
+                raise TimeoutError("still running")
+            return 0
+
+        def kill(self):
+            self.killed = True
+
+    proc = OwnedProcess()
+    calls = []
+    monkeypatch.setattr(gemini_cdp, "devtools_version", lambda _port: None)
+    monkeypatch.setattr(gemini_cdp, "IS_WIN", True)
+    monkeypatch.setattr(gemini_cdp.subprocess, "run", lambda args, **kwargs: (calls.append((args, kwargs)) or type("Result", (), {"returncode": 0})()))
+    client = gemini_cdp.CdpGeminiClient(73)
+    client._proc = proc
+    client._attached = True
+    client.close()
+    assert proc.wait_calls == [3, 3] and not proc.killed
+    assert calls[0][0] == ["taskkill", "/F", "/T", "/PID", "4321"]
+    assert calls[0][1]["stdout"] == gemini_cdp.subprocess.DEVNULL
+    assert calls[0][1]["stderr"] == gemini_cdp.subprocess.DEVNULL
+    assert client._proc is None and client._attached is False
+
+
+def test_client_close_falls_back_to_owned_pid_on_non_windows(monkeypatch):
+    class OwnedProcess:
+        pid = 1234
+        def __init__(self): self.wait_calls = []; self.killed = False
+        def wait(self, timeout):
+            self.wait_calls.append(timeout)
+            if len(self.wait_calls) == 1: raise TimeoutError("still running")
+            return 0
+        def kill(self): self.killed = True
+
+    proc = OwnedProcess()
+    monkeypatch.setattr(gemini_cdp, "devtools_version", lambda _port: None)
+    monkeypatch.setattr(gemini_cdp, "IS_WIN", False)
+    monkeypatch.setattr(gemini_cdp.subprocess, "run", lambda *args, **kwargs: pytest.fail("taskkill is Windows-only"))
+    client = gemini_cdp.CdpGeminiClient(74)
+    client._proc = proc
+    client.close()
+    assert proc.wait_calls == [3, 3] and proc.killed
+    assert client._proc is None and client._attached is False
+
+
+def test_client_close_still_reaps_owned_child_when_devtools_probe_errors(monkeypatch):
+    class OwnedProcess:
+        pid = 1235
+        def __init__(self): self.wait_calls = []
+        def wait(self, timeout):
+            self.wait_calls.append(timeout)
+            return 0
+        def kill(self): pytest.fail("graceful owned process should not be killed")
+
+    proc = OwnedProcess()
+    monkeypatch.setattr(gemini_cdp, "devtools_version", lambda _port: (_ for _ in ()).throw(OSError("offline")))
+    client = gemini_cdp.CdpGeminiClient(75)
+    client._proc = proc
+    client._attached = True
+    client.close()
+    assert proc.wait_calls == [3]
+    assert client._proc is None and client._attached is False
+
+
 def test_login_and_headless_launch_contract(isolated):
     udir = gemini_cdp.profile_dir(7)
     assert udir.name == "account_7" and udir.parent == gemini_cdp.PROFILES_ROOT

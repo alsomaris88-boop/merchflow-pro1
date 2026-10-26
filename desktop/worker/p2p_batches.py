@@ -137,8 +137,8 @@ def create(out_dir: Path, req: BatchRequest) -> dict:
 def _export(raw: bytes, out_dir: Path, job: dict, background: str, account: str, prompt: str, started: float) -> dict:
     import pyvips
 
-    # This graph stays lazy until pngsave writes scanlines to disk. No full-size
-    # Pillow/NumPy canvas and no returned/base64 master PNG are allocated.
+    # Archive the provider's decoded native dimensions. Do not resize, embed or
+    # materialize a print canvas here; Prepare owns final 4500x5400 expansion.
     with _EXPORT_LOCK:
         pyvips.cache_set_max(0)  # unique inputs must not accumulate in the op cache
         source = pyvips.Image.new_from_buffer(raw, "", access="sequential", fail_on="error").autorot()
@@ -152,17 +152,13 @@ def _export(raw: bytes, out_dir: Path, job: dict, background: str, account: str,
             source = source.bandjoin(maximum)
         if source.bands != 4:
             raise ValueError("Provider render could not be represented as lossless RGBA")
-        scale = min(4500 / source.width, 5400 / source.height)
-        if scale != 1:
-            source = source.premultiply(max_alpha=maximum).resize(scale, kernel="lanczos3").unpremultiply(max_alpha=maximum).cast(source.format)
-        colour = [int(background[i:i + 2], 16) * (257 if maximum == 65535 else 1) for i in (1, 3, 5)] + [maximum]
-        final = source.embed((4500 - source.width) // 2, (5400 - source.height) // 2,
-                             4500, 5400, extend="background", background=colour)
-        return output_store.save_vips_print(final, out_dir, job["name"], {
+        return output_store.save_vips_image(source, out_dir, job["name"], {
+            "source": "pixel-to-pixel", "style": "Donepixel recreation",
             "background": background, "account": account, "prompt": prompt,
             "batchId": job["batch_id"], "jobId": job["id"],
-            "nativeW": native_w, "nativeH": native_h, "upscaled": scale > 1,
-        }, ms=round((time.perf_counter() - started) * 1000))
+            "nativeW": native_w, "nativeH": native_h, "upscaled": False,
+        }, ms=round((time.perf_counter() - started) * 1000),
+           max_bytes=output_store.P2P_MAX_BYTES)
 
 
 def _run_item(out_dir: Path, batch: dict, job: dict) -> None:

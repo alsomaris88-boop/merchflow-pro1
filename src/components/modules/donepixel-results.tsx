@@ -42,7 +42,7 @@ export function DonepixelResults({ jobs, busy, canRetry, retryErrors, onRetry, s
             </> : pending ? <div className="w-full h-full p-6 flex flex-col items-center justify-center gap-5" data-testid="p2p-generating">
               <div aria-hidden="true" className="absolute inset-0 animate-pulse bg-gradient-to-br from-[#7c5aff]/15 via-white/[0.035] to-[#c9f24b]/10" />
               <div aria-hidden="true" className="relative w-3/4 space-y-4 animate-pulse"><div className="h-28 rounded-2xl bg-white/[0.07]" /><div className="h-3 rounded-full bg-white/[0.08]" /><div className="h-3 w-2/3 mx-auto rounded-full bg-white/[0.05]" /></div>
-              <div role="status" className="relative flex items-center gap-2 text-sm font-semibold text-[#d1c6ff]"><Loader2 size={17} className="animate-spin" />Generating 8K artwork...</div>
+              <div role="status" className="relative flex items-center gap-2 text-sm font-semibold text-[#d1c6ff]"><Loader2 size={17} className="animate-spin" />Generating native-resolution artwork...</div>
               <p className="relative text-[11px] text-white/45">{["requesting", "awaiting-upload", "uploading", "retry-uploading", "uploaded"].includes(job.state) ? "Preparing your reference upload" : job.state === "saving" ? "Verifying PNG + archiving to History" : "Waiting for the Gemini engine"}</p>
             </div> : failed ? <div className="p-5 w-full space-y-4 max-h-full overflow-y-auto">
               <AlertTriangle size={32} className="text-red-300" />
@@ -64,8 +64,8 @@ export function DonepixelResults({ jobs, busy, canRetry, retryErrors, onRetry, s
           <div className="p-4 space-y-3">
             <h3 className="font-semibold text-sm truncate" title={job.name}>{job.name}</h3>
             {design ? <>
-              <p className="text-[11px] text-white/45">4500 × 5400 · 300 DPI · {formatBytes(design.bytes)} · lossless RGBA</p>
-              {design.nativeW && <p className="text-[10px] text-white/40">Provider {design.nativeW} × {design.nativeH} · {design.upscaled ? "Lanczos-upscaled to print" : "aspect-fit print export"}</p>}
+              <p className="text-[11px] text-white/45">Native {design.nativeW ?? design.w} × {design.nativeH ?? design.h} · {formatBytes(design.bytes)} · lossless RGBA</p>
+              <p className="text-[10px] text-white/40">Prepare Lab expands the saved native image to the selected print canvas.</p>
               <div className="flex flex-col gap-2">
                 <a href={design.fileUrl} download={`${design.name}.png`} aria-label={`Download ${job.name}`} className="inline-flex items-center justify-center gap-2 rounded-xl px-4 py-2.5 text-[13px] font-semibold border border-white/15 bg-white/[0.05] hover:bg-white/10"><Download size={14} />Download</a>
                 <Btn variant="primary" className="justify-center" aria-label={`Send ${job.name} to Prepare Designs Lab`} onClick={() => { sendToPrepare([design.id]); setView("prepare"); }}><FlaskConical size={14} />Send to Prepare Lab</Btn>

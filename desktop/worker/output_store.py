@@ -103,6 +103,7 @@ def save_image(
             "ms": ms + round((time.perf_counter() - save_started) * 1000), "saved": True, "path": str(path), "createdAt": round(time.time() * 1000),
             "fileUrl": f"/api/bridge/designs/{design_id}",
             "previewUrl": f"/api/bridge/designs/{design_id}?preview=1",
+            **{key: metadata[key] for key in ("nativeW", "nativeH") if key in metadata},
         }
         with _connect(out_dir) as conn:
             conn.execute("INSERT INTO designs VALUES (?, ?, ?)", (design_id, record["createdAt"], json.dumps(record)))
@@ -115,41 +116,51 @@ def save_image(
         raise
 
 
-def save_vips_image(image, out_dir: Path, name: str, metadata: dict | None = None, *, ms: int = 0, compress: bool = True) -> dict:
-    """Stream a prepared libvips graph directly to a verified History PNG.
+def save_vips_image(
+    image, out_dir: Path, name: str, metadata: dict | None = None, *,
+    ms: int = 0, compress: bool = True, max_bytes: int | None = None,
+) -> dict:
+    """Stream an RGBA libvips graph directly to a verified History PNG.
 
-    Unlike :func:`save_image`, this path does not materialize the full encoded
-    master in Python memory. It is used by the desktop Prepare endpoint, which
-    returns only the saved-design record. Resampling and PNG encoding stay in
-    libvips; the browser can still fetch the exact disk-backed original later.
+    Neither native provider assets nor prepared print masters are materialized
+    as encoded Python byte strings. The actual dimensions are preserved; callers
+    choose whether to resample before saving. Optional batch metadata commits the
+    History record and P2P job success in the same SQLite transaction.
     """
     import pyvips
 
     metadata = metadata or {}
-    if image.bands != 4 or image.format != "uchar":
-        raise ValueError("Prepared print output must be 8-bit RGBA")
+    if image.bands != 4 or image.format not in {"uchar", "ushort"}:
+        raise ValueError("History PNG output must be lossless RGBA")
     if image.width < 1 or image.height < 1:
-        raise ValueError("Prepared print output has invalid dimensions")
+        raise ValueError("History PNG output has invalid dimensions")
 
+    bitdepth = 16 if image.format == "ushort" else 8
     save_started = time.perf_counter()
     out_dir = out_dir.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     design_id = uuid.uuid4().hex
-    path = out_dir / f"{safe_name(name)}_{image.width}x{image.height}_{design_id}.png"
+    stem = Path(name).stem
+    if metadata.get("source") == "pixel-to-pixel":
+        stem = f"p2p_{stem}"
+    path = out_dir / f"{safe_name(stem)}_{image.width}x{image.height}_{design_id}.png"
     temp = path.with_suffix(".png.part")
     thumb = out_dir / ".previews" / f"{design_id}.png"
     thumb_temp = thumb.with_suffix(".png.part")
     try:
         image = image.copy(xres=DPI / 25.4, yres=DPI / 25.4)
         image.pngsave(str(temp), compression=6 if compress else 1, interlace=False,
-                      palette=False, bitdepth=8, filter=248)
+                      palette=False, bitdepth=bitdepth, filter=248)
+        size = temp.stat().st_size
+        if max_bytes is not None and size >= max_bytes:
+            raise ValueError("Lossless PNG exceeds the 25 MB limit; no colours were reduced and nothing was archived")
         with temp.open("r+b") as fp:
             os.fsync(fp.fileno())
         with Image.open(temp) as check:
             if check.format != "PNG" or check.size != (image.width, image.height) or check.mode != "RGBA":
-                raise OSError("Prepared PNG dimensions, format, or RGBA mode verification failed")
+                raise OSError("History PNG dimensions, format, or RGBA mode verification failed")
             if any(abs(d - DPI) > 0.1 for d in check.info.get("dpi", (0, 0))):
-                raise OSError("Prepared PNG DPI verification failed")
+                raise OSError("History PNG DPI verification failed")
             check.verify()
         thumb.parent.mkdir(exist_ok=True)
         preview = pyvips.Image.thumbnail(str(temp), 384, height=384, size="down")
@@ -169,7 +180,7 @@ def save_vips_image(image, out_dir: Path, name: str, metadata: dict | None = Non
             "prompt": str(metadata.get("prompt", ""))[:12000],
             "account": str(metadata.get("account", "local"))[:80],
             "w": image.width, "h": image.height, "dpi": DPI,
-            "bytes": path.stat().st_size,
+            "bytes": size,
             "ms": ms + round((time.perf_counter() - save_started) * 1000),
             "saved": True, "path": str(path), "previewPath": str(thumb),
             "createdAt": round(time.time() * 1000),
@@ -178,11 +189,21 @@ def save_vips_image(image, out_dir: Path, name: str, metadata: dict | None = Non
             "lossless": True, "mode": "RGBA", "encoder": "libvips-png",
             **{key: metadata[key] for key in (
                 "upscaled", "upscaleFactor", "cutoutMode", "detectedBg", "resizeForPrint",
+                "nativeW", "nativeH", "batchId", "jobId",
             ) if key in metadata},
         }
         with _connect(out_dir) as conn:
             conn.execute("INSERT INTO designs VALUES (?, ?, ?)",
                          (design_id, record["createdAt"], json.dumps(record)))
+            if metadata.get("batchId") and metadata.get("jobId"):
+                updated = conn.execute(
+                    "UPDATE p2p_jobs SET state='succeeded', design_id=?, ms=? "
+                    "WHERE id=? AND batch_id=? AND state='saving'",
+                    (design_id, ms, metadata["jobId"], metadata["batchId"]),
+                )
+                if updated.rowcount != 1:
+                    raise RuntimeError("Batch job state changed before archive; transaction rolled back")
+                publish_event(conn, {"type": "p2p.updated", "batchId": metadata["batchId"]})
             publish_event(conn, {"type": "design.saved", "design": record})
         return record
     except Exception:
