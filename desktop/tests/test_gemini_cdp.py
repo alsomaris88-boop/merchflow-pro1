@@ -573,7 +573,7 @@ def test_silent_paste_waits_for_editable_composer_dom(live):
         session.close();gemini_cdp.close_page(port,target["id"])
 
 
-def test_silent_paste_gives_up_after_five_seconds_when_composer_stays_unavailable(live):
+def test_silent_paste_gives_up_after_timeout_when_composer_stays_unavailable(live):
     _,pool,root=live
     client=signed_in_profile(pool)
     source=root/"missing-composer.png"
@@ -588,10 +588,11 @@ def test_silent_paste_gives_up_after_five_seconds_when_composer_stays_unavailabl
           return true;
         """))
         assert disabled
+        assert inspect.signature(gemini_cdp._paste_image).parameters["timeout"].default == 12.0
         started=time.monotonic()
-        assert not gemini_cdp._paste_image(session,source)
+        assert not gemini_cdp._paste_image(session,source,timeout=1.1)
         elapsed=time.monotonic()-started
-        assert 4.8 <= elapsed < 6
+        assert 0.95 <= elapsed < 2
         assert session.evaluate("window.__fixtureDelivery.paste") == 0
     finally:
         session.close();gemini_cdp.close_page(port,target["id"])

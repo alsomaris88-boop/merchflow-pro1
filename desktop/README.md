@@ -26,7 +26,7 @@ This release changes both the Python worker and the Prepare Lab UI. Pull/replace
 the worker source and rebuild the static UI with `npm ci && npm run build:desktop`;
 copy the generated `out/` to the Windows package, stop its old engine/app window,
 run `run_windows.bat`, and reload. `/api/health` identifies the worker as
-**`2.5.5-history-direct-disk`** and reports the parallel/tab limits.
+**`2.5.6-zero-disk-choke`** and reports the parallel/tab limits.
 
 `out/` is generated and git-ignored. Do not replace genuine verified Chrome
 profiles, SQLite credentials, or existing output during an update. The end user
@@ -99,10 +99,10 @@ limit or an 80MB-per-tab guarantee. Credentials are never requested again and
 no cookie values are exported into application JSON or frontend JavaScript.
 `desktop/worker/gemini_cdp.py` drives Gemini's normal chat input:
 
-1. Read each real reference on the server, sniff its actual image MIME without
-   converting/recompressing the pixels, Base64 it in memory, reconstruct a
-   `File`/`DataTransfer`, wait up to five seconds for `promptEditor()` to resolve
-   to a live `isContentEditable` composer, then dispatch `ClipboardEvent('paste')`
+1. Sniff each real reference's actual MIME without converting/recompressing
+   pixels, poll every 350ms for up to twelve seconds until `promptEditor()` is a
+   live `isContentEditable` composer, then read/Base64 the bytes once in memory,
+   reconstruct a `File`/`DataTransfer`, and dispatch `ClipboardEvent('paste')`
    through `Runtime.evaluate`. No OS clipboard read/write,
    upload menu, Images pill, file-input setter, native file chooser or visible
    generation window is used.
@@ -222,10 +222,14 @@ before optional scaling.
 The local `/api/bridge/process` path builds and writes its final RGBA PNG through
 libvips to disk, verifies dimensions, alpha-capable mode and DPI, and then
 registers the saved file in History; it does not return an archive-sized PNG
-buffer to the UI. The pipeline still loads the source/cutout and uses OpenCV for
-the final alpha choke, so RAM and latency vary with image size and machine—no
-18MB peak-memory claim is made. The multi-file queue retains every input, even
-50+, and processes one complete design at a time; each failure stays isolated.
+buffer to the UI. The final-resolution OpenCV alpha choke is one in-memory
+operation with no temporary raw mask file, avoiding Windows rawload file-handle
+races. Source RGBA and the full-frame eroded-alpha mask stay alive until the PNG
+write completes, so peak RAM scales with the final dimensions (and can be large
+when 4×/8× is selected); the earlier 18MB estimate is not claimed. PNG masters
+use compression level 6, still lossless RGBA with no palette quantization. The
+multi-file queue retains every input, even 50+, and processes one complete
+design at a time; each failure stays isolated.
 
 When a design is sent from History, Prepare posts its `designId` and settings,
 not the original file bytes. The worker resolves the ID against SQLite, validates

@@ -134,6 +134,20 @@ def test_streaming_prepare_fails_closed_without_libvips(tmp_path, monkeypatch):
     assert output_store.list_designs(tmp_path) == []
 
 
+def test_vips_alpha_choke_returns_its_in_memory_mask_and_correctly_erodes_rgba():
+    if not image_lab.HAS_VIPS or not image_lab.HAS_CV:
+        pytest.skip("Requires native libvips and OpenCV")
+    source = Image.new("RGBA", (7, 7), (120, 40, 200, 255))
+    vips_source, source_bytes = image_lab._vips_from_image(source)
+    result, mask_bytes, coverage = image_lab._vips_choke_alpha(vips_source, 1)
+    assert isinstance(source_bytes, bytes) and len(source_bytes) == 7 * 7 * 4
+    assert isinstance(mask_bytes, bytes) and len(mask_bytes) == 7 * 7
+    with Image.frombytes("RGBA", (7, 7), bytes(result.write_to_memory())) as output:
+        assert output.getpixel((0, 0))[3] == 0
+        assert output.getpixel((3, 3)) == (120, 40, 200, 255)
+    assert 0 < coverage < 100
+
+
 def test_streaming_prepare_exports_verified_print_png_without_materializing_return_bytes(tmp_path, monkeypatch):
     if not image_lab.HAS_VIPS:
         pytest.skip("Requires native libvips")

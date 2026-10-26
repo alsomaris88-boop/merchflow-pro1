@@ -5,7 +5,7 @@
 Built on published `bba33c8740c0b5b38f9d76609ad72b7094ad33d8`, retaining its
 10-worker dynamic Donepixel scheduling, multi-tab Gemini pool, and all
 `b2e2361` silent-paste/original-only/no-false-cooldown contracts. Worker identity:
-`2.5.5-history-direct-disk`.
+`2.5.6-zero-disk-choke`.
 
 - Headless generation Chrome receives the requested background/render flags;
   visible account-login Chrome does not. Unit tests assert the launch contract
@@ -22,32 +22,40 @@ Built on published `bba33c8740c0b5b38f9d76609ad72b7094ad33d8`, retaining its
   (4500×5400, 300 DPI, 350px collar margin). Keep-holes and everywhere are
   tested across black, white, orange, navy and lime backgrounds. Without AI
   never invokes rembg; With AI retains the real rembg path.
-- The desktop process endpoint streams final sizing/PNG encoding through libvips
-  to disk and fails closed rather than reverting to Pillow if the native runtime
-  is missing. OpenCV's 1–2px final alpha choke is tiled in 128-row strips, retaining
-  the actual OpenCV operation without a full-resolution Python RGBA output copy.
-  Lanczos 2×/4×/8× options are ordinary resampling, not learned super-resolution.
+- The desktop process endpoint streams final PNG encoding through libvips and
+  fails closed rather than reverting to Pillow if the native runtime is missing.
+  The final OpenCV 1–2px alpha choke now uses one in-memory mask operation with
+  no temporary `.raw` mask file; this removes the libvips file-handle race on
+  Windows. The RGBA source and full-resolution eroded-alpha mask remain live
+  through the write, so peak RAM scales with output dimensions (especially when
+  upscaling); 18MB is not claimed. Master PNG compression is level 6 and remains
+  lossless RGBA. Lanczos 2×/4×/8× is ordinary resampling, not AI super-resolution.
 - History→Prepare now sends only `designId`, name and settings; the worker
   validates its SQLite-backed path and reads the original PNG from disk. The
   Prepare display uses the small preview, and an E2E assertion confirms the
   browser neither requests the full original nor posts an `image`/Base64 field.
   Uploaded local files retain their existing upload path.
-- CDP paste waits up to five seconds for a live editable composer before
-  dispatch. Chromium fixture tests cover a delayed-render success and the timeout.
-- A local 4500×5400 flat-color cutout benchmark measured **1.2377s** for the
-  border-color step in this container. This is not the proposed 0.03s target.
-  Similarly, total end-to-end peak RAM was not measured and an 18MB whole-pipeline
-  claim is not made. Very large upscale outputs can take substantial time/disk.
+- CDP paste polls every 350ms for up to 12 seconds for a live editable composer
+  before dispatch. Chromium fixture tests cover delayed-render success and timeout.
+- In this sandbox, a synthetic full 4500×5400 Without AI Prepare run with level-6
+  PNG compression measured **2.427s** and produced a 128,625-byte PNG; compression
+  level 1 measured 2.083s / 975,167 bytes on the same simple fixture. This does
+  not substantiate the promised <1.5s or 10× improvement on production designs.
+  The earlier border-detection-only measurement was 1.2377s (not the proposed
+  0.03s goal). Peak process RSS for
+  the level-6 run was **832,044 KiB**, including Python, ONNX/runtime and imaging
+  library imports; this is not a clean per-pipeline RAM measurement. The 18MB
+  claim is not made, and large 4×/8× outputs can require substantial RAM/disk.
 - The static UI export and normal Next production build passed; History→Prepare
   handoff was covered by the full static-worker browser run.
 
 Validation results:
 
-- **185 Python passed, 1 opt-in test skipped** (448.45s; one Starlette/httpx
+- **186 Python passed, 1 opt-in test skipped** (451.08s; one Starlette/httpx
   deprecation warning). This includes 46 real Chromium CDP fixture tests.
 - **26 TypeScript unit tests passed.** ESLint, typecheck, compileall and
   `git diff --check` passed.
-- **20 Chromium E2E tests passed** (4.1m), including the isolated local fixture
+- **20 Chromium E2E tests passed** (3.7m), including the isolated local fixture
   provider, Retry, strict failure states, a direct-disk History/Prepare handoff
   with no original browser fetch, and a 55-file real libvips/disk/SQLite/ZIP run.
   No live Gemini/paid rendering or native-Windows production smoke was used.

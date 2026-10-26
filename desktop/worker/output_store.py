@@ -141,7 +141,7 @@ def save_vips_image(image, out_dir: Path, name: str, metadata: dict | None = Non
     thumb_temp = thumb.with_suffix(".png.part")
     try:
         image = image.copy(xres=DPI / 25.4, yres=DPI / 25.4)
-        image.pngsave(str(temp), compression=9 if compress else 1, interlace=False,
+        image.pngsave(str(temp), compression=6 if compress else 1, interlace=False,
                       palette=False, bitdepth=8, filter=248)
         with temp.open("r+b") as fp:
             os.fsync(fp.fileno())

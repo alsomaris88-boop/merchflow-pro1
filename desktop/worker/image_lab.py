@@ -10,7 +10,6 @@ from __future__ import annotations
 import io
 import math
 import os
-import tempfile
 import threading
 import time
 from pathlib import Path
@@ -244,60 +243,39 @@ def _coverage(image: Image.Image) -> float:
 
 
 def _vips_from_image(image: Image.Image):
-    """Create a sequential libvips source without a raw full-frame byte copy."""
+    """Wrap a lossless RGBA buffer directly for the streaming libvips graph."""
     if not HAS_VIPS:
         raise RuntimeError("Streaming Prepare export requires native libvips")
-    buffer = io.BytesIO()
-    image.save(buffer, "PNG", compress_level=1)
-    payload = buffer.getvalue()
-    # Alpha-choke/coverage passes revisit the small cutout source before the
-    # final sequential PNG write, so request random source access here; the
-    # output graph and encoder still stream scanlines to disk.
-    source = pyvips.Image.new_from_buffer(payload, "", access="random", fail_on="error")
+    raw_rgba = image.tobytes()
+    source = pyvips.Image.new_from_memory(raw_rgba, image.width, image.height, 4, "uchar").copy(interpretation="srgb")
     if source.bands != 4 or source.format != "uchar":
         raise ValueError("Prepare source could not be represented as lossless RGBA")
-    return source, buffer
+    # new_from_memory borrows this buffer; retain it until the output PNG has
+    # finished evaluating the graph.
+    return source, raw_rgba
 
 
 def _vips_choke_alpha(image, pixels: int):
-    """Apply the OpenCV choke in bounded row tiles to the final-size alpha.
+    """Apply one OpenCV erosion to an in-memory final-resolution alpha mask.
 
-    The 1–2 px halo around each tile makes its erosion identical to a whole
-    image pass, including transparent outer edges. Only the alpha mask is
-    materialized a few rows at a time; RGB and the final PNG remain libvips
-    graphs streamed to disk. The temporary raw alpha file is removed by the
-    caller after the PNG save completes.
+    The mask buffer stays alive alongside the lazy libvips graph until the PNG
+    has been written. This avoids Windows file-handle races from rawload-backed
+    temporary masks. Memory use scales with the full output alpha dimensions.
     """
     if cv2 is None:
         raise RuntimeError("Alpha choke requires opencv-python-headless")
     pixels = max(1, min(2, int(pixels)))
-    tile_rows = 128
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (pixels * 2 + 1, pixels * 2 + 1))
-    histogram = np.zeros(256, dtype=np.uint64)
-    temp = tempfile.NamedTemporaryFile(prefix="merchflow-alpha-", suffix=".raw", delete=False)
-    mask_path = Path(temp.name)
-    temp.close()
-    try:
-        alpha_band = image.extract_band(3)
-        with mask_path.open("wb") as mask_file:
-            for y in range(0, image.height, tile_rows):
-                rows = min(tile_rows, image.height - y)
-                y0 = max(0, y - pixels)
-                y1 = min(image.height, y + rows + pixels)
-                tile_raw = alpha_band.crop(0, y0, image.width, y1 - y0).write_to_memory()
-                tile = np.frombuffer(tile_raw, dtype=np.uint8).reshape(y1 - y0, image.width)
-                eroded = cv2.erode(tile, kernel, iterations=1,
-                                   borderType=cv2.BORDER_CONSTANT, borderValue=0)
-                core = eroded[y - y0:y - y0 + rows]
-                mask_file.write(core.tobytes())
-                histogram += np.bincount(core.reshape(-1), minlength=256).astype(np.uint64)
-        mask = pyvips.Image.rawload(str(mask_path), image.width, image.height, 1, format="uchar")
-        result = image.extract_band(0, n=3).bandjoin(mask).copy(interpretation="srgb")
-        coverage = round(float(histogram[17:].sum()) / (image.width * image.height) * 100, 1)
-        return result, mask_path, coverage
-    except Exception:
-        mask_path.unlink(missing_ok=True)
-        raise
+
+    alpha_raw = image.extract_band(3).write_to_memory()
+    alpha = np.frombuffer(alpha_raw, dtype=np.uint8).reshape(image.height, image.width)
+    eroded = cv2.erode(alpha, kernel, iterations=1,
+                       borderType=cv2.BORDER_CONSTANT, borderValue=0)
+    eroded_bytes = eroded.tobytes()
+    mask = pyvips.Image.new_from_memory(eroded_bytes, image.width, image.height, 1, "uchar")
+    result = image.extract_band(0, n=3).bandjoin(mask).copy(interpretation="srgb")
+    coverage = round(float(np.count_nonzero(eroded > 16)) / (image.width * image.height) * 100, 1)
+    return result, eroded_bytes, coverage
 
 
 def _vips_coverage(image) -> float:
@@ -377,10 +355,10 @@ def _prepare(raw: bytes, settings: dict, out_dir: Path, name: str, metadata: dic
         if upscale_factor > 1:
             final = (final.premultiply().resize(upscale_factor, kernel="lanczos3")
                      .unpremultiply().cast("uchar"))
-        mask_path = None
+        mask_bytes = None
         try:
             if remove:
-                final, mask_path, coverage = _vips_choke_alpha(final, int(settings.get("defringe", 1)))
+                final, mask_bytes, coverage = _vips_choke_alpha(final, int(settings.get("defringe", 1)))
             else:
                 coverage = _vips_coverage(final)
             bg = str((metadata or {}).get("background", "transparent"))
@@ -403,9 +381,7 @@ def _prepare(raw: bytes, settings: dict, out_dir: Path, name: str, metadata: dic
                 compress=bool(settings.get("compress", True)),
             )
         finally:
-            if mask_path is not None:
-                mask_path.unlink(missing_ok=True)
-            del source_buffer
+            del mask_bytes, source_buffer
     else:
         placed = vips_resize(image, dw, dh)
         if resize_for_print:

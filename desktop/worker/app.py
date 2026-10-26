@@ -38,7 +38,7 @@ from pydantic import BaseModel, Field
 
 from . import browser, db, elite_tools, gemini_cdp, gemini_pool, image_lab, output_store, p2p_batches, trademark_shield, trends_local
 
-WORKER_VERSION = "2.5.5-history-direct-disk"
+WORKER_VERSION = "2.5.6-zero-disk-choke"
 
 OUT_DIR = Path(os.environ.get("MERCHFLOW_OUT") or (Path(__file__).resolve().parents[2] / "output")).resolve()
 OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -384,7 +384,7 @@ async def recreate_stream(req: GenerateReq) -> StreamingResponse:
 
 class ProcessReq(BaseModel):
     designId: str = Field(default="", max_length=100)
-    image: str = ""
+    image: str = Field(default="")
     name: str = Field(default="lab-design", max_length=160)
     settings: dict = Field(default_factory=dict)
 

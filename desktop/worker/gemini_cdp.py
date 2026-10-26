@@ -556,11 +556,12 @@ def _hint(text: str, hints: tuple[str, ...]) -> bool:
     return any(h in low for h in hints)
 
 
-def _paste_image(s: CDPSession, path: Path) -> bool:
-    """Stage one real reference in page memory and dispatch paste, never OS clipboard.
+def _paste_image(s: CDPSession, path: Path, timeout: float = 12.0) -> bool:
+    """Wait for a live composer, then dispatch one real reference paste.
 
-    Dispatch is not acceptance: _attach separately requires a genuine thumbnail.
-    Actual image MIME is sniffed; a JPEG named concept-reference.png stays JPEG.
+    Readiness polls carry only a small script; the image's Base64 payload is
+    sent once after the Angular composer is editable. Dispatch is not
+    acceptance: _attach separately requires a genuine thumbnail.
     """
     from PIL import Image
 
@@ -568,32 +569,39 @@ def _paste_image(s: CDPSession, path: Path) -> bool:
         mime = Image.MIME.get(image.format, "")
     if not mime.startswith("image/"):
         return False
+
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    readiness = _js("""
+      const ed = promptEditor();
+      return !!(ed && ed.isContentEditable);
+    """)
+    while time.monotonic() < deadline:
+        remaining = deadline - time.monotonic()
+        if bool(s.evaluate(readiness, timeout=min(UPLOAD_TIMEOUT, max(1.0, remaining)))):
+            break
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(0.35, remaining))
+    else:
+        return False
+
     b64 = base64.b64encode(path.read_bytes()).decode("ascii")
     body = r"""
-      return new Promise((resolve) => {
-        const deadline = performance.now() + 5000;
-        const dispatchWhenReady = () => {
-          if (performance.now() >= deadline) return resolve(false);
-          const ed = promptEditor();
-          if (!ed || !ed.isContentEditable) {
-            return setTimeout(dispatchWhenReady, 50);
-          }
-          try {
-            const bin = atob(%s), arr = new Uint8Array(bin.length);
-            for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
-            const file = new File([arr],%s,{type:%s});
-            const dt = new DataTransfer(); dt.items.add(file);
-            const pending = {editor:ed,transfer:dt,handled:false,dropDispatched:false};
-            window.__merchflowClipboard = pending;
-            ed.focus();
-            const event = new ClipboardEvent('paste',{bubbles:true,cancelable:true,clipboardData:dt});
-            ed.dispatchEvent(event);
-            pending.handled = event.defaultPrevented;
-            resolve(true);
-          } catch (_) { delete window.__merchflowClipboard; resolve(false); }
-        };
-        dispatchWhenReady();
-      });
+      try {
+        const ed = promptEditor(); if (!ed || !ed.isContentEditable) return false;
+        const bin = atob(%s), arr = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+        const file = new File([arr],%s,{type:%s});
+        const dt = new DataTransfer(); dt.items.add(file);
+        const pending = {editor:ed,transfer:dt,handled:false,dropDispatched:false};
+        window.__merchflowClipboard = pending;
+        ed.focus();
+        const event = new ClipboardEvent('paste',{bubbles:true,cancelable:true,clipboardData:dt});
+        ed.dispatchEvent(event);
+        pending.handled = event.defaultPrevented;
+        return true;
+      } catch (_) { delete window.__merchflowClipboard; return false; }
     """ % (json.dumps(b64), json.dumps(path.name), json.dumps(mime))
     return bool(s.evaluate(_js(body), timeout=UPLOAD_TIMEOUT))
 

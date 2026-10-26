@@ -8,6 +8,7 @@
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
     "build:desktop": "node scripts/build-desktop.mjs",
+    "test": "npm run test:unit",
     "test:unit": "tsx --test tests/unit/*.test.ts",
     "test:e2e": "playwright test",
     "test:python": "python -m pytest desktop/tests -q"
