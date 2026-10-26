@@ -79,6 +79,40 @@ test("55 real print PNGs are queued sequentially, streamed in one ZIP, and hande
   await expect(page.getByText(`${prefix}`, { exact: true }).first()).toBeVisible();
 });
 
+test("History designs reach Prepare by ID without a full-resolution browser fetch or Base64 payload", async ({ page, request }) => {
+  test.skip(process.env.MERCHFLOW_E2E_REAL_WORKER !== "1", "Requires a running real FastAPI worker");
+  test.setTimeout(90000);
+  const name = `history-direct-${Date.now()}`;
+  const buffer = await readFile(fixture);
+  const savedResponse = await request.post("/api/bridge/designs", {
+    data: { image: `data:image/png;base64,${buffer.toString("base64")}`, name },
+  });
+  expect(savedResponse.status()).toBe(200);
+  const original = (await savedResponse.json()).design as { id: string; fileUrl: string };
+  const originalPath = new URL(original.fileUrl, "http://fixture.invalid").pathname;
+  let fetchedOriginal = false;
+  let processPayload: Record<string, unknown> | undefined;
+  page.on("request", (req) => {
+    const url = new URL(req.url());
+    if (url.pathname === originalPath && !url.searchParams.has("preview")) fetchedOriginal = true;
+    if (url.pathname === "/api/bridge/process" && req.method() === "POST") processPayload = req.postDataJSON() as Record<string, unknown>;
+  });
+
+  await page.goto("/");
+  await page.getByRole("button", { name: "Designs History", exact: true }).click();
+  await page.getByPlaceholder("filter by niche, style, account…").fill(name);
+  await expect(page.getByRole("button", { name: "Send to Prepare (all)", exact: true })).toBeEnabled();
+  await page.getByRole("button", { name: "Send to Prepare (all)", exact: true }).click();
+  await expect(page.getByText("Batch queue · 1", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Remove background", exact: true }).click();
+  await page.getByRole("button", { name: "Prepare designs (1)", exact: true }).click();
+  await expect(page.getByRole("button", { name: "Download all (1)", exact: true })).toBeEnabled({ timeout: 60000 });
+  expect(processPayload).toMatchObject({ designId: original.id, name, settings: expect.any(Object) });
+  expect(processPayload).not.toHaveProperty("image");
+  expect(JSON.stringify(processPayload).length).toBeLessThan(3000);
+  expect(fetchedOriginal).toBe(false);
+});
+
 test("Prepare Lab exposes the three safe defaults, mode/precision choices, and opt-in scaling", async ({ page }) => {
   await mockNoProvider(page);
   await page.goto("/");

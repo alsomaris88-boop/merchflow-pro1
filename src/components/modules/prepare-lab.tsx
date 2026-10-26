@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Check, Download, FlaskConical, FolderCheck, ImageUp, Images, Loader2, Package, PlugZap, Trash2, WifiOff, X, Zap } from "lucide-react";
 import { Btn, Card, Chip, Field, PageHead, Section, Select, Toggle, cx } from "@/components/ui";
-import { dataUrlFromUrl, probeBridge, type BridgeStatus } from "@/lib/bridge";
+import { probeBridge, type BridgeStatus } from "@/lib/bridge";
 import { HANDOFF_EVENT, announceDesignsChanged, blobToDataUrl, downloadDesignsZip, formatBytes, getDesigns, isSavedDesign, responseJson, saveDesignBlob, takePrepareHandoff, type DesignRecord } from "@/lib/designs-store";
 import { PRODUCTS, analyzeContrast, applyDistressKnockout, buildDarkVariant, canvasToBlob, computePHash, cropToArt, findDuplicates, imageToCanvas, renderProductCanvas } from "@/lib/elite-tools";
 
@@ -201,10 +201,16 @@ export default function PrepareLab() {
         setQueue((q) => q.map((i) => i.id === item.id ? { ...i, status: "running", error: undefined } : i));
         try {
           if (item.file && item.file.size > 40 * 1024 * 1024) throw new Error("Image exceeds the 40 MB per-file limit.");
-          const image = item.file ? await blobToDataUrl(item.file) : await dataUrlFromUrl(item.url);
+          let payload: { name: string; settings: Settings } & ({ designId: string } | { image: string });
+          if (item.from === "history") {
+            payload = { designId: item.id, name: item.name, settings };
+          } else {
+            if (!item.file) throw new Error("The queued upload file is no longer available.");
+            payload = { image: await blobToDataUrl(item.file), name: item.name, settings };
+          }
           const res = await fetch("/api/bridge/process", {
             method: "POST", headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ image, name: item.name, settings }),
+            body: JSON.stringify(payload),
           });
           const result = await responseJson<{ design: DesignRecord; report: { coverage?: number; specks?: number } }>(res);
           if (!isSavedDesign(result.design)) throw new Error("Engine did not verify a 300 DPI PNG on disk.");
@@ -377,7 +383,7 @@ export default function PrepareLab() {
           <div className="checkerboard border border-white/10 rounded-xl aspect-[5/6] flex items-center justify-center relative overflow-hidden">
             {(output ? current?.saved : current) ? <>
               {/* eslint-disable-next-line @next/next/no-img-element */}
-              <img src={output ? current!.saved!.previewUrl : current!.url} alt={output ? "Prepared output" : "Original input"} className="max-w-full max-h-full object-contain" />
+              <img src={output ? current!.saved!.previewUrl : (current!.thumb ?? current!.url)} alt={output ? "Prepared output" : "Original input"} className="max-w-full max-h-full object-contain" />
             </> : <span className="text-xs text-white/30">{output ? "Run the pipeline" : "Queue is empty"}</span>}
             {output && current?.status === "running" && <div className="absolute inset-0 bg-black/60 flex items-center justify-center"><Loader2 size={24} className="animate-spin text-[#b9a8ff]" /></div>}
           </div>

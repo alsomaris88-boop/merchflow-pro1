@@ -26,7 +26,7 @@ This release changes both the Python worker and the Prepare Lab UI. Pull/replace
 the worker source and rebuild the static UI with `npm ci && npm run build:desktop`;
 copy the generated `out/` to the Windows package, stop its old engine/app window,
 run `run_windows.bat`, and reload. `/api/health` identifies the worker as
-**`2.5.4-prepare-3card-streaming`** and reports the parallel/tab limits.
+**`2.5.5-history-direct-disk`** and reports the parallel/tab limits.
 
 `out/` is generated and git-ignored. Do not replace genuine verified Chrome
 profiles, SQLite credentials, or existing output during an update. The end user
@@ -101,8 +101,9 @@ no cookie values are exported into application JSON or frontend JavaScript.
 
 1. Read each real reference on the server, sniff its actual image MIME without
    converting/recompressing the pixels, Base64 it in memory, reconstruct a
-   `File`/`DataTransfer`, focus `rich-textarea [contenteditable="true"]` and dispatch
-   `ClipboardEvent('paste')` through `Runtime.evaluate`. No OS clipboard read/write,
+   `File`/`DataTransfer`, wait up to five seconds for `promptEditor()` to resolve
+   to a live `isContentEditable` composer, then dispatch `ClipboardEvent('paste')`
+   through `Runtime.evaluate`. No OS clipboard read/write,
    upload menu, Images pill, file-input setter, native file chooser or visible
    generation window is used.
 2. **Gate 1** verifies exactly the expected new, loaded reference thumbnails in
@@ -225,7 +226,13 @@ buffer to the UI. The pipeline still loads the source/cutout and uses OpenCV for
 the final alpha choke, so RAM and latency vary with image size and machine—no
 18MB peak-memory claim is made. The multi-file queue retains every input, even
 50+, and processes one complete design at a time; each failure stays isolated.
-ZIP export streams saved PNGs from disk.
+
+When a design is sent from History, Prepare posts its `designId` and settings,
+not the original file bytes. The worker resolves the ID against SQLite, validates
+its disk-backed record, then reads the PNG directly from the configured output
+directory. The browser uses only the small History preview for display—no
+14MB-original fetch or 20MB Base64 round trip. Local user uploads continue to
+send their original File contents. ZIP export streams saved PNGs from disk.
 
 **Download all (N)** obtains a short-lived download ticket and streams one ZIP64
 archive from disk to the browser download manager. The worker copies in 256 KB

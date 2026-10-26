@@ -104,6 +104,42 @@ def test_prepare_api_uses_streamed_libvips_save_and_returns_verified_history_rec
         assert output.info["dpi"] == pytest.approx((300, 300), abs=0.02)
 
 
+def test_prepare_api_processes_history_design_from_worker_disk_by_id(worker):
+    client, module = worker
+    saved_response = client.post("/api/bridge/designs", json={
+        "image": image_data(), "name": "original-history-design",
+    })
+    assert saved_response.status_code == 200, saved_response.text
+    original = saved_response.json()["design"]
+    original_bytes = Path(original["path"]).read_bytes()
+
+    # No image/Base64 field: the worker resolves the registered ID and reads
+    # the original PNG from its own disk before running the normal pipeline.
+    response = client.post("/api/bridge/process", json={
+        "designId": original["id"], "name": "history-direct-process",
+        "settings": {"remove": False, "resizeForPrint": False, "despeckle": False},
+    })
+    assert response.status_code == 200, response.text
+    body = response.json()
+    processed = body["design"]
+    assert processed["id"] != original["id"]
+    assert processed["w"] == 64 and processed["h"] == 40
+    assert body["report"]["engine"] == "pyvips-streaming"
+    assert Path(processed["path"]).is_file()
+    assert Path(original["path"]).read_bytes() == original_bytes
+    assert len(output_store.list_designs(module.OUT_DIR)) == 2
+
+
+def test_prepare_api_returns_not_found_for_unknown_history_design_id(worker):
+    client, _ = worker
+    response = client.post("/api/bridge/process", json={
+        "designId": "does-not-exist",
+        "settings": {"remove": False},
+    })
+    assert response.status_code == 404
+    assert "not in history" in response.json()["reason"]
+
+
 def test_no_authenticated_provider_never_creates_a_design(worker):
     client, module = worker
     payload = {"styleImage": image_data(), "nicheImages": [{"id": "one", "image": image_data()}]}

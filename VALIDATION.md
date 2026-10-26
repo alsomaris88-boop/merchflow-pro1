@@ -5,7 +5,7 @@
 Built on published `bba33c8740c0b5b38f9d76609ad72b7094ad33d8`, retaining its
 10-worker dynamic Donepixel scheduling, multi-tab Gemini pool, and all
 `b2e2361` silent-paste/original-only/no-false-cooldown contracts. Worker identity:
-`2.5.4-prepare-3card-streaming`.
+`2.5.5-history-direct-disk`.
 
 - Headless generation Chrome receives the requested background/render flags;
   visible account-login Chrome does not. Unit tests assert the launch contract
@@ -27,6 +27,13 @@ Built on published `bba33c8740c0b5b38f9d76609ad72b7094ad33d8`, retaining its
   is missing. OpenCV's 1–2px final alpha choke is tiled in 128-row strips, retaining
   the actual OpenCV operation without a full-resolution Python RGBA output copy.
   Lanczos 2×/4×/8× options are ordinary resampling, not learned super-resolution.
+- History→Prepare now sends only `designId`, name and settings; the worker
+  validates its SQLite-backed path and reads the original PNG from disk. The
+  Prepare display uses the small preview, and an E2E assertion confirms the
+  browser neither requests the full original nor posts an `image`/Base64 field.
+  Uploaded local files retain their existing upload path.
+- CDP paste waits up to five seconds for a live editable composer before
+  dispatch. Chromium fixture tests cover a delayed-render success and the timeout.
 - A local 4500×5400 flat-color cutout benchmark measured **1.2377s** for the
   border-color step in this container. This is not the proposed 0.03s target.
   Similarly, total end-to-end peak RAM was not measured and an 18MB whole-pipeline
@@ -36,14 +43,14 @@ Built on published `bba33c8740c0b5b38f9d76609ad72b7094ad33d8`, retaining its
 
 Validation results:
 
-- **181 Python passed, 1 opt-in test skipped** (542.60s; one Starlette/httpx
-  deprecation warning).
+- **185 Python passed, 1 opt-in test skipped** (448.45s; one Starlette/httpx
+  deprecation warning). This includes 46 real Chromium CDP fixture tests.
 - **26 TypeScript unit tests passed.** ESLint, typecheck, compileall and
   `git diff --check` passed.
-- **19 Chromium E2E tests passed** (5.3m), including the isolated local fixture
-  provider, Retry, strict failure states, History/Prepare handoff and a 55-file
-  real libvips/disk/SQLite/ZIP Prepare run. No live Gemini/paid rendering or
-  native-Windows production smoke was used.
+- **20 Chromium E2E tests passed** (4.1m), including the isolated local fixture
+  provider, Retry, strict failure states, a direct-disk History/Prepare handoff
+  with no original browser fetch, and a 55-file real libvips/disk/SQLite/ZIP run.
+  No live Gemini/paid rendering or native-Windows production smoke was used.
 
 ## Retained baseline: 10× dynamic Donepixel workers and concurrent Gemini tabs
 

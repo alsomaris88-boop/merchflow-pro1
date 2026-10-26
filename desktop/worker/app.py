@@ -38,7 +38,7 @@ from pydantic import BaseModel, Field
 
 from . import browser, db, elite_tools, gemini_cdp, gemini_pool, image_lab, output_store, p2p_batches, trademark_shield, trends_local
 
-WORKER_VERSION = "2.5.4-prepare-3card-streaming"
+WORKER_VERSION = "2.5.5-history-direct-disk"
 
 OUT_DIR = Path(os.environ.get("MERCHFLOW_OUT") or (Path(__file__).resolve().parents[2] / "output")).resolve()
 OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -383,7 +383,8 @@ async def recreate_stream(req: GenerateReq) -> StreamingResponse:
 
 
 class ProcessReq(BaseModel):
-    image: str
+    designId: str = Field(default="", max_length=100)
+    image: str = ""
     name: str = Field(default="lab-design", max_length=160)
     settings: dict = Field(default_factory=dict)
 
@@ -392,13 +393,19 @@ class ProcessReq(BaseModel):
 @app.post("/api/bridge/process")
 async def process(req: ProcessReq) -> JSONResponse:
     try:
-        raw = _decode(req.image)
+        if req.designId:
+            record = await asyncio.to_thread(output_store.get_design, OUT_DIR, req.designId)
+            raw = await asyncio.to_thread(Path(record["path"]).read_bytes)
+        else:
+            raw = _decode(req.image)
         _, report = await asyncio.to_thread(
             image_lab.process_design, raw, req.settings, OUT_DIR, req.name, return_bytes=False,
         )
         return JSONResponse({"ok": True, "design": report["design"], "report": report})
     except HTTPException:
         raise
+    except FileNotFoundError as exc:
+        return JSONResponse({"ok": False, "reason": str(exc)}, status_code=404)
     except Exception as exc:
         return JSONResponse({"ok": False, "reason": str(exc)}, status_code=500)
 

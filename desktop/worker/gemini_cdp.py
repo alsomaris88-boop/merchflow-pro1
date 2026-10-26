@@ -570,20 +570,30 @@ def _paste_image(s: CDPSession, path: Path) -> bool:
         return False
     b64 = base64.b64encode(path.read_bytes()).decode("ascii")
     body = r"""
-      try {
-        const ed = promptEditor(); if (!ed || !ed.isContentEditable) return false;
-        const bin = atob(%s), arr = new Uint8Array(bin.length);
-        for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
-        const file = new File([arr],%s,{type:%s});
-        const dt = new DataTransfer(); dt.items.add(file);
-        const pending = {editor:ed,transfer:dt,handled:false,dropDispatched:false};
-        window.__merchflowClipboard = pending;
-        ed.focus();
-        const event = new ClipboardEvent('paste',{bubbles:true,cancelable:true,clipboardData:dt});
-        ed.dispatchEvent(event);
-        pending.handled = event.defaultPrevented;
-        return true;
-      } catch (_) { delete window.__merchflowClipboard; return false; }
+      return new Promise((resolve) => {
+        const deadline = performance.now() + 5000;
+        const dispatchWhenReady = () => {
+          if (performance.now() >= deadline) return resolve(false);
+          const ed = promptEditor();
+          if (!ed || !ed.isContentEditable) {
+            return setTimeout(dispatchWhenReady, 50);
+          }
+          try {
+            const bin = atob(%s), arr = new Uint8Array(bin.length);
+            for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+            const file = new File([arr],%s,{type:%s});
+            const dt = new DataTransfer(); dt.items.add(file);
+            const pending = {editor:ed,transfer:dt,handled:false,dropDispatched:false};
+            window.__merchflowClipboard = pending;
+            ed.focus();
+            const event = new ClipboardEvent('paste',{bubbles:true,cancelable:true,clipboardData:dt});
+            ed.dispatchEvent(event);
+            pending.handled = event.defaultPrevented;
+            resolve(true);
+          } catch (_) { delete window.__merchflowClipboard; resolve(false); }
+        };
+        dispatchWhenReady();
+      });
     """ % (json.dumps(b64), json.dumps(path.name), json.dumps(mime))
     return bool(s.evaluate(_js(body), timeout=UPLOAD_TIMEOUT))
 

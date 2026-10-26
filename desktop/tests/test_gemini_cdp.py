@@ -547,6 +547,56 @@ def test_existing_real_draft_attachment_is_rejected_before_new_paste_or_send(liv
 
 
 
+def test_silent_paste_waits_for_editable_composer_dom(live):
+    _,pool,root=live
+    client=signed_in_profile(pool)
+    source=root/"delayed-composer.png"
+    source.write_bytes(png())
+    port=client._ensure_browser();target,session=client._open_tab(port)
+    try:
+        client._wait_ready(session)
+        scheduled=session.evaluate(gemini_cdp._js("""
+          const ed=promptEditor();
+          if (!ed) return false;
+          ed.setAttribute('contenteditable','false');
+          setTimeout(() => ed.setAttribute('contenteditable','true'), 350);
+          return true;
+        """))
+        assert scheduled
+        started=time.monotonic()
+        assert gemini_cdp._paste_image(session,source)
+        assert 0.3 <= time.monotonic()-started < 5
+        assert client._gate1(session,1,3)
+    finally:
+        try: session.evaluate(gemini_cdp.CLEAR_CLIPBOARD_JS)
+        except Exception: pass
+        session.close();gemini_cdp.close_page(port,target["id"])
+
+
+def test_silent_paste_gives_up_after_five_seconds_when_composer_stays_unavailable(live):
+    _,pool,root=live
+    client=signed_in_profile(pool)
+    source=root/"missing-composer.png"
+    source.write_bytes(png())
+    port=client._ensure_browser();target,session=client._open_tab(port)
+    try:
+        client._wait_ready(session)
+        disabled=session.evaluate(gemini_cdp._js("""
+          const ed=promptEditor();
+          if (!ed) return false;
+          ed.setAttribute('contenteditable','false');
+          return true;
+        """))
+        assert disabled
+        started=time.monotonic()
+        assert not gemini_cdp._paste_image(session,source)
+        elapsed=time.monotonic()-started
+        assert 4.8 <= elapsed < 6
+        assert session.evaluate("window.__fixtureDelivery.paste") == 0
+    finally:
+        session.close();gemini_cdp.close_page(port,target["id"])
+
+
 @pytest.mark.parametrize("text",[
     "You've reached a temporary network problem. Please try again tomorrow.",
     "Service momentanément indisponible. Réessayez demain.",
