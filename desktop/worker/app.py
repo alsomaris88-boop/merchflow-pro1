@@ -38,7 +38,7 @@ from pydantic import BaseModel, Field
 
 from . import browser, db, elite_tools, gemini_cdp, gemini_pool, image_lab, output_store, p2p_batches, trademark_shield, trends_local
 
-WORKER_VERSION = "2.5.1-multilingual-upload-live-retry"
+WORKER_VERSION = "2.5.2-clipboard-originals-no-dom-cooldown"
 
 OUT_DIR = Path(os.environ.get("MERCHFLOW_OUT") or (Path(__file__).resolve().parents[2] / "output")).resolve()
 OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -78,7 +78,7 @@ async def health() -> dict:
         "engine": f"gemini-cdp-headless + {image_lab.ENGINE_NAME}",
         "libvips": image_lab.HAS_VIPS, "mock": gemini_pool.MOCK, "headless": True,
         "outDir": str(OUT_DIR), "profiles": gemini_pool.profile_cards(),
-        "capabilities": {**elite_tools.CAPABILITIES, "rembg": image_lab.HAS_REMBG, "opencv": image_lab.HAS_CV, "streamZip": True, "diskHistory": True, "historyEvents": True, "donepixelBatch": image_lab.HAS_VIPS, "donepixelRetry": image_lab.HAS_VIPS},
+        "capabilities": {**elite_tools.CAPABILITIES, "rembg": image_lab.HAS_REMBG, "opencv": image_lab.HAS_CV, "streamZip": True, "diskHistory": True, "historyEvents": True, "donepixelBatch": image_lab.HAS_VIPS, "donepixelRetry": image_lab.HAS_VIPS, "silentClipboard": True, "originalImagesOnly": True},
     }
 
 
@@ -506,7 +506,7 @@ class EliteReq(BaseModel):
 @app.get("/elite/capabilities")
 @app.get("/api/bridge/elite/capabilities")
 async def elite_caps() -> dict:
-    return {"ok": True, "capabilities": {**elite_tools.CAPABILITIES, "rembg": image_lab.HAS_REMBG, "opencv": image_lab.HAS_CV, "streamZip": True, "diskHistory": True, "historyEvents": True, "donepixelBatch": image_lab.HAS_VIPS, "donepixelRetry": image_lab.HAS_VIPS}, "products": elite_tools.PRODUCTS}
+    return {"ok": True, "capabilities": {**elite_tools.CAPABILITIES, "rembg": image_lab.HAS_REMBG, "opencv": image_lab.HAS_CV, "streamZip": True, "diskHistory": True, "historyEvents": True, "donepixelBatch": image_lab.HAS_VIPS, "donepixelRetry": image_lab.HAS_VIPS, "silentClipboard": True, "originalImagesOnly": True}, "products": elite_tools.PRODUCTS}
 
 
 async def _elite_decode(req: EliteReq) -> bytes:

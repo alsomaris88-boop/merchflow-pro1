@@ -22,6 +22,7 @@ with tempfile.TemporaryDirectory(prefix="merchflow-p2p-browser-") as temp:
     os.environ["MERCHFLOW_OUT"] = str(root / "output")
     os.environ["MERCHFLOW_DB"] = str(root / "app.sqlite")
     from desktop.worker import app, gemini_pool
+    from desktop.worker.gemini_client import GeminiAutomationError
     import uvicorn
 
     pool = gemini_pool.AccountPool()
@@ -48,9 +49,9 @@ with tempfile.TemporaryDirectory(prefix="merchflow-p2p-browser-") as temp:
                     first = key not in failed_references
                     failed_references.add(key)
                 if first:
-                    raise RuntimeError("GATE 1 FAILED: the reference thumbnail never rendered in the Gemini input box")
+                    raise GeminiAutomationError("GATE 1 FAILED: the reference thumbnail never rendered in the Gemini input box")
             if marker == (8, 18, 28):
-                raise RuntimeError("Provider returned no image")
+                raise GeminiAutomationError("Provider returned no image")
             return raw
 
     providers = {i: TestProvider() for i in (1, 2, 3)}

@@ -11,6 +11,8 @@ import glob
 import importlib.util
 import io
 import json
+import inspect
+import hashlib
 import os
 import shutil
 import time
@@ -20,7 +22,7 @@ import pytest
 from PIL import Image
 
 from desktop.worker import browser, db, gemini_cdp, gemini_pool
-from desktop.worker.gemini_client import GeminiAuthError, GeminiRenderError, ModelDegradedError
+from desktop.worker.gemini_client import GeminiAuthError, GeminiAutomationError, GeminiRenderError, ModelDegradedError
 
 ROOT = Path(__file__).resolve().parents[2]
 _spec = importlib.util.spec_from_file_location("fake_gemini", ROOT / "tests/support/fake_gemini.py")
@@ -235,9 +237,9 @@ def test_exactly_one_full_size_image_is_kept_from_a_multi_image_response(live):
     assert client.last_extraction["imagesInResponse"] == 3
 
 
-def test_attachment_menu_file_chooser_and_full_resolution_fetch_fallback(live):
+def test_silent_paste_without_file_input_or_menu_uses_original_fetch(live):
     fake, pool, _ = live
-    fake.mode, fake.download = "chooser", False   # no static input, no download button
+    fake.mode, fake.download, fake.query_string = "no-controls", False, True
     client = signed_in_profile(pool)
     result = client.generate_image("Recreate this.", [(png(), "ref.png")])
     assert Image.open(io.BytesIO(result)).size == fake_gemini.FULL
@@ -288,20 +290,12 @@ def test_upload_selector_vocabulary_includes_requested_french_and_universal_cont
                 "importer une image", "ajouter des fichiers", "téléverser"]) <= set(gemini_cdp.SELECTORS["uploadMenuText"])
 
 
-@pytest.mark.parametrize("mode", ["chooser", "svg", "mat", "testid", "drop", "input-cdp-error"])
-def test_french_and_icon_only_uploads_verify_http_thumbnails_and_preserve_image1_image2(live, monkeypatch, mode):
+@pytest.mark.parametrize("mode", ["chooser", "svg", "mat", "testid", "drop", "no-controls"])
+def test_silent_paste_ignores_french_upload_controls_and_preserves_image1_image2(live, monkeypatch, mode):
     fake, pool, _ = live
     fake.locale, fake.http_thumbnail, fake.delay_ms = "fr", True, 300
-    fake.mode = "input" if mode == "input-cdp-error" else mode
-    if mode == "input-cdp-error":
-        original = gemini_cdp.CDPSession.send
-        failed = []
-        def fail_first_file_set(session, method, *args, **kwargs):
-            if method == "DOM.setFileInputFiles" and not failed:
-                failed.append(True)
-                raise gemini_cdp.CDPError("TEST ONLY: direct file input rejected; chooser must still work")
-            return original(session, method, *args, **kwargs)
-        monkeypatch.setattr(gemini_cdp.CDPSession, "send", fail_first_file_set)
+    fake.mode = mode
+    forbid_upload_protocol(monkeypatch)
     client = signed_in_profile(pool)
     niche, style = png(colour=(1, 8, 3)), png(colour=(4, 2, 9))
     result = client.generate_image(gemini_pool.FUSION_DIRECTIVE,
@@ -315,6 +309,8 @@ def test_french_and_icon_only_uploads_verify_http_thumbnails_and_preserve_image1
     assert " ".join(sent["prompt"].split()) == " ".join(gemini_pool.FUSION_DIRECTIVE.split())
     assert [name for name, _ in sent["files"]] == ["01_niche_IMAGE1.png", "02_style_IMAGE2.png"]
     assert [data for _, data in sent["files"]] == [niche, style]
+    assert sent["delivery"] == {"paste":2,"drop":0,"menu":0,"chooser":0,"fileInput":0,"imagesPill":0}
+    assert client.last_extraction["upload"] == "clipboard-paste"
 
 
 def test_real_browser_gate_rejects_avatar_history_hidden_broken_empty_and_preexisting_images(live):
@@ -377,3 +373,182 @@ def test_partial_upload_never_appends_duplicate_references_to_fool_gate1(live, m
     with pytest.raises(GeminiRenderError, match="GATE 1 FAILED: the reference thumbnail never rendered"):
         client.generate_image(gemini_pool.FUSION_DIRECTIVE, [(png(), "IMAGE1.png"), (png(), "IMAGE2.png")])
     assert fake.submissions == [], "no prompt/send is allowed before genuine complete attachment verification"
+
+
+# ------------------------------------- silent clipboard / original-only production contract
+FORBIDDEN_UPLOAD_COMMANDS = {"DOM.setFileInputFiles", "Page.setInterceptFileChooserDialog", "Input.dispatchDragEvent"}
+
+def forbid_upload_protocol(monkeypatch):
+    original = gemini_cdp.CDPSession.send
+    def checked(session, method, *args, **kwargs):
+        assert method not in FORBIDDEN_UPLOAD_COMMANDS, f"Forbidden UI/file-chooser upload command: {method}"
+        return original(session, method, *args, **kwargs)
+    monkeypatch.setattr(gemini_cdp.CDPSession, "send", checked)
+
+
+def test_clipboard_contract_has_no_menu_picker_native_file_or_preview_canvas_fallback():
+    source = inspect.getsource(gemini_cdp)
+    assert "ClipboardEvent('paste'" in source and "new DataTransfer()" in source
+    assert "DragEvent('drop'" in source
+    for method in FORBIDDEN_UPLOAD_COMMANDS:
+        assert method not in source
+    assert "CLICK_UPLOAD_JS" not in source and "CLICK_UPLOAD_MENU_JS" not in source
+    assert "CANVAS_JS" not in source and "canvas-toDataURL" not in source
+    assert "navigator.clipboard" not in source and "pyperclip" not in source
+
+
+def test_exact_8k_templates_are_byte_identical_and_colour_is_the_only_substitution():
+    assert hashlib.sha256(gemini_pool.FUSION_DIRECTIVE.encode()).hexdigest() == "cd28a8b6c29a84515a4547bb7a5dbe1f7c99bf7f4ff72f695bcd767ef0143d3e"
+    assert hashlib.sha256(gemini_pool.DONEPIXEL_PROMPT.encode()).hexdigest() == "297b8e4121d26f1282c671db36029cdcf230c3f04f4b84bf6ceff4088c0f2c96"
+    for colour in ("#000000", "#FFFFFF"):
+        assert gemini_pool.donepixel_prompt(colour) == gemini_pool.DONEPIXEL_PROMPT.replace("{Selected_Color_Hex}",colour)
+    payload = {"background":"black", "aspect":"5:6", "textOverride":"EXACT TEXT"}
+    assert gemini_pool._build_prompt(payload).startswith(gemini_pool.FUSION_DIRECTIVE + "\n\n")
+
+
+@pytest.mark.parametrize("mode,drops", [("both",0),("paste-no-prevent",0),("delayed",0),("drop",1)])
+def test_real_chromium_silent_paste_drop_fallback_never_delivers_twice(live, monkeypatch, mode, drops):
+    fake, pool, _ = live
+    fake.mode, fake.clipboard_mode, fake.delay_ms = "no-controls", mode, 300
+    forbid_upload_protocol(monkeypatch)
+    monkeypatch.setattr(gemini_cdp,"UPLOAD_TIMEOUT",1.0)
+    client = signed_in_profile(pool)
+    reference = png()
+    result = client.generate_image(gemini_pool.donepixel_prompt("#000000"),[(reference,"reference.png")])
+    assert Image.open(io.BytesIO(result)).size == fake.full_size
+    [sent] = fake.submissions
+    assert [data for _,data in sent["files"]] == [reference]
+    assert sent["delivery"] == {"paste":1,"drop":drops,"menu":0,"chooser":0,"fileInput":0,"imagesPill":0}
+    assert client.last_extraction["upload"] == ("clipboard-paste/drop" if drops else "clipboard-paste")
+    assert client.last_extraction["fullResolution"] is True
+
+
+def test_clipboard_preserves_original_jpeg_bytes_and_sniffs_mime_despite_png_filename(live, monkeypatch):
+    fake,pool,_ = live
+    fake.mode = "no-controls"
+    forbid_upload_protocol(monkeypatch)
+    stream=io.BytesIO();Image.new("RGB",(300,300),(10,50,70)).save(stream,"JPEG")
+    original=stream.getvalue()
+    signed_in_profile(pool).generate_image(gemini_pool.donepixel_prompt("#FFFFFF"),[(original,"concept-reference.png")])
+    [sent]=fake.submissions
+    assert sent["files"][0][1] == original and sent["mimes"] == ["image/jpeg"]
+    assert sent["delivery"]["paste"] == 1 and sent["delivery"]["drop"] == 0
+
+
+@pytest.mark.parametrize("mode,drops,reason", [("both",0,"reference thumbnail"),("none",1,"reference thumbnail"),("duplicate",0,"duplicate attachments")])
+def test_rejected_or_duplicate_synthetic_paste_fails_before_send_without_fake_thumbnail(live, monkeypatch, mode, drops, reason):
+    fake,pool,_=live
+    fake.mode,fake.clipboard_mode="no-controls",mode
+    fake.reject_upload = mode != "duplicate"
+    monkeypatch.setattr(gemini_cdp,"UPLOAD_TIMEOUT",0.7)
+    forbid_upload_protocol(monkeypatch)
+    client=signed_in_profile(pool)
+    observed=[];original=client._attach
+    def attach(session,paths):
+        try: return original(session,paths)
+        finally: observed.append((session.evaluate("window.__fixtureDelivery"),session.evaluate("window.__merchflowClipboard || null")))
+    monkeypatch.setattr(client,"_attach",attach)
+    with pytest.raises(GeminiAutomationError,match=reason):
+        client.generate_image(gemini_pool.donepixel_prompt("#000000"),[(png(),"reference.png")])
+    assert fake.submissions == []
+    delivery,pending=observed[0]
+    assert delivery == {"paste":1,"drop":drops,"menu":0,"chooser":0,"fileInput":0,"imagesPill":0}
+    assert pending is None, "no Base64/File/DataTransfer reference is retained after failure"
+
+
+def test_original_failure_never_falls_back_to_fetching_or_canvas_saving_the_preview(live, monkeypatch):
+    fake,pool,_=live
+    fake.mode,fake.download,fake.full_error,fake.query_string="no-controls",False,True,True
+    forbid_upload_protocol(monkeypatch)
+    client=signed_in_profile(pool)
+    with pytest.raises(GeminiAutomationError,match="preview/canvas fallback is disabled"):
+        client.generate_image(gemini_pool.donepixel_prompt("#000000"),[(png(),"reference.png")])
+    assert len(fake.submissions)==1, "uncertain generation must not be silently reissued"
+    assert any("=s0?fixture=keep" in r["url"] for r in fake.asset_requests)
+    assert not any("=s512" in r["url"] and r["destination"]=="empty" for r in fake.asset_requests)
+    assert not client.last_extraction.get("fullResolution")
+
+
+def test_a_full_size_endpoint_returning_only_thumbnail_pixels_is_rejected(live):
+    fake,pool,_=live
+    fake.full_is_preview=True
+    client=signed_in_profile(pool)
+    with pytest.raises(GeminiAutomationError,match="preview-sized 512×640"):
+        client.generate_image(gemini_pool.donepixel_prompt("#000000"),[(png(),"reference.png")])
+    assert len(fake.submissions)==1 and not client.last_extraction.get("fullResolution")
+
+
+def test_an_actual_8k_original_is_extracted_byte_identically_without_resize(live):
+    fake,pool,_=live
+    fake.full_size=(6554,8192)
+    client=signed_in_profile(pool)
+    result=client.generate_image(gemini_pool.donepixel_prompt("#000000"),[(png(),"reference.png")])
+    assert Image.open(io.BytesIO(result)).size==fake.full_size
+    assert result==fake_gemini.png(fake.full_size,fake_gemini.COLOURS[0])
+    assert client.last_extraction["fullResolution"] and client.last_extraction["height"]==8192
+    assert len(fake.submissions)==1
+
+
+def test_full_directive_is_repaired_if_native_text_insertion_was_truncated(live, monkeypatch):
+    fake,pool,_=live
+    original=gemini_cdp.CDPSession.send
+    def truncated(session,method,params=None,**kwargs):
+        if method=="Input.insertText": params={**params,"text":params["text"][:80]}
+        return original(session,method,params,**kwargs)
+    monkeypatch.setattr(gemini_cdp.CDPSession,"send",truncated)
+    client=signed_in_profile(pool)
+    client.generate_image(gemini_pool.FUSION_DIRECTIVE,[(png(),"IMAGE1.png"),(png(colour=(80,2,4)),"IMAGE2.png")])
+    [sent]=fake.submissions
+    assert " ".join(sent["prompt"].split())==" ".join(gemini_pool.FUSION_DIRECTIVE.split())
+    assert len(sent["files"])==2
+
+
+@pytest.mark.parametrize("headless",[True,False])
+def test_profile_reattachment_never_reuses_a_visible_browser_for_generation(isolated, monkeypatch, headless):
+    folder=gemini_cdp.profile_dir(8);folder.mkdir(parents=True)
+    (folder/"DevToolsActivePort").write_text("12345\n/browser/test-only\n")
+    monkeypatch.setattr(gemini_cdp,"devtools_version",lambda port:{"User-Agent":"HeadlessChrome/156" if headless else "Chrome/156"})
+    client=gemini_cdp.CdpGeminiClient(8,user_data_dir=folder)
+    if headless: assert client._owned_port()==12345
+    else:
+        with pytest.raises(GeminiAutomationError,match="visible browser"):
+            client._owned_port()
+
+
+
+def test_existing_real_draft_attachment_is_rejected_before_new_paste_or_send(live):
+    fake,pool,root=live
+    client=signed_in_profile(pool)
+    old=root/"old.png";new=root/"new.png"
+    old.write_bytes(png());new.write_bytes(png(colour=(20,90,50)))
+    port=client._ensure_browser();target,session=client._open_tab(port)
+    try:
+        client._wait_ready(session)
+        assert gemini_cdp._paste_image(session,old)
+        assert client._gate1(session,1,2)
+        with pytest.raises(GeminiAutomationError,match="already contains a reference"):
+            client._attach(session,[str(new)])
+        assert session.evaluate("window.__fixtureDelivery.paste")==1
+        assert fake.submissions==[]
+    finally:
+        session.evaluate(gemini_cdp.CLEAR_CLIPBOARD_JS)
+        session.close();gemini_cdp.close_page(port,target["id"])
+
+
+
+@pytest.mark.parametrize("text",[
+    "You've reached a temporary network problem. Please try again tomorrow.",
+    "Service momentanément indisponible. Réessayez demain.",
+])
+def test_generic_service_retry_text_is_not_misclassified_as_quota(isolated, monkeypatch, text):
+    class Clock:
+        value=0
+        def monotonic(self): self.value+=2; return self.value
+        def sleep(self,seconds): pass
+    class Session:
+        def evaluate(self,script):
+            return {"responses":1,"images":0,"downloads":0,"stop":False,"text":text}
+    monkeypatch.setattr(gemini_cdp,"time",Clock())
+    client=gemini_cdp.CdpGeminiClient(99)
+    with pytest.raises(GeminiAutomationError,match="answered without an image"):
+        client._await_image(Session(),{"responses":0})

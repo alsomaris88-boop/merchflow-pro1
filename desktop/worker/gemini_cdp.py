@@ -13,21 +13,24 @@ Architecture (modelled on clovericbot/cc-image and spurbro/gemini-web-image-gen)
     The persistent profile already holds the Google session, so credentials
     are never requested again. Each job opens a fresh chat tab and drives the
     normal Gemini chat input — there is no separate "image tab":
-      1. dispatch the reference file(s) into <input type="file" accept="image/*">
+      1. inject File/DataTransfer/ClipboardEvent('paste') directly into the composer;
+         only an unhandled paste may use an in-memory DragEvent('drop') fallback.
+         No upload menu, Images pill, file input or OS file chooser is used.
       2. GATE 1 — wait until the thumbnail card renders in the input container
       3. inject the exact prompt into the rich-textarea (Input.insertText)
       4. submit via button[aria-label="Send message"] (Enter as fallback)
          GATE 2 — the user bubble must show the attached image
       5. wait for the model response, then extract the FULL-SIZE image via the
          "Download full size image" button (browser-level setDownloadBehavior),
-         falling back to an in-page full-resolution fetch, then canvas.toDataURL
+         or an in-page original-only fetch. Preview/canvas fallbacks are forbidden.
       6. return EXACTLY ONE image — never a set of variants
 
   Port model: account N listens on 9222 + (N - 1). Every account is its own
   Chrome process (a profile directory can only be opened by one process), so
   parallel Pixel-to-Pixel leases need one DevTools port per account.
 
-All Gemini DOM knowledge lives in SELECTORS so UI drift is a one-place fix.
+Composer-scoped helpers and SELECTORS centralize DOM knowledge. Local DOM/
+transport/extraction errors never count as account/quota evidence.
 """
 from __future__ import annotations
 
@@ -50,7 +53,7 @@ from urllib.parse import quote, urlparse
 
 import httpx
 
-from .gemini_client import GeminiAuthError, GeminiRenderError, ModelDegradedError
+from .gemini_client import GeminiAuthError, GeminiAutomationError, GeminiRefusalError, GeminiRenderError, ModelDegradedError
 
 IS_WIN = sys.platform.startswith("win")
 DESKTOP_ROOT = Path(__file__).resolve().parent.parent            # desktop/
@@ -96,9 +99,10 @@ SELECTORS: dict = {
     "minSide": MIN_IMAGE_SIDE,
 }
 QUOTA_HINTS = ("reached your limit", "image generation limit", "limit for generating",
-               "try again tomorrow", "you've reached", "you have reached", "usage limit")
+               "usage limit", "vous avez atteint votre limite", "vous avez atteint la limite", "limite de génération")
 REFUSAL_HINTS = ("i can't generate", "i cannot generate", "unable to generate", "can't create",
-                 "content policy", "safety policy", "try a different prompt", "that violates")
+                 "content policy", "safety policy", "try a different prompt", "that violates",
+                 "je ne peux pas générer", "je ne peux pas créer", "règles de sécurité")
 
 EXE_CANDIDATES = {
     "chrome": [
@@ -325,8 +329,21 @@ const visible = (el) => {
   }
   return true;
 };
+const promptEditor = () => {
+  const all = [...document.querySelectorAll(S.editor)].filter(visible);
+  return all.find((el) => el.closest('rich-textarea') && el.closest(S.inputContainer)) ||
+    all.find((el) => el.closest('rich-textarea')) || all.find((el) => el.closest(S.inputContainer)) || all[0] || null;
+};
+const previewHint = (src) => {
+  try {
+    const url = new URL(src,location.href), match = url.pathname.match(/=(?:s|w|h)(\d+)(?:[-_a-z0-9]*)$/i);
+    return !!(match && +match[1] > 0 && +match[1] <= 768) || /\/(?:thumb|thumbnail|preview)(?:s|\/|[-_.])/i.test(url.pathname);
+  } catch (_) { return false; }
+};
+const referenceImages = (root) => root ? [...root.querySelectorAll('img')].filter((img) => visible(img) && img.complete &&
+  img.naturalWidth > 0 && !img.closest('.avatar,.profile-avatar,[data-avatar],[data-testid*="avatar"],header,nav')) : [];
 const box = () => {
-  const ed = document.querySelector(S.editor);
+  const ed = promptEditor();
   if (!ed) return null;
   const root = ed.closest('input-area-v2,input-area') || ed.closest(S.inputContainer) || ed.closest('form,fieldset');
   if (root && root !== document.body && root !== document.documentElement) return root;
@@ -358,7 +375,7 @@ SESSION_JS = _js("""
     const v = el.getAttribute('aria-label') || el.getAttribute('alt') || '';
     if (/google account|compte google/i.test(v)) { const m = v.match(rx); if (m) { account = m[0]; break; } account = account || 'signed-in'; }
   }
-  return { href: location.href, ready: document.readyState, editor: !!document.querySelector(S.editor), signIn, account };
+  return { href: location.href, ready: document.readyState, editor: !!promptEditor(), signIn, account };
 """)
 
 DISMISS_JS = _js("""
@@ -378,9 +395,11 @@ STATE_JS = _js("""
   const stop = [...document.querySelectorAll('button')].some((b) => ariaMatch(b, S.stopAria) && b.offsetParent !== null);
   const lastQuery = lastOf(S.userQuery);
   return { responses: responses.length, userQueries: document.querySelectorAll(S.userQuery).length,
-           queryImages: lastQuery ? lastQuery.querySelectorAll('img').length : 0,
+           queryImages: referenceImages(lastQuery).length,
+           imageWidth: imgs[0]?.naturalWidth || 0, imageHeight: imgs[0]?.naturalHeight || 0,
+           imageIsPreview: !!imgs[0] && previewHint(imgs[0].currentSrc || imgs[0].src),
            images: imgs.length, downloads, stop, text: last ? (last.innerText || '').slice(0, 800) : '',
-           editorText: (document.querySelector(S.editor)?.innerText || document.querySelector(S.editor)?.value || '') };
+           editorText: (promptEditor()?.innerText || promptEditor()?.value || '') };
 """)
 
 GATE1_JS = _js(r"""
@@ -400,18 +419,12 @@ GATE1_JS = _js(r"""
     return gate.ids.get(el) + ':' + (el.currentSrc || el.getAttribute('src') || getComputedStyle(el).backgroundImage || 'card');
   });
   const busy = [container, ...container.querySelectorAll(S.uploadBusy)].some((el) => el.matches(S.uploadBusy) && visible(el));
-  return { chips: tokens.length, busy, tokens, composer: true };
-""")
-
-FILE_INPUT_JS = _js(r"""
-  const container = box();
-  if (!container) return null;
-  const inputs = [...container.querySelectorAll(S.fileInput)].filter(enabled);
-  return inputs.find((el) => lower(el.accept).includes('image')) || inputs[0] || null;
+  const knownAttachments = images.filter((img) => img.closest('uploader-file-preview,.file-preview-card,.attachment-preview,.uploaded-image,.attachment-card,[data-testid*="attachment"],[data-test-id*="attachment"],[data-testid*="file-preview"],[data-test-id*="file-preview"]')).length;
+  return { chips: tokens.length, busy, tokens, composer: true, knownAttachments };
 """)
 
 FOCUS_EDITOR_JS = _js("""
-  const ed = document.querySelector(S.editor);
+  const ed = promptEditor();
   if (!ed) return false;
   ed.focus();
   if (ed.isContentEditable) { const r = document.createRange(); r.selectNodeContents(ed); const s = getSelection(); s.removeAllRanges(); s.addRange(r); document.execCommand('delete'); }
@@ -419,41 +432,21 @@ FOCUS_EDITOR_JS = _js("""
   return true;
 """)
 
-CLICK_UPLOAD_JS = _js(r"""
-  const container = box(); if (!container) return false;
-  const direct = 'button[aria-label*="import" i],button[aria-label*="add" i],button[aria-label*="plus" i],'
-    + 'button[aria-label*="upload" i],button[aria-label*="attach" i],button[aria-label*="joindre" i],'
-    + 'button[data-testid*="upload" i],button[data-test-id*="upload" i],'
-    + 'button[data-testid*="attach" i],button[data-test-id*="attach" i],'
-    + 'button:has(svg[data-icon="plus"]),button:has(svg[data-icon="attachment"]),'
-    + 'button:has(.icon-plus),button:has(.plus-icon),button:has(mat-icon)';
-  const candidates = [...new Set([...container.querySelectorAll(direct), ...container.querySelectorAll('button,[role="button"]')])]
-    .filter((el) => visible(el) && enabled(el));
-  const score = (el) => {
-    const aria = lower(el.getAttribute('aria-label'));
-    const icon = lower([...el.querySelectorAll('svg,mat-icon,[class*="icon"]')].map((node) =>
-      [node.textContent,node.getAttribute('data-icon'),node.getAttribute('fonticon'),node.getAttribute('svgicon'),node.getAttribute('class')].join(' ')).join(' '));
-    const testid = lower(el.getAttribute('data-testid') || el.getAttribute('data-test-id'));
-    if (/upload|attach|import|ajouter|joindre|téléverser/.test(aria + ' ' + testid)) return 5;
-    if (/plus|(^|[\s_-])add([\s_-]|$)|attach|upload|file_upload/.test(icon) || aria === '+' || aria.includes('plus') || el.textContent.trim() === '+') return 4;
-    return ariaMatch(el,S.uploadButtonAria) ? 1 : 0;
-  };
-  const button = candidates.map((el,index) => ({ el,index,score:score(el) })).filter((item) => item.score > 0)
-    .sort((a,b) => b.score-a.score || a.index-b.index)[0]?.el;
-  if (!button) return false; button.click(); return true;
+CLIPBOARD_STATUS_JS = _js("""
+  const pending = window.__merchflowClipboard;
+  return pending ? { handled: pending.handled, dropDispatched: pending.dropDispatched } : null;
 """)
 
-CLICK_UPLOAD_MENU_JS = _js(r"""
-  const items = [...document.querySelectorAll('[role="menuitem"],.mat-mdc-menu-item,button,[data-test-id*="uploader"],[data-testid*="uploader"]')];
-  const item = items.find((el) => visible(el) && enabled(el) &&
-    S.uploadMenuText.some((word) => lower((el.innerText || '') + ' ' + (el.getAttribute('aria-label') || '')).includes(lower(word))));
-  if (!item) return false; item.click(); return true;
+DROP_STAGED_JS = _js("""
+  const pending = window.__merchflowClipboard, ed = promptEditor();
+  if (!pending || !ed || ed !== pending.editor || !ed.isConnected || pending.dropDispatched) return false;
+  ed.focus();
+  pending.dropDispatched = true;
+  ed.dispatchEvent(new DragEvent('drop', { bubbles:true, cancelable:true, dataTransfer:pending.transfer }));
+  return true;
 """)
 
-EDITOR_RECT_JS = _js("""
-  const ed = document.querySelector(S.editor); if (!ed) return null;
-  const r = ed.getBoundingClientRect(); return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
-""")
+CLEAR_CLIPBOARD_JS = "delete window.__merchflowClipboard"
 
 SEND_JS = _js("""
   const container = box(); if (!container) return false;
@@ -473,33 +466,38 @@ CLICK_DOWNLOAD_JS = _js("""
   if (!b) return false; b.click(); return true;
 """)
 
-FETCH_FULL_JS = "(async () => {" + _HELPERS + """
+FETCH_FULL_JS = "(async () => {" + _HELPERS + r"""
   const last = lastOf(S.response); if (!last) return null;
   const img = outermost([...last.querySelectorAll(S.generatedImages.join(','))]).filter(goodImg)[0];
   if (!img) return null;
-  const src = img.currentSrc || img.src;
-  const full = src.replace(/=[swh]\\d+[^/=]*$/, '=s0');
-  for (const url of [...new Set([full, src])]) {
+  const src = img.currentSrc || img.src, urls = [];
+  const original = (value, explicit=false) => {
     try {
-      const res = await fetch(url, { credentials: 'include' });
+      const url = new URL(value,location.href);
+      if (!/^https?:$/.test(url.protocol) && !(explicit && (url.protocol === 'blob:' || value.startsWith('data:image/')))) return;
+      const resized = /=(?:s|w|h)\d+(?:[-_a-z0-9]*)$/i.test(url.pathname);
+      if (resized) url.pathname = url.pathname.replace(/=(?:s|w|h)\d+(?:[-_a-z0-9]*)$/i,'=s0');
+      if (resized || (explicit && !previewHint(url.href))) urls.push(url.href);
+    } catch (_) { /* malformed metadata is not an original asset */ }
+  };
+  for (const node of [img,img.closest('generated-image'),img.closest('single-image'),img.parentElement].filter(Boolean)) {
+    for (const name of ['data-original-src','data-original-url','data-full-size-url','data-full-url','data-download-url']) {
+      const value = node.getAttribute(name); if (value) original(value,true);
+    }
+  }
+  original(src);
+  for (const url of [...new Set(urls)]) {
+    try {
+      const res = await fetch(url,{credentials:'include'});
       if (!res.ok) continue;
       const blob = await res.blob();
       if (!blob.type.startsWith('image/') || !blob.size) continue;
-      const data = await new Promise((ok, bad) => { const fr = new FileReader(); fr.onload = () => ok(fr.result); fr.onerror = bad; fr.readAsDataURL(blob); });
-      return { data, url };
-    } catch (e) { /* try the next candidate */ }
+      const data = await new Promise((ok,bad) => { const fr = new FileReader(); fr.onload = () => ok(fr.result); fr.onerror = bad; fr.readAsDataURL(blob); });
+      return {data, original:true};
+    } catch (_) { /* another proven original candidate may still work */ }
   }
   return null;
 })()"""
-
-CANVAS_JS = _js("""
-  const last = lastOf(S.response); if (!last) return null;
-  const img = outermost([...last.querySelectorAll(S.generatedImages.join(','))]).filter(goodImg)[0];
-  if (!img) return null;
-  const c = document.createElement('canvas'); c.width = img.naturalWidth; c.height = img.naturalHeight;
-  c.getContext('2d').drawImage(img, 0, 0);
-  try { return { data: c.toDataURL('image/png') }; } catch (e) { return null; }
-""")
 
 
 # --------------------------------------------------------------- helpers
@@ -527,7 +525,7 @@ def validate_image(data: bytes) -> tuple[int, int]:
     with Image.open(io.BytesIO(data)) as image:
         width, height = image.size
     if min(width, height) < MIN_IMAGE_SIDE:
-        raise GeminiRenderError(f"Extracted image is only {width}×{height}; refusing a thumbnail")
+        raise GeminiAutomationError(f"Extracted image is only {width}×{height}; refusing a thumbnail")
     return width, height
 
 
@@ -538,6 +536,38 @@ def _decode_data_url(data_url: str) -> bytes:
 def _hint(text: str, hints: tuple[str, ...]) -> bool:
     low = (text or "").lower()
     return any(h in low for h in hints)
+
+
+def _paste_image(s: CDPSession, path: Path) -> bool:
+    """Stage one real reference in page memory and dispatch paste, never OS clipboard.
+
+    Dispatch is not acceptance: _attach separately requires a genuine thumbnail.
+    Actual image MIME is sniffed; a JPEG named concept-reference.png stays JPEG.
+    """
+    from PIL import Image
+
+    with Image.open(path) as image:
+        mime = Image.MIME.get(image.format, "")
+    if not mime.startswith("image/"):
+        return False
+    b64 = base64.b64encode(path.read_bytes()).decode("ascii")
+    body = r"""
+      try {
+        const ed = promptEditor(); if (!ed || !ed.isContentEditable) return false;
+        const bin = atob(%s), arr = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+        const file = new File([arr],%s,{type:%s});
+        const dt = new DataTransfer(); dt.items.add(file);
+        const pending = {editor:ed,transfer:dt,handled:false,dropDispatched:false};
+        window.__merchflowClipboard = pending;
+        ed.focus();
+        const event = new ClipboardEvent('paste',{bubbles:true,cancelable:true,clipboardData:dt});
+        ed.dispatchEvent(event);
+        pending.handled = event.defaultPrevented;
+        return true;
+      } catch (_) { delete window.__merchflowClipboard; return false; }
+    """ % (json.dumps(b64), json.dumps(path.name), json.dumps(mime))
+    return bool(s.evaluate(_js(body), timeout=UPLOAD_TIMEOUT))
 
 
 # ----------------------------------------------------------- headless client
@@ -572,7 +602,12 @@ class CdpGeminiClient:
             port = int(marker.read_text(encoding="utf-8").splitlines()[0])
         except Exception:
             return None
-        return port if devtools_version(port) else None
+        info = devtools_version(port)
+        if not info:
+            return None
+        if "HeadlessChrome" not in info.get("User-Agent", ""):
+            raise GeminiAutomationError("This profile is already open in a visible browser. Close it before silent headless generation; the account was not penalized.")
+        return port
 
     def _ensure_browser(self) -> int:
         if self._proc is not None and self._proc.poll() is None and devtools_version(self.port):
@@ -595,7 +630,7 @@ class CdpGeminiClient:
                         break
                     time.sleep(0.25)
                 if not owned:
-                    raise GeminiRenderError(f"{self.label}: headless Chrome did not publish a DevTools port")
+                    raise GeminiAutomationError(f"{self.label}: headless Chrome did not publish a DevTools port")
                 self.port = owned
         info = wait_devtools(self.port, 25, self._proc)
         self._attached = True
@@ -648,7 +683,7 @@ class CdpGeminiClient:
                     self.email = info["account"]
                 s.evaluate(DISMISS_JS)
                 return info
-        raise GeminiRenderError(f"{self.label}: Gemini chat did not become ready within {int(READY_TIMEOUT)}s")
+        raise GeminiAutomationError(f"{self.label}: Gemini chat did not become ready within {int(READY_TIMEOUT)}s")
 
     def init(self) -> None:
         """Verify the persistent session headlessly (no credentials involved)."""
@@ -674,88 +709,63 @@ class CdpGeminiClient:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             state = s.evaluate(GATE1_JS) or {}
-            if self._new_chips(state, baseline or set()) >= expected and not state.get("busy"):
+            count = self._new_chips(state, baseline or set())
+            if count > expected:
+                raise GeminiAutomationError(f"GATE 1 FAILED: expected exactly {expected} new reference thumbnail(s), found {count}; duplicate attachments were not submitted")
+            if count == expected and not state.get("busy"):
                 return True
             time.sleep(0.2)
         return False
 
     def _attach(self, s: CDPSession, paths: list[str]) -> str:
-        expected = len(paths)
-        baseline = set((s.evaluate(GATE1_JS) or {}).get("tokens", []))
+        initial = s.evaluate(GATE1_JS) or {}
+        if initial.get("busy") or initial.get("knownAttachments"):
+            raise GeminiAutomationError("GATE 1 FAILED: the composer already contains a reference upload; no message was sent, to preserve exact IMAGE 1 / IMAGE 2 ordering")
+        baseline = set(initial.get("tokens", []))
         failure = "GATE 1 FAILED: the reference thumbnail never rendered in the Gemini input box"
-
-        def verify() -> bool:
-            if self._gate1(s, expected, UPLOAD_TIMEOUT, baseline):
-                return True
-            state = s.evaluate(GATE1_JS) or {}
-            # Never append the reference again over a partial/still-busy upload:
-            # duplicate thumbnails could otherwise fool the gate and change IMAGE 1/2.
-            if self._new_chips(state, baseline) or state.get("busy"):
-                raise GeminiRenderError(failure)
-            return False
-
-        def set_input() -> bool:
-            obj = s.object_id(FILE_INPUT_JS)
-            if not obj:
-                return False
+        used_drop = False
+        for position, value in enumerate(paths):
             try:
-                s.send("DOM.setFileInputFiles", {"files": paths, "objectId": obj})
-            except CDPError:
-                return False
-            return verify()
-
-        # A — direct, composer-scoped file input; never an unrelated page input.
-        if set_input():
-            return "file-input"
-        # B — French/English labels and locale-independent plus/attachment icons.
-        try:
-            s.send("Page.setInterceptFileChooserDialog", {"enabled": True})
-            if s.evaluate(CLICK_UPLOAD_JS):
-                chooser = s.wait_event("Page.fileChooserOpened", 1.0)
-                if chooser is None:
-                    deadline = time.monotonic() + 6
-                    while time.monotonic() < deadline:
-                        if s.evaluate(CLICK_UPLOAD_MENU_JS):
-                            chooser = s.wait_event("Page.fileChooserOpened", 4)
-                            break
-                        time.sleep(0.2)
-                if chooser and chooser.get("backendNodeId"):
-                    try:
-                        s.send("DOM.setFileInputFiles", {"files": paths, "backendNodeId": chooser["backendNodeId"]})
-                    except CDPError:
-                        pass
-                    else:
-                        if verify():
-                            return "file-chooser"
-                if set_input():
-                    return "file-input-after-menu"
-        finally:
-            try:
-                s.send("Page.setInterceptFileChooserDialog", {"enabled": False})
-            except CDPError:
-                pass
-        # C — real native drag-and-drop. No thumbnail is ever fabricated.
-        rect = s.evaluate(EDITOR_RECT_JS)
-        if rect:
-            data = {"items": [], "files": paths, "dragOperationsMask": 1}
-            for kind in ("dragEnter", "dragOver", "drop"):
-                s.send("Input.dispatchDragEvent", {"type": kind, "x": rect["x"], "y": rect["y"], "data": data})
-            if verify():
-                return "drag-drop"
-        raise GeminiRenderError(failure)
+                try:
+                    dispatched = _paste_image(s, Path(value))
+                except (OSError, ValueError) as exc:
+                    raise GeminiAutomationError(f"Silent reference paste failed: {exc}") from exc
+                if not dispatched:
+                    raise GeminiAutomationError("Silent reference paste could not reach the focused Gemini composer")
+                expected = position + 1
+                if self._gate1(s, expected, UPLOAD_TIMEOUT, baseline):
+                    continue
+                state = s.evaluate(GATE1_JS) or {}
+                pending = s.evaluate(CLIPBOARD_STATUS_JS) or {}
+                # A canceled paste or visible/busy/partial upload was consumed.
+                # Never send it again via drop and corrupt IMAGE 1 / IMAGE 2.
+                if pending.get("handled") or state.get("busy") or self._new_chips(state, baseline) != position:
+                    raise GeminiAutomationError(failure)
+                if not s.evaluate(DROP_STAGED_JS):
+                    raise GeminiAutomationError("Silent drop fallback could not reach the Gemini composer")
+                used_drop = True
+                if not self._gate1(s, expected, UPLOAD_TIMEOUT, baseline):
+                    raise GeminiAutomationError(failure)
+            finally:
+                try:
+                    s.evaluate(CLEAR_CLIPBOARD_JS)
+                except CDPError:
+                    pass
+        return "clipboard-paste/drop" if used_drop else "clipboard-paste"
 
     # ---------------------------------------------- step 3 + 4: prompt
     def _type_prompt(self, s: CDPSession, prompt: str) -> None:
         if not s.evaluate(FOCUS_EDITOR_JS):
-            raise GeminiRenderError("Gemini prompt box (rich-textarea) not found")
+            raise GeminiAutomationError("Gemini prompt box (rich-textarea) not found")
         s.send("Input.insertText", {"text": prompt})
         typed = re.sub(r"\s+", " ", (s.evaluate(STATE_JS) or {}).get("editorText", ""))
-        if re.sub(r"\s+", " ", prompt)[:48].strip() not in typed:
+        expected = re.sub(r"\s+", " ", prompt).strip()
+        if expected != typed.strip():
             s.evaluate(FOCUS_EDITOR_JS)
             s.evaluate(f"document.execCommand('insertText', false, {json.dumps(prompt)})")
             typed = re.sub(r"\s+", " ", (s.evaluate(STATE_JS) or {}).get("editorText", ""))
-            if re.sub(r"\s+", " ", prompt)[:48].strip() not in typed:
-                raise GeminiRenderError("Prompt injection into the Gemini rich-textarea failed")
+            if expected != typed.strip():
+                raise GeminiAutomationError("Prompt injection into the Gemini rich-textarea failed")
 
     def _submit(self, s: CDPSession, before: dict, references: int) -> None:
         deadline = time.monotonic() + 30
@@ -774,10 +784,10 @@ class CdpGeminiClient:
         while time.monotonic() < deadline:
             st = s.evaluate(STATE_JS) or {}
             if st.get("userQueries", 0) > before.get("userQueries", 0):
-                if references == 0 or st.get("queryImages", 0) >= 1:
+                if references == 0 or st.get("queryImages", 0) == references:
                     return
             time.sleep(0.4)
-        raise GeminiRenderError("GATE 2 FAILED: Gemini did not accept the message with its reference image")
+        raise GeminiAutomationError("GATE 2 FAILED: Gemini did not accept the message with its reference image")
 
     # ------------------------------------------------- step 5: response
     def _await_image(self, s: CDPSession, before: dict) -> dict:
@@ -791,7 +801,7 @@ class CdpGeminiClient:
             if st.get("responses", 0) <= before.get("responses", 0):
                 continue
             text = st.get("text", "")
-            if _hint(text, QUOTA_HINTS):
+            if _hint(text, QUOTA_HINTS) and not st.get("images") and not st.get("downloads"):
                 raise ModelDegradedError(f"{self.label}: Gemini image limit reached — {text[:200]}")
             if st.get("images", 0) or st.get("downloads", 0):
                 image_at = image_at or time.monotonic()
@@ -802,12 +812,13 @@ class CdpGeminiClient:
             if not st.get("stop") and text and text == last_text:
                 idle_since = idle_since or time.monotonic()
                 if time.monotonic() - idle_since >= 6:
-                    reason = "refused" if _hint(text, REFUSAL_HINTS) else "answered without an image"
-                    raise GeminiRenderError(f"Gemini {reason}: {text[:240]}")
+                    if _hint(text, REFUSAL_HINTS):
+                        raise GeminiRefusalError(f"Gemini refused: {text[:240]}")
+                    raise GeminiAutomationError(f"Gemini answered without an image: {text[:240]}")
             else:
                 idle_since = None
             last_text = text
-        raise GeminiRenderError(f"Gemini produced no image within {int(GENERATION_TIMEOUT)}s")
+        raise GeminiAutomationError(f"Gemini produced no image within {int(GENERATION_TIMEOUT)}s")
 
     # ------------------------------------------------ step 6: one image
     def _download_full_size(self, s: CDPSession, port: int, folder: Path) -> bytes | None:
@@ -847,8 +858,7 @@ class CdpGeminiClient:
     def _extract_one(self, s: CDPSession, port: int, workdir: Path, found: dict) -> bytes:
         attempts: list[tuple[str, callable]] = [
             ("download-full-size", lambda: self._download_full_size(s, port, workdir / "downloads")),
-            ("fetch-full-resolution", lambda: (lambda r: _decode_data_url(r["data"]) if r else None)(s.evaluate(FETCH_FULL_JS, timeout=60))),
-            ("canvas-toDataURL", lambda: (lambda r: _decode_data_url(r["data"]) if r else None)(s.evaluate(CANVAS_JS))),
+            ("fetch-full-resolution", lambda: (lambda r: _decode_data_url(r["data"]) if r and r.get("original") is True else None)(s.evaluate(FETCH_FULL_JS, timeout=60))),
         ]
         errors = []
         for method, attempt in attempts:
@@ -857,16 +867,21 @@ class CdpGeminiClient:
                 if not data:
                     continue
                 width, height = validate_image(data)
-                self.last_extraction = {"method": method, "width": width, "height": height,
+                if found.get("imageIsPreview") and width <= found.get("imageWidth", 0) and height <= found.get("imageHeight", 0):
+                    raise GeminiAutomationError(f"Full-resolution extraction returned only a preview-sized {width}×{height} image")
+                self.last_extraction = {**self.last_extraction, "method": method, "fullResolution": True,
+                                        "width": width, "height": height,
                                         "bytes": len(data), "imagesInResponse": max(found.get("images", 0), found.get("downloads", 0))}
                 return data  # EXACTLY ONE image — extras in the response are ignored on purpose
             except Exception as exc:
                 errors.append(f"{method}: {exc}")
-        raise GeminiRenderError("Generated image could not be extracted at full size (" + "; ".join(errors)[:400] + ")")
+        raise GeminiAutomationError("Generated image could not be extracted at full size; preview/canvas fallback is disabled" +
+                                    (" (" + "; ".join(errors) + ")" if errors else ""))
 
     # ---------------------------------------------------------- public
     def generate_image(self, prompt: str, references: list[tuple[bytes, str]]) -> bytes:
         with self._lock:
+            self.last_extraction = {}
             workdir = Path(tempfile.mkdtemp(prefix=f"merchflow-cdp-{self.account_id}-"))
             try:
                 paths = []
@@ -878,8 +893,11 @@ class CdpGeminiClient:
                 try:
                     port = self._ensure_browser()
                 except CDPError as exc:
-                    raise GeminiRenderError(f"{self.label}: {exc}") from exc
-                target, s = self._open_tab(port)
+                    raise GeminiAutomationError(f"{self.label}: {exc}") from exc
+                try:
+                    target, s = self._open_tab(port)
+                except CDPError as exc:
+                    raise GeminiAutomationError(f"{self.label}: CDP tab setup failed — {exc}") from exc
                 try:
                     self._wait_ready(s)
                     before = s.evaluate(STATE_JS) or {}
@@ -890,7 +908,7 @@ class CdpGeminiClient:
                     found = self._await_image(s, before)
                     return self._extract_one(s, port, workdir, found)
                 except CDPError as exc:
-                    raise GeminiRenderError(f"{self.label}: CDP automation failed — {exc}") from exc
+                    raise GeminiAutomationError(f"{self.label}: CDP automation failed — {exc}") from exc
                 finally:
                     s.close()
                     close_page(port, target["id"])

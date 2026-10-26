@@ -1,6 +1,76 @@
-# Pipeline validation — 2026-10-25
+# Pipeline validation — 2026-10-26
 
-## Current fix: multilingual upload, strict Gate 1 and live Donepixel results
+## Current fix: silent in-memory clipboard, exact prompts, originals-only extraction
+
+Based on published `963f530`, with the user's explicit **safe paste → drop
+fallback** choice (not unconditional duplicate dispatch). Worker identity:
+`2.5.2-clipboard-originals-no-dom-cooldown`.
+
+- Production attachment code no longer has file-input setters, upload-menu/Images
+  clicks, OS choosers, or native drag-dispatch fallbacks. Each reference becomes a
+  raw-byte `File`/`DataTransfer` and a real Chromium `ClipboardEvent('paste')` in
+  the focused composer. Only an unhandled, non-busy paste with no new thumbnail
+  may use one in-memory `DragEvent('drop')`. Both-handler/uncanceled/delayed cases
+  avoid duplicate delivery. Actual MIME is sniffed without recompression; file
+  bytes, niche IMAGE 1/style IMAGE 2 order, and one-result semantics are preserved.
+- Gate 1 verifies the exact new reference count after each file; existing draft
+  attachments, duplicate/rejected events and fabricated/hidden/history/avatar
+  thumbnails never become success. Gate 2 requires the whole reference count.
+  Temporary DataTransfer/File state is released. Generation cannot reattach to
+  a visible private-profile browser.
+- Byte-identical mandated Fusion and Donepixel 8K prompt literals are hash-locked.
+  Only the selected Black/White hex changes the Donepixel template. The complete
+  normalized prompt must survive native insertion or its one repair attempt;
+  a matching prefix is no longer enough to send a truncated directive.
+- Only the first actual original is extracted: full-size browser Download or an
+  original-only request (`=s0`, query preserved, explicit original metadata).
+  Failed original retrieval cannot return the UI preview or canvas fallback.
+  Known preview-sized export bytes fail rather than masquerading as full-size.
+  A physical 6554 × 8192 fixture original is returned byte-for-byte, without
+  client resizing. No provider-native 8K guarantee is inferred from the prompt.
+- Local DOM/clipboard/gate/CDP/prompt/timeout/extraction errors, explicit refusals
+  and empty results never fault/cooldown a healthy account or silently reroute
+  an uncertain paid render. Both generation paths release leases and preserve
+  exact errors. Generic service-outage/“try tomorrow” text alone is not quota
+  evidence. Real authentication/limit/degradation/window-cap guards remain.
+- The approved live cards, exact failed-card errors/Retry, saved-ID Download/
+  Prepare/History, verified SQLite accounts, lossless print pipeline and Windows
+  launcher are retained; no fake production account or fabricated success is introduced.
+
+Final automated results:
+
+- **161 Python tests passed, 1 opt-in neural-model smoke skipped** (467.05s).
+  Includes **42 CDP tests**: real Chromium paste/drop delivery and French controls
+  left untouched, uncanceled/delayed handlers, MIME/byte identity, rejected/double/
+  stale attachments, strict gates, exact prompt hashes/truncation repair, original
+  failure/preview rejection, a physical byte-identical 6554 × 8192 original, and
+  visible-browser reuse rejection. **18 account-policy tests** cover both Fusion
+  and Donepixel, no local-error cooldown/usage/reroute, empty/refused responses,
+  and preserved genuine quota/auth guards. Ambiguous service-outage text is not
+  classified as quota. All earlier account/launcher/image/1–100+ regressions pass.
+- **26 TypeScript unit tests passed.**
+- **17 Chromium desktop E2E tests passed, 1 opt-in legacy 55-file Prepare smoke
+  skipped** (1.6m), using the actual static export + FastAPI. Typed automation
+  failures remain exact red failed cards; Retry, real Download/Prepare/History,
+  one-output archive identity, SSE/ZIP/Listing, reload, Black/White, empty verified
+  account lists and 1/5/20/101 ingestion remain verified.
+- ESLint, TypeScript, compileall and whitespace checks pass. Both normal Next
+  production build and static desktop export pass; API sources are restored.
+- Fusion, Donepixel and legacy recreation prompt literals are unchanged from
+  `963f530`; the mandatory two current 8K literals are SHA-256 locked in tests.
+  Generator/live-card UI, output-store encoding/transactions, neural pipeline,
+  persistent batch/Retry, account DB/browser admission and launcher are untouched.
+- `/api/accounts` and `/api/bridge/accounts` remain genuinely empty after native
+  integration; the test provider is never exposed as a connected account.
+  The temporary fixture service is stopped and its temporary data removed.
+
+All Google page and provider responses are explicit local test fixtures; Chromium/CDP, private
+Chrome SQLite profiles, native libvips, PNG files/History/SQLite/SSE and browser
+handoffs are real. No live Google/Gemini paid render or native Windows smoke was
+performed. Synthetic clipboard acceptance depends on the current provider DOM;
+if rejected, the engine fails visibly, not via a fake thumbnail or hidden UI fallback.
+
+## Published baseline `963f530`: multilingual upload, Gate 1 and live results
 
 Built on published `6e46af3` without rewriting approved CDP/Fusion/Prepare work.
 Worker identity: `2.5.1-multilingual-upload-live-retry`.

@@ -50,6 +50,18 @@ class GeminiRenderError(RuntimeError):
     """RPC executed but returned no usable image (rate limit, refusal, drift)."""
 
 
+class GeminiAutomationError(GeminiRenderError):
+    """Local DOM/transport/upload/original-extraction failure, NOT quota evidence.
+
+    A remote generation may already have happened. Never penalize the account
+    or silently repeat the paid request through another account.
+    """
+
+
+class GeminiRefusalError(GeminiRenderError):
+    """Explicit provider refusal; not an account/session/quota failure."""
+
+
 class ModelDegradedError(GeminiRenderError):
     """
     Pro→Flash degradation sensor trigger.

@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Callable
 
 from . import db, gemini_cdp, gemini_client, image_lab
-from .gemini_client import GeminiAuthError, GeminiRenderError, ModelDegradedError
+from .gemini_client import GeminiAuthError, GeminiAutomationError, GeminiRefusalError, GeminiRenderError, ModelDegradedError
 
 MOCK = os.environ.get("MERCHFLOW_MOCK_ENGINE", "").lower() in {"1", "true", "yes"}
 
@@ -569,7 +569,14 @@ def run_batch(payload: dict, push: Callable[[dict], None], out_dir: Path) -> dic
                 push({"type": "progress", "job": job_id, "pct": 25, "msg": f"[{acct.label}] sending reference to the image provider"})
                 references = [(niche_bytes, "concept-reference.png")] if recreate else [(niche_bytes, f"niche_{job_id}_IMAGE1.png"), (style_bytes, "style_ref_IMAGE2.png")]
                 raw = client.generate_image(prompt, references)
+                if not raw:
+                    raise GeminiAutomationError("Provider returned no image")
                 POOL.note_render(acct.id)
+                break
+            except (GeminiAutomationError, GeminiRefusalError) as exc:
+                # DOM/paste/extraction/refusal is not quota or expired auth.
+                # The request may already have rendered: explicit Retry only.
+                last_err = exc
                 break
             except ModelDegradedError as exc:
                 last_err = exc
@@ -589,8 +596,8 @@ def run_batch(payload: dict, push: Callable[[dict], None], out_dir: Path) -> dic
             finally:
                 if acct is not None:
                     POOL.release(acct.id)
-        if raw is None or acct is None:
-            push({"type": "failed", "job": job_id, "name": name, "reason": str(last_err or "No authenticated account available")[:400]})
+        if not raw or acct is None:
+            push({"type": "failed", "job": job_id, "name": name, "reason": str(last_err or "No authenticated account available")})
             continue
         try:
             push({"type": "progress", "job": job_id, "pct": 80, "msg": "Provider returned an image; processing and verifying the PNG on disk"})
@@ -643,9 +650,12 @@ def render_donepixel(reference: bytes, colour: str, dispatch: Callable[[str], No
                 raise GeminiAuthError("Provider session expired; reconnect in Account Pool")
             raw = client.generate_image(prompt, [(reference, "concept-reference.png")])
             if not raw:
-                raise GeminiRenderError("Provider returned no image")
+                raise GeminiAutomationError("Provider returned no image")
             POOL.note_render(account.id)
             return raw, account.label, prompt
+        except (GeminiAutomationError, GeminiRefusalError) as exc:
+            last_error = exc
+            break  # no false cooldown or silent second paid render
         except ModelDegradedError as exc:
             last_error = exc
             if account is not None:

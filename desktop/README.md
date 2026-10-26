@@ -20,7 +20,7 @@ Ship the generated `out/` folder with the Python desktop package. Run
 `run_windows.bat` from the repository root on Windows; it installs the worker
 dependencies and opens `http://127.0.0.1:8000` in an app window.
 
-### Updating an existing Windows install (upload + live-results fix)
+### Updating an existing Windows install (silent clipboard + live results)
 
 After pulling the updated source, **rebuild and replace `out/`** using
 `npm ci && npm run build:desktop` on the development/build machine. `out/` is a
@@ -28,8 +28,11 @@ generated, git-ignored bundle: pulling Python/TS source alone does not update an
 older packaged UI. Copy that fresh bundle to the Windows package, stop its old
 engine/app window, then run `run_windows.bat` and reload the dashboard. The end
 user still does not need a running Node process. `/api/health` identifies this
-worker as **`2.5.1-multilingual-upload-live-retry`** and advertises `donepixelRetry`.
+worker as **`2.5.2-clipboard-originals-no-dom-cooldown`** and advertises `donepixelRetry`.
 Keep existing verified Chrome profiles, local SQLite files and genuine output.
+The clipboard/original-extraction changes themselves are Python-side; if the
+package already has the `963f530` live-card UI, restarting its updated worker is
+sufficient. Rebuild the UI when shipping a fresh package or upgrading older UI.
 
 ### Windows startup upgrades and crash logs
 
@@ -94,35 +97,64 @@ Chrome process, so parallel accounts need separate ports). Credentials are
 never requested again and no cookie values are exported into application JSON or frontend JavaScript.
 `desktop/worker/gemini_cdp.py` drives Gemini's normal chat input:
 
-1. dispatch the reference file(s) to `<input type="file" accept="image/*">`
-   (fallbacks: the attachment menu's intercepted file chooser, then native
-   drag-and-drop onto the rich-textarea);
-2. **Gate 1** — wait for newly rendered, loaded reference thumbnails inside the
-   actual composer, including HTTP-backed `img`/`.attachment-card` previews.
-   English/French upload labels plus locale-independent SVG/Material icons and
-   test IDs are supported. Avatars, chat-history images, hidden/broken previews,
-   empty cards and pre-existing composer decorations do not satisfy the gate.
-   A hidden spinner does not block a finished upload; a visible one still does;
-3. inject the exact prompt into the rich-textarea with `Input.insertText`;
-4. submit with the composer-scoped Send/Envoyer control (Enter fallback);
-   **Gate 2** — the user bubble must carry the attached image;
-5. wait for the response, then extract the image at full size: the
-   *Download full size image* / French *Télécharger l'image* button with browser-level
-   `Browser.setDownloadBehavior`, falling back to an in-page `=s0` original
-   fetch, then `canvas.toDataURL` at natural size (thumbnails < 256 px are
-   rejected);
-6. return **exactly one** image — extra images in a response are ignored.
+1. Read each real reference on the server, sniff its actual image MIME without
+   converting/recompressing the pixels, Base64 it in memory, reconstruct a
+   `File`/`DataTransfer`, focus `rich-textarea [contenteditable="true"]` and dispatch
+   `ClipboardEvent('paste')` through `Runtime.evaluate`. No OS clipboard read/write,
+   upload menu, Images pill, file-input setter, native file chooser or visible
+   generation window is used.
+2. **Gate 1** verifies exactly the expected new, loaded reference thumbnails in
+   the composer **after each reference**, keeping niche IMAGE 1 before style
+   IMAGE 2. Existing draft attachments, duplicates, avatars/history, hidden/broken
+   previews and empty cards cannot satisfy it. If paste is unhandled and no
+   upload/thumbnail is in progress, the **same staged File** may be dispatched
+   once with in-memory `DragEvent('drop')`. An acknowledged/busy/partially accepted
+   paste is never resent via drop. This intentionally avoids dispatching both
+   deliveries unconditionally and uploading every reference twice. Staged page
+   data is released after each attempt.
+3. Inject the exact prompt with `Input.insertText`; verify its **entire** normalized
+   text, not only its first 48 characters. A native insertion truncation gets one
+   full replacement attempt; a remaining mismatch fails before sending. The
+   source Fusion/Donepixel literals remain byte-identical; browser paragraph
+   whitespace is normalized only for comparison.
+4. Submit with the composer-scoped Send/Envoyer control (Enter fallback).
+   **Gate 2** requires the complete expected number of real user-bubble reference
+   images, excluding avatars, rather than accepting one image for a two-image fusion.
+5. Extract the **first generated asset at original resolution** using its full-size
+   Download control with browser-level download behavior (no OS Save As dialog),
+   or an in-page original-only fetch. `=s…`/`=w…`/`=h…` URLs are requested at `=s0`,
+   preserving query parameters; explicit original metadata URLs are supported.
+   A failed original never falls back to the known preview URL or a canvas copy.
+   A supposed full-size export returning only known preview-sized pixels fails
+   visibly. The CDP extractor never resizes the original bytes or invents 8K pixels.
+6. Return **exactly one** original; response candidate sets are not saved. Actual
+   native width/height are recorded. A local 8K-source regression verifies a
+   6554 × 8192 original byte-for-byte; this is not proof Google will generate
+   native 8K just because a prompt requests it.
 
-Refusals and text-only answers fail the job; image-limit messages trigger the
-account's cooldown. Disconnecting an idle account closes its headless client and deletes its SQLite row and profile folder. Deletion failures remain visible and do not report a successful disconnect. `desktop/profiles/` holds private live sessions and is git-ignored. No legacy JSON account file is read or written. Gemini's DOM changes over time; all selectors
-live in `gemini_cdp.SELECTORS`. Direct file-input CDP errors fall back to the
-intercepted chooser and native drag/drop. A partial/still-busy upload never
-gets appended again to make the gate pass with duplicate references. The
-per-strategy thumbnail wait defaults to 45 seconds (`MERCHFLOW_CDP_UPLOAD_TIMEOUT`).
-French account/session, Send, Stop and full-size download labels are supported
-as well. Tests drive real headless Chromium against a
-local DOM stand-in (`tests/support/fake_gemini.py`); a live Google sign-in
-still needs a manual smoke test on Windows.
+**No false account cooldowns for local glitches.** `GeminiAutomationError`
+classifies composer/clipboard/gate/prompt/CDP/timeout/original-extraction errors;
+explicit refusals and empty results are also non-quota failures. Both Fusion and
+Donepixel release the lease without cooldown, false success-usage increments,
+auth invalidation or silently trying another paid account. The remote request may
+already have rendered: only explicit Retry may reissue it. Actual verified
+sign-out, explicit provider limit/Flash-degradation signals, and existing window
+caps still enforce their real account guards. No quota bypass is implemented.
+
+Generation stays headless and will not reuse a visible Chrome process for the
+private profile; close that window first. Initial Google sign-in remains the
+real, visible, browser-verified setup flow described above. Disconnecting an idle
+account closes its headless client and deletes its SQLite row/profile. Failures
+stay visible, never synthetic successes. `desktop/profiles/` holds private live
+sessions and is git-ignored; no legacy JSON account file is read or written.
+Gemini may change its DOM or reject synthetic events: dispatch alone is **not**
+accepted as upload success, no fake thumbnail is inserted, and UI upload fallbacks
+are forbidden. Such failures leave the account healthy and show their exact error.
+The per-gate wait defaults to 45 seconds (`MERCHFLOW_CDP_UPLOAD_TIMEOUT`). English/
+French session, Send, Stop and full-size download labels remain supported.
+Tests use real Chromium against `tests/support/fake_gemini.py` (an explicit local
+DOM fixture, never Google). Live authenticated Gemini and native Windows still
+require target-machine smoke tests.
 
 **Account admission and upgrade safeguards**
 
@@ -346,7 +378,7 @@ unauthenticated public multi-user service.
 | `MERCHFLOW_OUT` | `<repository>/output` | PNGs, previews and durable History |
 | `MERCHFLOW_DB` | `~/MerchFlow/merchflow.db` | Existing account/job/listing database |
 | `MERCHFLOW_WORKER_URL` | `http://127.0.0.1:8000` | Next.js → worker proxy |
-| `MERCHFLOW_CDP_UPLOAD_TIMEOUT` | `45` | Seconds per strategy to verify new, loaded composer thumbnails |
+| `MERCHFLOW_CDP_UPLOAD_TIMEOUT` | `45` | Seconds per gate to verify each silent paste/drop reference thumbnail |
 | `MERCHFLOW_P2P_PARALLEL` | `8` | Parallel P2P provider calls, capped to eligible account count (1–32) |
 | `MERCHFLOW_REMBG_MODEL` | `u2net` | Default model for direct pipeline callers |
 | `U2NET_HOME` | rembg default | Model weights cache directory |
@@ -414,7 +446,12 @@ optional ZIP only, navigation/reload recovery, immediate pre-POST pending cards,
 full exact-error badges, no false zero-image completion, retry/reselection with
 no duplicate saved outputs, byte-identical optional PNG Download, saved-ID
 Prepare handoff, and real Listing Hub file association, including regenerating the same retained files on another colour
-with fresh job identities. Python provider fixtures exercise genuine 1/5/20/101 disk archives
+with fresh job identities. Clipboard regressions forbid menu/Images/file-input/chooser commands, preserve
+original JPEG MIME/bytes even under a .png filename, verify sequential IMAGE 1/2,
+reject rejected/double/stale pastes, repair truncated prompts, and reject preview
+fallbacks when original requests fail. Account-policy tests cover both generation
+paths with no false local-error cooldowns while retaining real auth/quota guards.
+Python provider fixtures exercise genuine 1/5/20/101 disk archives
 and exact-pixel lossless RGBA roundtrip above 4 MB. These are not a claim of
 successful live Gemini rendering. Linux validation does not replace an actual
 Windows/native-package and authenticated-provider smoke test.
