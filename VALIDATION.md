@@ -1,66 +1,71 @@
 # Pipeline validation — 2026-10-26
 
-## Current integration: Prepare Lab streaming pipeline and headless Chrome flags
+## Current integration: native-first archives, Prepare, and CDP
 
-Built on published `bba33c8740c0b5b38f9d76609ad72b7094ad33d8`, retaining its
-10-worker dynamic Donepixel scheduling, multi-tab Gemini pool, and all
-`b2e2361` silent-paste/original-only/no-false-cooldown contracts. Worker identity:
-`2.5.6-zero-disk-choke`.
+Worker identity: `2.5.8-native-first-halftone`.
 
-- Headless generation Chrome receives the requested background/render flags;
-  visible account-login Chrome does not. Unit tests assert the launch contract
-  and that visible login omits these flags. Playwright exercised the UI with
-  isolated local fixtures, not Gemini's generation browser. No 80MB-per-tab
-  ceiling was measured; memory remains machine/workload dependent.
-- The existing batch scheduler/pool already provides `MAX_PARALLEL=10` and ten
-  per-account slots by default (each bounded/configurable 1–32), dynamically
-  capped by queued jobs and eligible account capacity. Its leases, rolling-window
-  reservations and monotonic auth/quota safeguards remain unchanged.
-- Prepare has three cards: removal ON (With AI remains the regression-safe
-  default, with selectable U2Net/BiRefNet and 1–2px choke; Without AI uses
-  border-median/OpenCV exterior flood fill), Upscale OFF, and print resize ON
-  (4500×5400, 300 DPI, 350px collar margin). Keep-holes and everywhere are
-  tested across black, white, orange, navy and lime backgrounds. Without AI
-  never invokes rembg; With AI retains the real rembg path.
-- The desktop process endpoint streams final PNG encoding through libvips and
-  fails closed rather than reverting to Pillow if the native runtime is missing.
-  The final OpenCV 1–2px alpha choke now uses one in-memory mask operation with
-  no temporary `.raw` mask file; this removes the libvips file-handle race on
-  Windows. The RGBA source and full-resolution eroded-alpha mask remain live
-  through the write, so peak RAM scales with output dimensions (especially when
-  upscaling); 18MB is not claimed. Master PNG compression is level 6 and remains
-  lossless RGBA. Lanczos 2×/4×/8× is ordinary resampling, not AI super-resolution.
-- History→Prepare now sends only `designId`, name and settings; the worker
-  validates its SQLite-backed path and reads the original PNG from disk. The
-  Prepare display uses the small preview, and an E2E assertion confirms the
-  browser neither requests the full original nor posts an `image`/Base64 field.
-  Uploaded local files retain their existing upload path.
-- CDP paste polls every 350ms for up to 12 seconds for a live editable composer
-  before dispatch. Chromium fixture tests cover delayed-render success and timeout.
-- In this sandbox, a synthetic full 4500×5400 Without AI Prepare run with level-6
-  PNG compression measured **2.427s** and produced a 128,625-byte PNG; compression
-  level 1 measured 2.083s / 975,167 bytes on the same simple fixture. This does
-  not substantiate the promised <1.5s or 10× improvement on production designs.
-  The earlier border-detection-only measurement was 1.2377s (not the proposed
-  0.03s goal). Peak process RSS for
-  the level-6 run was **832,044 KiB**, including Python, ONNX/runtime and imaging
-  library imports; this is not a clean per-pipeline RAM measurement. The 18MB
-  claim is not made, and large 4×/8× outputs can require substantial RAM/disk.
-- The static UI export and normal Next production build passed; History→Prepare
-  handoff was covered by the full static-worker browser run.
+- Donepixel stores the provider's original render as a lossless RGBA PNG at its
+  decoded native dimensions. Generation does not upscale. History records the
+  native width/height and the real saved byte count; original-only extraction
+  and the no-false-cooldown behavior remain in place.
+- History→Prepare sends `designId`, name, and settings only. The worker resolves
+  the SQLite-backed disk record; the browser displays the small preview and
+  never fetches/posts the full-resolution PNG. Local file uploads keep their
+  binary upload path.
+- With AI remains ON by default and uses real U2Net/BiRefNet. Without AI is an
+  explicit opt-in using median-border/OpenCV exterior flood fill. Cutout,
+  despeckle, and the 1–2px alpha choke run at native/source resolution before
+  any print resize. If no foreground remains, the exact client error is:
+  `Subject matches the border color. Try With AI mode or lower color tolerance.`
+- Despeckle counts connected components in OpenCV. Above 50,000 foreground
+  components it skips per-component deletion, applies one 3×3 morphological
+  close, preserves the texture, and returns zero removed pixels. This avoids a
+  large Python contour-object list on halftone/grain masks.
+- Only after native processing and foreground validation may the worker resize
+  and pad to the 4500×5400, 300-DPI print canvas, with a 180px top collar margin.
+  The matching Elite T-shirt product canvas and mockup collar preset also use
+  180px. The final PNG is streamed through libvips to disk with lossless RGBA
+  and compression level 6; History stores the output's actual dimensions/bytes.
+  Lanczos is resampling, not AI super-resolution.
+- The P2P input queue has no fixed item-count cap; tests exercise 101 inputs.
+  Rendering concurrency remains distinct from queue size: the worker pool is
+  configurable at 1–32 (default 10), per-account slots at 1–32 (default 2), and
+  same-account launches are staggered by 2.5 seconds.
+- Chrome applies the requested background-timer, occluded-window, renderer, and
+  native Win-occlusion flags to both launch modes. Manual sign-in stays visible
+  at the normal desktop position; no off-screen `--window-position` flag is
+  added. Headless-only resource flags remain separate. Worker cleanup targets
+  only the owned Chrome PID tree; no system-wide Chrome kill is used.
+- The isolated Playwright provider is test-only, labeled, and confined to a
+  temporary output/SQLite directory. It makes no Gemini calls and is not a
+  production account or a claim of live provider success.
 
 Validation results:
 
-- **186 Python passed, 1 opt-in test skipped** (451.08s; one Starlette/httpx
-  deprecation warning). This includes 46 real Chromium CDP fixture tests.
-- **26 TypeScript unit tests passed.** ESLint, typecheck, compileall and
-  `git diff --check` passed.
-- **20 Chromium E2E tests passed** (3.7m), including the isolated local fixture
-  provider, Retry, strict failure states, a direct-disk History/Prepare handoff
-  with no original browser fetch, and a 55-file real libvips/disk/SQLite/ZIP run.
-  No live Gemini/paid rendering or native-Windows production smoke was used.
+- **182 Python tests passed, 15 skipped** (272.21s; one Starlette/httpx
+  deprecation warning). `compileall` and `git diff --check` passed.
+- **27 TypeScript unit tests passed.** ESLint, typecheck, normal production
+  build, and static desktop build passed.
+- **20 Chromium E2E tests passed** (3.5m), using the isolated local fixture
+  provider. Coverage includes pending/success/failure/retry, native-size disk
+  archives, History→Prepare without original-image fetch, a 55-file real
+  libvips/disk/SQLite/ZIP run, and 101-file dynamic ingestion. No live Gemini,
+  paid rendering, or native-Windows production smoke was run.
+- `npm ci` reports 7 dependency advisories (4 moderate, 2 high, 1 critical); no
+  dependency updates were made as part of this image-pipeline change.
+
+Performance boundary: a synthetic 1500×1500 mask with 562,500 isolated pixels
+measured connected-component counting at 0.037s and the morphological close at
+0.001s in this sandbox. An alternative `findContours` call measured 0.54s and
+process RSS rose from 45.3 to 274.9 MiB for that same synthetic case. These are
+fixture measurements only—not a production RAM ceiling, image-processing SLA,
+or speedup claim. No `<0.2s`, `<15MB`, or 0%-RAM guarantee is made.
 
 ## Retained baseline: 10× dynamic Donepixel workers and concurrent Gemini tabs
+
+Historical notes below describe the pre-native-first baseline. Where an older
+setting conflicts with the current section above, the current native-first
+settings take precedence.
 
 Worker identity: `2.5.3-multitab-dynamic-batch`, built atop published
 `b2e236145d3b7b495e7e2fab1071439087cd8ab8` (`2.5.2` silent-paste/original-only

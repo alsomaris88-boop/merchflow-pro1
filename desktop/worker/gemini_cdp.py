@@ -179,11 +179,13 @@ def chrome_args(exe: str, user_data_dir: Path | str, port: int, *, headless: boo
         "--no-first-run",
         "--no-default-browser-check",
         "--disable-session-crashed-bubble",
-        "--disable-features=Translate,MediaRouter",
+        "--disable-background-timer-throttling",
+        "--disable-backgrounding-occluded-windows",
+        "--disable-renderer-backgrounding",
+        "--disable-features=Translate,MediaRouter,CalculateNativeWinOcclusion",
     ]
     if headless:
-        # Keep the multi-tab worker lean without changing visible sign-in
-        # windows. These flags reduce background/renderer work, but Chrome's
+        # These flags make CDP event/focus timing more predictable. Chrome's
         # actual memory use remains workload- and machine-dependent.
         args += [
             "--headless=new",
@@ -195,8 +197,6 @@ def chrome_args(exe: str, user_data_dir: Path | str, port: int, *, headless: boo
             "--disable-translate",
             "--mute-audio",
             "--hide-scrollbars",
-            "--disable-renderer-backgrounding",
-            "--disable-backgrounding-occluded-windows",
             "--disable-ipc-flooding-protection",
             "--disable-dev-shm-usage",
             "about:blank",

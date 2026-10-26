@@ -55,8 +55,8 @@ except Exception:
 PRODUCTS: dict[str, dict] = {
     "tshirt": {
         "label": "Standard T-Shirt / Long Sleeve",
-        "w": 4500, "h": 5400, "top_margin": 350, "mode": "top",
-        "fill": 0.92, "note": "top 350px collar margin, centered",
+        "w": 4500, "h": 5400, "top_margin": 180, "mode": "top",
+        "fill": 0.92, "note": "top 180px collar margin, centered",
     },
     "hoodie": {
         "label": "Hoodie / Sweatshirt",

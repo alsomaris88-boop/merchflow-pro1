@@ -245,7 +245,7 @@ export default function Mockup() {
 
             <div className="flex gap-2">
               <Btn variant="ghost" className="flex-1 justify-center py-2 text-[11.5px]" onClick={() => setOffsetY(0)}>Center chest</Btn>
-              <Btn variant="ghost" className="flex-1 justify-center py-2 text-[11.5px]" onClick={() => setOffsetY(-46)}>Collar −350px</Btn>
+              <Btn variant="ghost" className="flex-1 justify-center py-2 text-[11.5px]" onClick={() => setOffsetY(-24)}>Collar −180px</Btn>
             </div>
 
             <Field label="Scene">

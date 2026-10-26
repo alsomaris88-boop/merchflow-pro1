@@ -364,7 +364,7 @@ export default function PrepareLab() {
             </div>
             <div className="rounded-lg border border-[#c9f24b]/25 p-3 font-mono2 text-[11px] text-[#c9f24b]">
               {settings.resizeForPrint
-                ? `Base target 4500 × 5400 px @ 300 DPI · 350 px collar margin${settings.upscale ? ` · final ${4500 * settings.upscaleFactor} × ${5400 * settings.upscaleFactor} px` : ""}`
+                ? `Base target 4500 × 5400 px @ 300 DPI · 180 px top collar margin${settings.upscale ? ` · final ${4500 * settings.upscaleFactor} × ${5400 * settings.upscaleFactor} px` : ""}`
                 : `OFF · preserve source dimensions${settings.upscale ? ` · then ${settings.upscaleFactor}×` : ""}`}
             </div>
           </Card>

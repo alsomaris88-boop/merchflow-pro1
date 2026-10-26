@@ -127,11 +127,27 @@ def test_without_ai_mode_skips_rembg_and_reports_sampled_background(tmp_path, mo
 
 def test_without_ai_empty_foreground_raises_the_actionable_error(tmp_path):
     source = Image.new("RGBA", (32, 32), (0, 0, 0, 255))
-    with pytest.raises(ValueError, match="^No foreground remaining; try With AI mode or adjust tolerance\\.$"):
+    with pytest.raises(ValueError, match="^Subject matches the border color\\. Try With AI mode or lower color tolerance\\.$"):
         image_lab.process_design(png_bytes(source), {
             "remove": True, "mode": "without_ai", "despeckle": False,
         }, tmp_path, "all-background")
     assert output_store.list_designs(tmp_path) == []
+
+
+def test_despeckle_halftone_guard_uses_one_morphological_close_over_50k_components():
+    if image_lab.cv2 is None:
+        pytest.skip("Requires OpenCV")
+    rgba = np.zeros((460, 460, 4), dtype=np.uint8)
+    rgba[::2, ::2] = (200, 80, 30, 255)  # 52,900 isolated alpha islands
+    source = Image.fromarray(rgba, "RGBA")
+    alpha = rgba[..., 3].copy()
+    kernel = image_lab.cv2.getStructuringElement(image_lab.cv2.MORPH_ELLIPSE, (3, 3))
+    expected = image_lab.cv2.morphologyEx(alpha, image_lab.cv2.MORPH_CLOSE, kernel)
+
+    result, removed = image_lab._despeckle(source, min_size=4)
+
+    assert removed == 0  # preserve halftone texture rather than deleting every dot
+    assert np.array_equal(np.asarray(result.getchannel("A")), expected)
 
 
 def test_streaming_prepare_fails_closed_without_libvips(tmp_path, monkeypatch):
@@ -208,7 +224,7 @@ def test_streaming_upscale_is_optional_and_records_real_output_dimensions(tmp_pa
 def test_inference_failure_and_empty_foreground_fail_the_job(tmp_path, monkeypatch):
     monkeypatch.setattr(image_lab, "_session", lambda model: object())
     monkeypatch.setattr(image_lab, "_rembg_remove", lambda image, **kwargs: Image.new("RGBA", image.size))
-    with pytest.raises(ValueError, match="^No foreground remaining; try With AI mode or adjust tolerance\\.$"):
+    with pytest.raises(ValueError, match="^Subject matches the border color\\. Try With AI mode or lower color tolerance\\.$"):
         image_lab.process_design(png_bytes(Image.new("RGBA", (32, 32), "orange")), {}, tmp_path)
     assert output_store.list_designs(tmp_path) == []
 
@@ -224,7 +240,7 @@ def test_prepare_exports_real_4500x5400_png_at_300dpi(tmp_path, neural_mask):
         assert output.size == (4500, 5400)
         assert output.info["dpi"] == pytest.approx((300, 300), abs=0.02)
         assert output.getpixel((0, 0))[3] == 0
-        assert output.getchannel("A").getbbox()[1] == 350  # choke ran at native size before print placement
+        assert output.getchannel("A").getbbox()[1] == 180  # 180px collar; native choke ran before print resampling
 
 
 @pytest.mark.parametrize("background", ["transparent", "black", "white", "original"])

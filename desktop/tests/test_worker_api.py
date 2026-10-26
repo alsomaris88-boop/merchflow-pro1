@@ -172,7 +172,7 @@ def test_empty_background_cutout_returns_actionable_client_error_not_500(worker)
     assert response.status_code == 422
     assert response.json() == {
         "ok": False,
-        "reason": "No foreground remaining; try With AI mode or adjust tolerance.",
+        "reason": "Subject matches the border color. Try With AI mode or lower color tolerance.",
     }
     assert output_store.list_designs(module.OUT_DIR) == []
 

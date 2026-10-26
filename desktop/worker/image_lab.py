@@ -42,7 +42,8 @@ HAS_CV = cv2 is not None
 EXPORT_W, EXPORT_H = 4500, 5400
 ENGINE_NAME = "pyvips-lanczos3" if HAS_VIPS else "pillow-lanczos"
 REMBG_MODELS = {"u2net": "u2net", "birefnet": "birefnet-general", "birefnet-general": "birefnet-general"}
-EMPTY_FOREGROUND_ERROR = "No foreground remaining; try With AI mode or adjust tolerance."
+EMPTY_FOREGROUND_ERROR = "Subject matches the border color. Try With AI mode or lower color tolerance."
+DESPECKLE_COMPONENT_GUARD = 50_000
 _SESSIONS: dict[str, object] = {}
 _SESSION_LOCK = threading.Lock()
 # Bounded memory on ordinary Windows PCs, including concurrent HTTP requests.
@@ -269,7 +270,21 @@ def _despeckle(image: Image.Image, min_size: int = 4) -> tuple[Image.Image, int]
     rgba = getattr(image, "_merchflow_rgba", None)
     backed = isinstance(rgba, np.ndarray) and rgba.shape == (image.height, image.width, 4)
     alpha = rgba[..., 3] if backed else np.array(image.getchannel("A"))
-    count, labels, stats, _ = cv2.connectedComponentsWithStats((alpha > 16).astype(np.uint8), connectivity=8)
+    count, labels, stats, centroids = cv2.connectedComponentsWithStats(
+        (alpha > 16).astype(np.uint8), connectivity=8,
+    )
+    if count - 1 > DESPECKLE_COMPONENT_GUARD:
+        # A grain/halftone image can contain hundreds of thousands of tiny
+        # islands. Do not allocate a per-contour Python object list or mutate
+        # every dot individually; smooth this pathological case once in C++.
+        del labels, stats, centroids
+        close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        alpha_clean = cv2.morphologyEx(alpha, cv2.MORPH_CLOSE, close_kernel)
+        if backed:
+            rgba[..., 3] = alpha_clean
+        else:
+            image.putalpha(Image.fromarray(alpha_clean))
+        return image, 0
     small = np.zeros(count, dtype=bool)
     small[1:] = stats[1:, cv2.CC_STAT_AREA] < max(1, min_size)
     removed = small[labels]
@@ -277,7 +292,7 @@ def _despeckle(image: Image.Image, min_size: int = 4) -> tuple[Image.Image, int]
     alpha[removed] = 0
     if not backed:
         image.putalpha(Image.fromarray(alpha))
-    del labels, stats, small, removed
+    del labels, stats, centroids, small, removed
     return image, pixels
 
 
@@ -419,7 +434,7 @@ def _prepare(raw: bytes, settings: dict, out_dir: Path, name: str, metadata: dic
         w, h = settings.get("dimensions", (EXPORT_W, EXPORT_H))
         if (w, h) not in {(4500, 5400), (4500, 4500), (4050, 5400)}:
             raise ValueError("Unsupported print canvas")
-        top = 350 if settings.get("placement", "top") == "top" else 0
+        top = 180 if settings.get("placement", "top") == "top" else 0
         max_w, max_h = int(w * 0.92), h - top - (220 if top else int(h * 0.10))
         scale = min(max_w / image.width, max_h / image.height)
         dw, dh = max(1, round(image.width * scale)), max(1, round(image.height * scale))

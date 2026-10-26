@@ -26,7 +26,18 @@ with tempfile.TemporaryDirectory(prefix="merchflow-p2p-browser-") as temp:
     import uvicorn
 
     pool = gemini_pool.AccountPool()
-    pool.accounts = [gemini_pool.AccountState(id=i, email="TEST FIXTURE - NO LIVE GEMINI", status="ready", is_pro=True) for i in (1, 2, 3)]
+    # These visibly labeled identities exist only inside this isolated test
+    # process and temporary SQLite/output directory. They carry no cookies or
+    # real profile and never contact Gemini; the login marker lets the UI
+    # exercise authenticated-only controls without production test accounts.
+    pool.accounts = [
+        gemini_pool.AccountState(
+            id=i, email=f"TEST FIXTURE - NO LIVE GEMINI {i}", login_flow_id=f"fixture-only-{i}",
+            verified_at=time.time(), engine="cdp", profile_dir=str(root / "fixture-profiles" / str(i)),
+            status="ready", is_pro=True,
+        )
+        for i in (1, 2, 3)
+    ]
     pool._wait_jitter = lambda account: None
     gemini_pool.POOL = pool
 

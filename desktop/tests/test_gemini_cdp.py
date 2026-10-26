@@ -228,14 +228,21 @@ def test_login_and_headless_launch_contract(isolated):
     worker = gemini_cdp.chrome_args("chrome", udir, gemini_cdp.cdp_port(1), headless=True)
     assert "--headless=new" in worker and f"--user-data-dir={udir}" in worker
     assert "--remote-debugging-port=9222" in worker
+    automation_flags = {
+        "--disable-background-timer-throttling", "--disable-backgrounding-occluded-windows",
+        "--disable-renderer-backgrounding",
+    }
+    assert automation_flags.issubset(worker) and automation_flags.issubset(login)
+    assert "--disable-features=Translate,MediaRouter,CalculateNativeWinOcclusion" in worker
+    assert "--disable-features=Translate,MediaRouter,CalculateNativeWinOcclusion" in login
+    assert not any(arg.startswith("--window-position=") for arg in login), "manual sign-in stays visible"
     memory_flags = {
         "--disable-gpu", "--disable-extensions", "--disable-background-networking",
         "--disable-sync", "--disable-translate", "--mute-audio", "--hide-scrollbars",
-        "--disable-renderer-backgrounding", "--disable-backgrounding-occluded-windows",
         "--disable-ipc-flooding-protection", "--disable-dev-shm-usage",
     }
     assert memory_flags.issubset(worker)
-    assert not memory_flags.intersection(login), "visible account-login Chrome keeps its normal browser behavior"
+    assert not memory_flags.intersection(login), "visible login does not receive headless-only flags"
     assert [gemini_cdp.cdp_port(n) for n in (1, 2, 3)] == [9222, 9223, 9224]
 
 

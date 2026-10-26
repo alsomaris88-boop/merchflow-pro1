@@ -20,7 +20,7 @@ export interface ProductSpec {
 }
 
 export const PRODUCTS: ProductSpec[] = [
-  { key: "tshirt", label: "T-Shirt / Long Sleeve", w: 4500, h: 5400, mode: "top", topMargin: 350, fill: 0.92, note: "350px collar margin" },
+  { key: "tshirt", label: "T-Shirt / Long Sleeve", w: 4500, h: 5400, mode: "top", topMargin: 180, fill: 0.92, note: "180px collar margin" },
   { key: "hoodie", label: "Hoodie / Sweatshirt", w: 4500, h: 4050, mode: "top", topMargin: 300, bottomSafe: 800, fill: 0.88, note: "800px pocket safe zone" },
   { key: "popsocket", label: "PopSockets Grip", w: 2400, h: 2400, mode: "center", circleMask: 1000, fill: 0.72, note: "circular mask r=1000px" },
   { key: "tote", label: "Tote Bag", w: 2925, h: 2925, mode: "center", fill: 0.8, note: "square scaling" },

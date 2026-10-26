@@ -26,7 +26,7 @@ This release changes both the Python worker and the Prepare Lab UI. Pull/replace
 the worker source and rebuild the static UI with `npm ci && npm run build:desktop`;
 copy the generated `out/` to the Windows package, stop its old engine/app window,
 run `run_windows.bat`, and reload. `/api/health` identifies the worker as
-**`2.5.7-native-first-two-slot`** and reports the parallel/tab limits.
+**`2.5.8-native-first-halftone`** and reports the parallel/tab limits.
 
 `out/` is generated and git-ignored. Do not replace genuine verified Chrome
 profiles, SQLite credentials, or existing output during an update. The end user
@@ -91,11 +91,14 @@ shown and the session is live, the visible browser closes and the same profile i
 
 Generation opens or reuses **the same profile headlessly**
 (`--headless=new`, DevTools port `9222 + id − 1`; each profile is its own
-Chrome process, so parallel accounts need separate ports). Headless launches add
-background-work/renderer flags (`--disable-gpu`, extensions, sync, background
-networking, occlusion/render backgrounding, and others); visible sign-in Chrome
-keeps its regular launch behavior. These are workload hints, not a hard memory
-limit or an 80MB-per-tab guarantee. Credentials are never requested again and
+Chrome process, so parallel accounts need separate ports). Both launch modes use
+CDP timing/occlusion flags (`--disable-background-timer-throttling`,
+`--disable-backgrounding-occluded-windows`, `--disable-renderer-backgrounding`,
+and disabled native Win occlusion). Manual sign-in remains visible at the normal
+desktop position; off-screen positioning is deliberately omitted so first-time
+account setup stays usable. The headless worker additionally disables GPU,
+extensions, sync, background networking and other nonessential work. These are
+workload hints, not a hard memory limit or an 80MB-per-tab guarantee. Credentials are never requested again and
 no cookie values are exported into application JSON or frontend JavaScript.
 `desktop/worker/gemini_cdp.py` drives Gemini's normal chat input:
 
@@ -196,7 +199,7 @@ uses its own exact single-reference fidelity prompt, not the fusion directive.
 
 `desktop/worker/image_lab.py` offers two explicit modes. **With AI** remains the
 Prepare default and uses real rembg/ONNX with selectable U2Net or
-`birefnet-general`; its alpha edges retain the OpenCV 1–2px final-resolution
+`birefnet-general`; its alpha edges retain the OpenCV 1–2px native-resolution
 choke. It preserves existing transparent
 counters and handles textured/uneven backdrops better than a colour key. First
 use may download model weights; missing dependencies, inference failures and
@@ -213,7 +216,7 @@ not promise a fixed 0.03-second runtime.
 The Prepare Lab now has three focused cards: **Remove the background** (default
 ON; With AI/Without AI and precision), **Upscale** (default OFF; optional 2×/4×/8×
 Lanczos interpolation), and **Resize for printing** (default ON; 4500×5400 at
-300 DPI with a 350px top collar margin). Lanczos is resampling, not learned
+300 DPI with a 180px top collar margin). Lanczos is resampling, not learned
 super-resolution; it does not invent detail. With print resizing enabled, the
 selected upscale factor is applied to the print canvas, so 8× creates a very
 large output. With resizing off, the cutout/source pixel dimensions are kept
@@ -222,7 +225,7 @@ before optional scaling.
 The local `/api/bridge/process` path builds and writes its final RGBA PNG through
 libvips to disk, verifies dimensions, alpha-capable mode and DPI, and then
 registers the saved file in History; it does not return an archive-sized PNG
-buffer to the UI. The final-resolution OpenCV alpha choke is one in-memory
+buffer to the UI. The native-resolution OpenCV alpha choke is one in-memory
 operation with no temporary raw mask file, avoiding Windows rawload file-handle
 races. Source RGBA and the full-frame eroded-alpha mask stay alive until the PNG
 write completes, so peak RAM scales with the final dimensions (and can be large
@@ -352,7 +355,7 @@ When the saved design is sent to Prepare Lab, the worker reads its original PNG
 from disk by `designId`. Background removal (real U2Net/BiRefNet or the explicit
 Without AI OpenCV flood-fill mode), despeckle and the 1–2px OpenCV alpha choke
 run at native/source resolution. If no foreground remains, Prepare returns the
-actionable error `No foreground remaining; try With AI mode or adjust tolerance.`
+actionable error `Subject matches the border color. Try With AI mode or lower color tolerance.`
 Only after the cutout is validated does libvips Lanczos3-resize and pad it onto
 the selected print canvas (4500 × 5400 @ 300 DPI by default), streaming the final
 PNG directly to disk with compression level 6. The earlier 18MB/15MB memory

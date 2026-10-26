@@ -297,7 +297,7 @@ test("Retry of a legacy/missing original opens a real file chooser and reuploads
   const batch = await startSelected(page, 1), failed = await terminalBatch(request, batch.id, "failed"), job = failed.items[0];
   // Delete ONLY this explicit fixture's temporary source to reproduce old builds,
   // which deleted failed originals. Never touch source fixtures or real output.
-  const outDir = (await (await request.get("/api/health")).json()).outDir;
+  const outDir = (await (await request.get("/api/bridge")).json()).outDir;
   expect(outDir).toContain("merchflow-p2p-browser-");
   await unlink(path.join(outDir, ".p2p-inputs", batch.id, job.id));
   await page.reload(); await page.getByRole("button", { name: "Pixel to Pixel", exact: true }).click();

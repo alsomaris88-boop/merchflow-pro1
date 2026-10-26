@@ -20,6 +20,11 @@ def assert_saved(record):
         assert image.info["dpi"] == pytest.approx((300, 300), abs=0.02)
 
 
+def test_tshirt_polycanvas_uses_current_180px_collar_margin():
+    assert elite_tools.PRODUCTS["tshirt"]["top_margin"] == 180
+    assert "180px collar margin" in elite_tools.PRODUCTS["tshirt"]["note"]
+
+
 def test_polycanvas_variants_are_registered_verified_pngs(tmp_path, monkeypatch):
     monkeypatch.setattr(elite_tools, "PRODUCTS", {"fixture": {"label": "Fixture product", "w": 80, "h": 96, "mode": "center", "fill": 0.8, "note": "test"}})
     items = elite_tools.adapt_to_products(source_png(), tmp_path, "product", ["fixture"])
