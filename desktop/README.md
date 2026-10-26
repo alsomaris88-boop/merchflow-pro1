@@ -22,17 +22,19 @@ dependencies and opens `http://127.0.0.1:8000` in an app window.
 
 ### Updating an existing Windows install (silent clipboard + live results)
 
-After pulling the updated source, **rebuild and replace `out/`** using
-`npm ci && npm run build:desktop` on the development/build machine. `out/` is a
-generated, git-ignored bundle: pulling Python/TS source alone does not update an
-older packaged UI. Copy that fresh bundle to the Windows package, stop its old
-engine/app window, then run `run_windows.bat` and reload the dashboard. The end
-user still does not need a running Node process. `/api/health` identifies this
-worker as **`2.5.2-clipboard-originals-no-dom-cooldown`** and advertises `donepixelRetry`.
-Keep existing verified Chrome profiles, local SQLite files and genuine output.
-The clipboard/original-extraction changes themselves are Python-side; if the
-package already has the `963f530` live-card UI, restarting its updated worker is
-sufficient. Rebuild the UI when shipping a fresh package or upgrading older UI.
+This release changes the Python worker only. If the Windows package already
+contains the live-card UI from `963f530`, replace/pull the updated worker source,
+stop its old engine/app window, run `run_windows.bat`, and reload; no UI rebuild
+is required for this concurrency change. `/api/health` identifies the worker as
+**`2.5.3-multitab-dynamic-batch`** and reports the parallel/tab limits.
+
+`out/` is generated and git-ignored. When shipping a fresh complete package or
+upgrading an older UI, rebuild and replace it on the development machine with
+`npm ci && npm run build:desktop`; pulling UI source alone cannot update an
+older packaged bundle. Copy the fresh `out/` to the Windows package, stop its
+old engine/app window, run `run_windows.bat`, and reload. The end user still does
+not need a running Node process. Keep genuine verified Chrome profiles, SQLite
+credentials, and existing output intact; never replace their private state.
 
 ### Windows startup upgrades and crash logs
 
@@ -245,14 +247,35 @@ The stable response parser deduplicates renditions and excludes uploaded referen
 
 `gemini_pool.DONEPIXEL_PROMPT` contains the exact requested 8K multimodal prompt,
 with only `{Selected_Color_Hex}` substituted. Every call sends one original
-uploaded reference to the real image provider. Available authenticated Pro
-sessions get exclusive, least-recently-used leases: one render per account,
-across accounts in parallel. The default ceiling is eight concurrent provider
-calls, configurable with `MERCHFLOW_P2P_PARALLEL` (1–32). Auth-required,
-cooldown, exhausted and unverified/non-Pro sessions are excluded. Flash
-model-degradation failures are not accepted as Pro successes. Existing fusion
-scheduling keeps its ordered account strategy and shares the exclusive leases.
-There is no promised render throughput or provider quota bypass. The prompt is
+uploaded reference to the real image provider. Eligible authenticated Pro
+sessions get atomic per-tab leases and share the batch across both accounts and
+independent headless tabs within each account.
+The dynamic worker count is `min(MERCHFLOW_P2P_PARALLEL, ready Pro accounts ×
+SLOTS_PER_ACCOUNT, queued jobs)`: default maximum **10 designs at once**, never
+more than the queued batch size. `MERCHFLOW_P2P_PARALLEL` is configurable from
+1–32 (default 10); `MERCHFLOW_GEMINI_SLOTS_PER_ACCOUNT` defaults to 10 and is
+configurable from 1–32. The pool reserves an individual tab slot **and** its
+rolling-window quota before dispatch, so 10 concurrent requests cannot spend the
+same final local Pro-window allowance. Unverified, non-Pro, auth-required and
+quota/cooldown accounts are excluded. A genuine quota/degradation signal blocks
+new leases, cannot be shortened by another tab's generic network error, and
+survives sibling success; verified auth-required state cannot be erased by a
+sibling quota signal.
+
+Each raw-CDP render owns its own Chrome tab, CDP WebSocket, input files,
+full-size image destination and thread-local diagnostics; sharing one profile
+never serializes the actual generation. Chrome's normal browser-context download
+folder is global, so only the final full-size *download/extraction* stage uses a
+per-account lock to prevent two tabs from saving/returning each other's PNG.
+Gemini's HTTP client similarly snapshots token/request IDs under a small state
+lock while the upload and image RPC network requests remain independent.
+The legacy sequential scheduler retains its randomized account jitter; dynamic
+parallel P2P bursts bypass that 65–85-second per-account delay, staying bounded
+by tab slots, the local window cap, and genuine provider auth/quota signals. Existing fusion calls still use the pool. Flash
+model-degradation failures remain real quota signals; no provider quota bypass or
+throughput guarantee is claimed. Up to ten concurrent 8K renders can still
+increase local memory/CPU/network use and may expose provider-side rate limits;
+operators can lower either slot setting if needed. The prompt is
 the exact requested faithful-artwork/no-variations text, including cleanup of
 fabric wrinkles, with only the selected Black/White hex substituted.
 
@@ -379,7 +402,8 @@ unauthenticated public multi-user service.
 | `MERCHFLOW_DB` | `~/MerchFlow/merchflow.db` | Existing account/job/listing database |
 | `MERCHFLOW_WORKER_URL` | `http://127.0.0.1:8000` | Next.js → worker proxy |
 | `MERCHFLOW_CDP_UPLOAD_TIMEOUT` | `45` | Seconds per gate to verify each silent paste/drop reference thumbnail |
-| `MERCHFLOW_P2P_PARALLEL` | `8` | Parallel P2P provider calls, capped to eligible account count (1–32) |
+| `MERCHFLOW_P2P_PARALLEL` | `10` | Per-batch concurrent provider calls, dynamically capped to jobs and Pro accounts × per-account slots (1–32) |
+| `MERCHFLOW_GEMINI_SLOTS_PER_ACCOUNT` | `10` | Independent concurrent headless tabs/RPC slots per eligible Gemini account (1–32) |
 | `MERCHFLOW_REMBG_MODEL` | `u2net` | Default model for direct pipeline callers |
 | `U2NET_HOME` | rembg default | Model weights cache directory |
 | `OMP_NUM_THREADS` | runtime default | ONNX CPU thread tuning |

@@ -1,4 +1,4 @@
-"""Real Gemini provider pool with exclusive per-account render leases.
+"""Real Gemini provider pool with bounded concurrent per-account tab leases.
 
 Pixel-to-Pixel distributes work across verified, available Pro sessions in
 parallel. Legacy fusion keeps lowest-slot scheduling. Provider limits, auth
@@ -22,6 +22,7 @@ from . import db, gemini_cdp, gemini_client, image_lab
 from .gemini_client import GeminiAuthError, GeminiAutomationError, GeminiRefusalError, GeminiRenderError, ModelDegradedError
 
 MOCK = os.environ.get("MERCHFLOW_MOCK_ENGINE", "").lower() in {"1", "true", "yes"}
+SLOTS_PER_ACCOUNT = max(1, min(32, int(os.environ.get("MERCHFLOW_GEMINI_SLOTS_PER_ACCOUNT", "10"))))
 
 # ---- Configured local scheduling budgets -------------------------------------------
 WINDOW_SECONDS = int(os.environ.get("MERCHFLOW_WINDOW_SECONDS", 5 * 3600))
@@ -174,7 +175,11 @@ class AccountPool:
     def __init__(self) -> None:
         self.lock = threading.RLock()
         self.condition = threading.Condition(self.lock)
-        self._busy: set[int] = set()
+        # Each entry is the number of active per-account generation leases.
+        # CDP requests use distinct tabs and distinct CDP WebSocket sessions.
+        self._busy: dict[int, int] = {}
+        self._jitter_deadlines: dict[int, float] = {}
+        self._jitter_released: set[int] = set()
         self._logins: set[int] = set()
         self.accounts: list[AccountState] = []
         self._load()
@@ -220,7 +225,7 @@ class AccountPool:
         now = time.time()
         for a in self.accounts:
             if a.status != "auth-required" and (a.status == "cooldown" or a.window_usage >= WINDOW_CAP) and a.cooldown_until and a.cooldown_until <= now:
-                a.status = "ready"
+                a.status = "active" if self._busy.get(a.id, 0) else "ready"
                 a.window_usage = 0
                 a.window_started = 0.0
                 a.cooldown_until = 0.0
@@ -343,53 +348,94 @@ class AccountPool:
             self.condition.notify_all()
             return removed
 
-    # ------------------------------ SEQUENTIAL EXHAUSTION scheduling
+    # ------------------------------ concurrent-slot scheduling
     def ready_pro_count(self) -> int:
+        """Eligible Pro account identities, including accounts with active tabs.
+
+        Each eligible identity contributes ``SLOTS_PER_ACCOUNT`` possible
+        concurrent tabs. Per-account leases and the rolling render budget are
+        reserved atomically by :meth:`acquire` below.
+        """
         with self.lock:
             self._reset_expired_locked()
-            return sum(a.is_pro and a.status in {"ready", "active"}
-                       and a.window_usage < WINDOW_CAP and a.id not in self._logins and client_for(a.id) is not None
-                       for a in self.accounts)
+            return sum(
+                a.is_pro and a.status in {"ready", "active"}
+                and a.window_usage < WINDOW_CAP
+                and a.id not in self._logins
+                and client_for(a.id) is not None
+                for a in self.accounts
+            )
 
     def acquire(self, *, parallel: bool = False, require_pro: bool = False,
                 exclude: set[int] | None = None, timeout: float = 300) -> AccountState:
-        """Reserve one session exclusively; wait only for busy eligible accounts.
+        """Reserve one concurrent tab and one unit of rolling-window capacity.
 
-        Cooldown/auth-required/Flash-degraded accounts are never dispatched.
-        Parallel scheduling favours the least-recently-used free account.
+        An account can hold up to ``SLOTS_PER_ACCOUNT`` independent CDP/HTTP
+        renders. No reservation can push committed plus in-flight renders over
+        the local Pro-window cap. Expired/auth-invalid/degraded sessions remain
+        ineligible, and parallel scheduling balances load across accounts.
         """
         deadline = time.monotonic() + timeout
         with self.condition:
             while True:
                 self._reset_expired_locked()
-                eligible = [a for a in self.accounts
-                            if a.status in {"ready", "active"}
-                            and a.window_usage < WINDOW_CAP
-                            and (not require_pro or a.is_pro)
-                            and a.id not in (exclude or set())
-                            and a.id not in self._logins
-                            and client_for(a.id) is not None]
-                free = [a for a in eligible if a.id not in self._busy]
+                # `eligible` means the account still has committed window
+                # budget; `free` below also reserves budget against sibling
+                # in-flight jobs. A worker waits if every remaining unit is
+                # reserved, since a sibling may fail and release its slot.
+                eligible = [
+                    a for a in self.accounts
+                    if a.status in {"ready", "active"}
+                    and a.window_usage < WINDOW_CAP
+                    and (not require_pro or a.is_pro)
+                    and a.id not in (exclude or set())
+                    and a.id not in self._logins
+                    and client_for(a.id) is not None
+                ]
+                free = [a for a in eligible
+                        if self._busy.get(a.id, 0) < SLOTS_PER_ACCOUNT
+                        and a.window_usage + self._busy.get(a.id, 0) < WINDOW_CAP]
                 if free:
-                    a = min(free, key=lambda a: (a.last_used, a.id)) if parallel else free[0]
-                    self._busy.add(a.id)
-                    a.status = "active"
-                    if not a.window_started:
-                        a.window_started = time.time()
-                    return a
+                    if parallel:
+                        account = min(free, key=lambda a: (self._busy.get(a.id, 0), a.last_used, a.id))
+                    else:
+                        account = free[0]
+                    lease_count = self._busy.get(account.id, 0)
+                    if lease_count == 0:
+                        # A burst of parallel tabs shares one randomized account
+                        # wait rather than serializing and sleeping once per tab.
+                        # Maximum-speed P2P leases are already bounded by the
+                        # slot count and real provider/window guards; do not
+                        # impose the legacy 65–85s per-account delay between
+                        # waves of one large batch. Serial legacy callers retain
+                        # their established randomized start spacing.
+                        delay = 0.0 if parallel else max(0.0, account.last_used + random.uniform(*JITTER) - time.time())
+                        self._jitter_deadlines[account.id] = time.monotonic() + delay
+                        self._jitter_released.discard(account.id)
+                    self._busy[account.id] = lease_count + 1
+                    account.status = "active"
+                    if not account.window_started:
+                        account.window_started = time.time()
+                    return account
                 if not eligible:
                     raise RuntimeError("No available authenticated Pro account; check Account Pool, provider limits and cooldowns")
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise RuntimeError("Timed out waiting for an available Pro account; check Account Pool")
+                    raise RuntimeError("Timed out waiting for an available Pro account slot; check Account Pool")
                 self.condition.wait(min(remaining, 1.0))
 
     def release(self, account_id: int) -> None:
         with self.condition:
-            self._busy.discard(account_id)
-            a = next((a for a in self.accounts if a.id == account_id), None)
-            if a and a.status == "active":
-                a.status = "ready"
+            lease_count = self._busy.get(account_id, 0)
+            if lease_count <= 1:
+                self._busy.pop(account_id, None)
+                self._jitter_deadlines.pop(account_id, None)
+                self._jitter_released.discard(account_id)
+            else:
+                self._busy[account_id] = lease_count - 1
+            account = next((a for a in self.accounts if a.id == account_id), None)
+            if account and account.status == "active" and not self._busy.get(account_id, 0):
+                account.status = "ready"
             self.condition.notify_all()
 
     def note_render(self, account_id: int) -> bool:
@@ -403,12 +449,17 @@ class AccountPool:
             a.weekly_used += 1
             a.total_generated += 1
             a.last_used = time.time()
+            if a.status in {"auth-required", "cooldown"}:
+                # A sibling in-flight tab cannot heal a sign-out or erase a real
+                # quota/degradation signal reported by another sibling.
+                self.save()
+                return a.status == "cooldown"
             if a.window_usage >= WINDOW_CAP:
                 a.status = "cooldown"
                 a.cooldown_until = time.time() + WINDOW_SECONDS
                 self.save()
                 return True
-            a.status = "ready"
+            a.status = "active" if self._busy.get(account_id, 0) else "ready"
             self.save()
             return False
 
@@ -418,10 +469,15 @@ class AccountPool:
             a = next((x for x in self.accounts if x.id == account_id), None)
             if not a:
                 return
+            a.last_used = time.time()
+            if a.status == "auth-required":
+                # A concurrent Flash/quota signal cannot erase a verified
+                # sign-out that already requires an operator reconnect.
+                self.save()
+                return
             a.status = "cooldown"
             a.window_usage = max(a.window_usage, WINDOW_CAP)
-            a.cooldown_until = time.time() + WINDOW_SECONDS
-            a.last_used = time.time()
+            a.cooldown_until = max(a.cooldown_until, time.time() + WINDOW_SECONDS)
         self.save()
 
     def fault(self, account_id: int, auth: bool = False) -> None:
@@ -429,22 +485,36 @@ class AccountPool:
             a = next((x for x in self.accounts if x.id == account_id), None)
             if not a:
                 return
-            a.last_used = time.time()
+            now = time.time()
+            a.last_used = now
             if auth:
                 a.status = "auth-required"
                 a.is_pro = False
-            else:
+            elif a.status != "auth-required":
+                # Late generic transport errors from sibling tabs may extend a
+                # short fault cooldown, but can never shorten a real Pro window.
                 a.status = "cooldown"
-                a.cooldown_until = time.time() + MINI_COOLDOWN_SECONDS
+                a.cooldown_until = max(a.cooldown_until, now + MINI_COOLDOWN_SECONDS)
             self.save()
 
     def _wait_jitter(self, a: AccountState) -> None:
-        jitter = random.uniform(*JITTER)
-        wait = a.last_used + jitter - time.time()
-        while wait > 0:
+        # All slots acquired in the same concurrent wave share one wait; do not
+        # accidentally serialize multi-tab work with one 65–85s delay per job.
+        with self.condition:
+            deadline = self._jitter_deadlines.get(a.id)
+        if deadline is None:  # supports standalone callers outside acquire()
+            delay = max(0.0, a.last_used + random.uniform(*JITTER) - time.time())
+            deadline = time.monotonic() + delay
+            with self.condition:
+                self._jitter_deadlines.setdefault(a.id, deadline)
+                deadline = self._jitter_deadlines[a.id]
+        while (wait := deadline - time.monotonic()) > 0:
             time.sleep(min(1.0, wait))
-            wait = a.last_used + jitter - time.time()
-        a.last_used = time.time()
+        with self.condition:
+            if a.id not in self._jitter_released:
+                a.last_used = time.time()
+                self._jitter_released.add(a.id)
+            self.condition.notify_all()
 
     # ------------------------------ UI cards
     def cards(self) -> list[dict]:

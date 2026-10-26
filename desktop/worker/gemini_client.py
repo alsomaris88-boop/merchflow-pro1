@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import random
 import re
+import threading
 import time
 
 import httpx
@@ -100,6 +101,7 @@ class GeminiClient:
             },
         )
         self._reqid = random.randint(100_000, 999_999)
+        self._state_lock = threading.RLock()  # token/cookie/build labels; HTTP requests themselves stay concurrent
 
     # ---------------------------------------------------------- lifecycle
     def close(self) -> None:
@@ -109,7 +111,11 @@ class GeminiClient:
             pass
 
     def init(self) -> None:
-        """Fetch /app → extract SNlM0e, build labels, account email."""
+        """Fetch /app once; serialize credential refresh, not image jobs."""
+        with self._state_lock:
+            self._init_locked()
+
+    def _init_locked(self) -> None:
         resp = self.client.get("/app")
         if resp.status_code != 200:
             raise GeminiAuthError(f"/app responded HTTP {resp.status_code}")
@@ -134,10 +140,11 @@ class GeminiClient:
 
     # ------------------------------------------------------------ cookies
     def rotate_cookies(self) -> None:
-        """
-        Best-effort __Secure-1PSIDTS rotation (rotate endpoint answers with a
-        fresh cookie inside Set-Cookie on HTTP 401).
-        """
+        """Best-effort cookie rotation, synchronized with token/session updates."""
+        with self._state_lock:
+            self._rotate_cookies_locked()
+
+    def _rotate_cookies_locked(self) -> None:
         try:
             resp = httpx.post(
                 ROTATE_URL,
@@ -162,7 +169,8 @@ class GeminiClient:
             pass  # rotation is optional; existing cookie continues
 
     def _cookie_header(self) -> str:
-        return "; ".join(f"{k}={v}" for k, v in self.client.cookies.items())
+        with self._state_lock:
+            return "; ".join(f"{k}={v}" for k, v in self.client.cookies.items())
 
     # --------------------------------------------------------------- upload
     def upload_image(self, data: bytes, filename: str) -> str:
@@ -205,8 +213,9 @@ class GeminiClient:
         Multimodal batchexecute call: reference images + fused prompt → Imagen 3.
         `images`: list of (raw_bytes, filename). Returns raw PNG/JPEG bytes.
         """
-        if not self.token:
-            self.init()
+        with self._state_lock:
+            if not self.token:
+                self._init_locked()
 
         upload_ids = [self.upload_image(b, n) for b, n in images]
         return self._rpc(prompt, upload_ids, timeout_s)
@@ -226,22 +235,25 @@ class GeminiClient:
             {"enforce_default_to_fast_version": False},
             ["gemini-imagen-3-pro"],
         ]
-        self._reqid += random.randint(1000, 9000)
+        with self._state_lock:
+            self._reqid += random.randint(1000, 9000)
+            reqid = self._reqid
+            token, build_label, session_id = self.token, self.bl, self.f_sid
 
         params = {
             "rpcids": "maZAc",
             "source-path": "/app",
             "hl": "en",
             "rt": "c",
-            "_reqid": str(self._reqid),
+            "_reqid": str(reqid),
         }
-        if self.bl:
-            params["bl"] = self.bl
-        if self.f_sid:
-            params["f.sid"] = self.f_sid
+        if build_label:
+            params["bl"] = build_label
+        if session_id:
+            params["f.sid"] = session_id
 
         payload = {
-            "at": self.token or "",
+            "at": token or "",
             "rpcids": "maZAc",
             "f.req": json.dumps([None, json.dumps(inner)]),
         }
@@ -255,8 +267,9 @@ class GeminiClient:
 
         if resp.status_code in (401, 403):
             # token went stale mid-flight → rotate + re-init once
-            self.rotate_cookies()
-            self.init()
+            with self._state_lock:
+                self._rotate_cookies_locked()
+                self._init_locked()
             raise GeminiAuthError("session expired — re-authenticated the token, retry the job")
 
         if resp.status_code != 200:

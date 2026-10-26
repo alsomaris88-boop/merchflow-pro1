@@ -44,6 +44,7 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8"><title>Gemini</title>
 <script>
 const CFG = %(cfg)s;
 const files = []; let busy = false, turn = 0;
+
 const delivery = {paste:0,drop:0,menu:0,chooser:0,fileInput:0,imagesPill:0};
 window.__fixtureDelivery = delivery;
 const editor = document.querySelector('.ql-editor'), send = document.getElementById('send');
@@ -93,7 +94,9 @@ send.addEventListener('click', async () => {
   for (const f of files) { const i = document.createElement('img'); i.src = URL.createObjectURL(f); q.appendChild(i); }
   document.getElementById('chat').appendChild(q);
   const fd = new FormData(); fd.append('delivery',JSON.stringify(delivery)); fd.append('prompt', text); files.forEach((f, n) => fd.append('file' + n, f, f.name));
-  await fetch('/submit', { method: 'POST', body: fd });
+  const submitted = await fetch('/submit', { method: 'POST', body: fd });
+  const receipt = await submitted.json();
+  const responseId = CFG.uniqueAssets ? receipt.requestId : turn + 1;
   editor.innerHTML = ''; files.length = 0; document.getElementById('chips').replaceChildren();
   const stop = document.createElement('button'); stop.setAttribute('aria-label', CFG.locale === 'fr' ? 'Arrêter la réponse' : 'Stop response'); document.body.appendChild(stop);
   turn += 1;
@@ -105,10 +108,10 @@ send.addEventListener('click', async () => {
       r.appendChild(document.createTextNode('Here is your image.'));
       for (let k = 1; k <= CFG.images; k++) {
         const g = document.createElement('generated-image');
-        const img = document.createElement('img'); img.src = '/img/' + turn + '-' + k + '=s512' + (CFG.queryString ? '?fixture=keep' : ''); g.appendChild(img);
+        const img = document.createElement('img'); img.src = '/img/' + responseId + '-' + k + '=s512' + (CFG.queryString ? '?fixture=keep' : ''); g.appendChild(img);
         if (CFG.download) {
           const b = document.createElement('button'); b.setAttribute('aria-label', CFG.locale === 'fr' ? "Télécharger l'image en taille originale" : 'Download full size image');
-          b.addEventListener('click', () => { const a = document.createElement('a'); a.href = '/img/' + turn + '-' + k + '=s0?dl=1'; a.download = ''; document.body.appendChild(a); a.click(); a.remove(); });
+          b.addEventListener('click', () => { const a = document.createElement('a'); a.href = '/img/' + responseId + '-' + k + '=s0?dl=1'; a.download = ''; document.body.appendChild(a); a.click(); a.remove(); });
           g.appendChild(b);
         }
         r.appendChild(g);
@@ -139,6 +142,10 @@ class FakeGemini:
         self.delay_ms = 1200
         self.submissions: list[dict] = []
         self.asset_requests: list[dict] = []
+        self.unique_assets = False
+        self._submission_lock = threading.Lock()
+        self._next_submission = 0
+        self._asset_colours: dict[int, tuple[int,int,int]] = {}
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), self._handler())
         self.port = self.server.server_address[1]
         self.app_url = f"http://127.0.0.1:{self.port}/app"
@@ -189,7 +196,8 @@ class FakeGemini:
                     upload = '' if fake.mode == 'no-controls' else f'<button {attrs} id="upload">{icon if fake.mode != "testid" else ""}</button>'
                     cfg = json.dumps({"reply": fake.reply, "images": fake.images, "download": fake.download,
                                       "delayMs": fake.delay_ms, "locale": fake.locale,
-                                      "httpThumbnail": fake.http_thumbnail, "rejectUpload": fake.reject_upload, "maxUploadFiles": fake.max_upload_files, "clipboardMode": fake.clipboard_mode, "queryString": fake.query_string})
+                                      "httpThumbnail": fake.http_thumbnail, "rejectUpload": fake.reject_upload, "maxUploadFiles": fake.max_upload_files, "clipboardMode": fake.clipboard_mode, "queryString": fake.query_string,
+                                      "uniqueAssets": fake.unique_assets})
                     body = PAGE % {"account": account, "file_input": file_input, "cfg": cfg,
                                    "upload_button": upload, "send_label": "Envoyer le message" if fake.locale == "fr" else "Send message"}
                     self._send(200, body.encode(), "text/html; charset=utf-8")
@@ -202,7 +210,8 @@ class FakeGemini:
                     if full and fake.full_error:
                         self._send(403,b"original unavailable", "text/plain")
                         return
-                    data = png(fake.full_size if full and not fake.full_is_preview else THUMB, COLOURS[k % len(COLOURS)])
+                    colour = fake._asset_colours.get(kid, COLOURS[k % len(COLOURS)]) if (kid := int(name.split("-")[0])) else COLOURS[k % len(COLOURS)]
+                    data = png(fake.full_size if full and not fake.full_is_preview else THUMB, colour)
                     headers = {"Content-Disposition": f'attachment; filename="gemini_{name}.png"'} if "dl=1" in self.path else {}
                     self._send(200, data, "image/png", headers)
                     return
@@ -226,7 +235,12 @@ class FakeGemini:
                     elif name and name.startswith("file"):
                         files.append((part.get_filename(), part.get_payload(decode=True)))
                         mimes.append(part.get_content_type())
-                fake.submissions.append({"prompt": prompt, "files": files, "delivery": delivery, "mimes": mimes})
-                self._send(200, b"{}", "application/json")
+                with fake._submission_lock:
+                    fake._next_submission += 1
+                    request_id = fake._next_submission
+                    colour = (30, 80, 220) if "CONCURRENCY BLUE" in prompt else (220, 40, 40) if "CONCURRENCY RED" in prompt else COLOURS[0]
+                    fake._asset_colours[request_id] = colour
+                    fake.submissions.append({"requestId":request_id,"prompt":prompt,"files":files,"delivery":delivery,"mimes":mimes})
+                self._send(200, json.dumps({"requestId":request_id}).encode(), "application/json")
 
         return Handler

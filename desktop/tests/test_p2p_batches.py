@@ -40,7 +40,7 @@ def worker(tmp_path, monkeypatch):
     monkeypatch.setattr(gemini_pool, "MOCK", False)
     monkeypatch.setattr(pool, "_wait_jitter", lambda account: None)
     lock = threading.Lock()
-    metrics = {"active": set(), "peak": 0, "calls": []}
+    metrics = {"active": {}, "peak": 0, "peak_by_account": {}, "calls": []}
     raw = reference_png()
 
     class Provider:
@@ -49,16 +49,18 @@ def worker(tmp_path, monkeypatch):
 
         def generate_image(self, prompt, references):
             with lock:
-                assert self.id not in metrics["active"], "Concurrent requests used the same provider session"
-                metrics["active"].add(self.id)
+                call_id = len(metrics["calls"])
+                metrics["active"][call_id] = self.id
                 metrics["peak"] = max(metrics["peak"], len(metrics["active"]))
+                active_for_account = sum(account_id == self.id for account_id in metrics["active"].values())
+                metrics["peak_by_account"][self.id] = max(metrics["peak_by_account"].get(self.id,0),active_for_account)
                 metrics["calls"].append((self.id, prompt, references))
             try:
                 time.sleep(0.025)
                 return raw
             finally:
                 with lock:
-                    metrics["active"].remove(self.id)
+                    metrics["active"].pop(call_id)
 
     clients = {i: Provider(i) for i in (1, 2, 3)}
     monkeypatch.setattr(gemini_pool, "client_for", clients.get)
@@ -128,6 +130,7 @@ def test_dynamic_batches_archive_every_real_print_before_success_and_without_bro
     if size > 1:
         assert metrics["peak"] >= 2
         assert len({call[0] for call in metrics["calls"]}) >= 2
+    assert max(metrics["peak_by_account"].values()) <= gemini_pool.SLOTS_PER_ACCOUNT
     assert not pool._busy
     assert not (module.OUT_DIR / ".p2p-inputs" / batch_id).exists()
     # Retried start is idempotent: no extra provider calls or history records.
@@ -254,26 +257,31 @@ def test_listing_hub_stores_real_design_association_and_rejects_unknown_ids(work
     assert any(row["design_id"] == record["id"] for row in client.get("/api/bridge/listings").json()["items"])
 
 
-def test_parallel_leases_exclude_busy_and_unverified_accounts(worker):
+def test_parallel_leases_balance_accounts_and_respect_slot_ceiling(worker,monkeypatch):
     client, module, pool, metrics = worker
+    monkeypatch.setattr(gemini_pool,"SLOTS_PER_ACCOUNT",3)
     pool.accounts[2].is_pro = False
-    seen = set()
+    active = {1:0, 2:0}
+    peak = {1:0, 2:0}
     lock = threading.Lock()
+    cohort = threading.Barrier(6)
     def acquire(_):
         account = pool.acquire(parallel=True, require_pro=True, timeout=5)
         try:
             with lock:
-                assert account.id not in seen
-                seen.add(account.id)
+                active[account.id] += 1
+                peak[account.id] = max(peak[account.id],active[account.id])
+            cohort.wait(timeout=5)
             time.sleep(0.02)
         finally:
             with lock:
-                seen.remove(account.id)
+                active[account.id] -= 1
             pool.release(account.id)
         return account.id
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        ids = list(executor.map(acquire, range(20)))
-    assert set(ids) == {1, 2} and not pool._busy
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        ids = list(executor.map(acquire, range(6)))
+    assert set(ids) == {1, 2} and peak == {1:3,2:3}
+    assert pool._busy == {}
 
 
 GATE1_REASON = "GATE 1 FAILED: the reference thumbnail never rendered in the Gemini input box"
@@ -419,3 +427,104 @@ def test_long_exact_failure_reason_is_not_truncated_or_replaced_with_zero_images
     second = finish(client, create_upload_start(client, 1))
     assert second["status"] == "failed" and second["items"][0]["reason"] == reason
     assert not output_store.list_designs(module.OUT_DIR)
+
+
+
+@pytest.mark.parametrize("size",[5,10])
+def test_single_pro_account_scales_to_batch_size_in_separate_leased_slots(worker,monkeypatch,size):
+    client,module,pool,metrics=worker
+    pool.accounts=pool.accounts[:1]
+    monkeypatch.setattr(gemini_pool,"SLOTS_PER_ACCOUNT",10)
+    monkeypatch.setattr(p2p_batches,"MAX_PARALLEL",10)
+    batch_id=create_upload_start(client,size)
+    batch=finish(client,batch_id)
+    assert batch["status"]=="completed" and batch["completed"]==size
+    assert len(metrics["calls"])==size and metrics["peak"]==size
+    assert metrics["peak_by_account"]=={pool.accounts[0].id:size}
+    assert pool._busy=={}
+
+
+def test_same_account_window_budget_reserves_inflight_slots_before_dispatch(worker,monkeypatch):
+    client,module,pool,metrics=worker
+    pool.accounts=pool.accounts[:1]
+    monkeypatch.setattr(gemini_pool,"SLOTS_PER_ACCOUNT",10)
+    monkeypatch.setattr(gemini_pool,"WINDOW_CAP",4)
+    pool.accounts[0].window_usage=3
+    first=pool.acquire(parallel=True,require_pro=True)
+    assert first.id==pool.accounts[0].id and pool._busy[first.id]==1
+    assert pool.ready_pro_count()==1, "eligible account identities still include in-flight capacity; acquire must wait rather than overspend"
+    with pytest.raises(RuntimeError,match="Timed out waiting"):
+        pool.acquire(parallel=True,require_pro=True,timeout=0)
+    assert pool.note_render(first.id) is True
+    pool.release(first.id)
+    assert pool.accounts[0].status=="cooldown" and not pool._busy
+
+
+def test_sibling_quota_cooldown_cannot_be_cleared_by_successful_inflight_render(worker):
+    client,module,pool,metrics=worker
+    pool.accounts=pool.accounts[:1]
+    account=pool.acquire(parallel=True,require_pro=True)
+    sibling=pool.acquire(parallel=True,require_pro=True)
+    assert account.id==sibling.id and pool._busy[account.id]==2
+    pool.degrade(account.id)
+    pool.note_render(sibling.id)
+    pool.release(sibling.id);pool.release(account.id)
+    assert pool.accounts[account.id-1].status=="cooldown"
+    assert pool.accounts[account.id-1].window_usage>=gemini_pool.WINDOW_CAP
+    assert not pool._busy
+
+
+
+def test_parallel_tabs_bypass_serial_jitter_and_share_an_immediate_deadline(worker,monkeypatch):
+    client,module,pool,metrics=worker
+    pool.accounts=pool.accounts[:1]
+    monkeypatch.setattr(gemini_pool,"SLOTS_PER_ACCOUNT",4)
+    monkeypatch.setattr(gemini_pool,"JITTER",(0.08,0.08))
+    monkeypatch.setattr(pool,"_wait_jitter",gemini_pool.AccountPool._wait_jitter.__get__(pool))
+    pool.accounts[0].last_used=time.time()
+    leases=[pool.acquire(parallel=True,require_pro=True) for _ in range(4)]
+    assert {account.id for account in leases}=={pool.accounts[0].id}
+    assert pool._jitter_deadlines[pool.accounts[0].id]<=time.monotonic()+0.01
+    release=threading.Barrier(4)
+    starts=[];lock=threading.Lock()
+    def await_shared_deadline(account):
+        release.wait(timeout=3)
+        pool._wait_jitter(account)
+        with lock: starts.append(time.monotonic())
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures=[executor.submit(await_shared_deadline,account) for account in leases]
+        for future in futures: future.result(timeout=5)
+    assert max(starts)-min(starts)<0.025, "same-account start jitter serialized concurrent tabs"
+    assert pool._jitter_released=={pool.accounts[0].id}
+    for account in leases: pool.release(account.id)
+    assert pool._jitter_deadlines=={} and pool._busy=={}
+
+
+
+def test_sibling_generic_fault_cannot_shorten_real_window_cooldown(worker,monkeypatch):
+    client,module,pool,metrics=worker
+    pool.accounts=pool.accounts[:1]
+    first=pool.acquire(parallel=True,require_pro=True)
+    sibling=pool.acquire(parallel=True,require_pro=True)
+    pool.degrade(first.id)
+    real_until=pool.accounts[0].cooldown_until
+    pool.fault(sibling.id)
+    assert pool.accounts[0].cooldown_until>=real_until
+    assert pool.accounts[0].status=="cooldown"
+    pool.release(first.id);pool.release(sibling.id)
+    assert pool.accounts[0].cooldown_until>=real_until and not pool._busy
+
+
+def test_sibling_degradation_cannot_overwrite_verified_auth_required_state(worker):
+    client,module,pool,metrics=worker
+    pool.accounts=pool.accounts[:1]
+    first=pool.acquire(parallel=True,require_pro=True)
+    sibling=pool.acquire(parallel=True,require_pro=True)
+    pool.fault(first.id,auth=True)
+    pool.degrade(sibling.id)
+    pool.fault(sibling.id)
+    pool.note_render(first.id)
+    pool.release(first.id);pool.release(sibling.id)
+    account=pool.accounts[0]
+    assert account.status=="auth-required" and not account.is_pro
+    assert not pool._busy

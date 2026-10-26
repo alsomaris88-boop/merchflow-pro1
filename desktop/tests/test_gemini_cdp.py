@@ -17,6 +17,9 @@ import os
 import shutil
 import time
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
+from collections import Counter
+import threading
 
 import pytest
 from PIL import Image
@@ -552,3 +555,38 @@ def test_generic_service_retry_text_is_not_misclassified_as_quota(isolated, monk
     client=gemini_cdp.CdpGeminiClient(99)
     with pytest.raises(GeminiAutomationError,match="answered without an image"):
         client._await_image(Session(),{"responses":0})
+
+
+
+def test_one_authenticated_headless_profile_serves_concurrent_tabs_with_isolated_downloads(live):
+    fake,pool,_=live
+    fake.mode="no-controls"
+    fake.unique_assets=True
+    fake.delay_ms=350
+    client=signed_in_profile(pool)
+    reference=png()
+    def generate(prompt):
+        image=client.generate_image(prompt,[(reference,"same-name.png")])
+        return image,dict(client.last_extraction)
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures=[executor.submit(generate,prompt) for prompt in (
+            "CONCURRENCY RED", "CONCURRENCY BLUE", "CONCURRENCY RED",
+        )]
+        results=[future.result(timeout=90) for future in futures]
+    assert [colour_of(data) for data,_ in results]==[(220,40,40),(30,80,220),(220,40,40)]
+    assert all(record["method"]=="download-full-size" and record["fullResolution"] for _,record in results)
+    assert Counter(submission["prompt"] for submission in fake.submissions)==Counter(["CONCURRENCY RED","CONCURRENCY BLUE","CONCURRENCY RED"])
+    assert all(submission["delivery"]["paste"]==1 and submission["delivery"]["drop"]==0 for submission in fake.submissions)
+    assert len({submission["requestId"] for submission in fake.submissions})==3
+
+
+def test_diagnostics_are_thread_local_between_concurrent_tab_jobs(isolated):
+    client=gemini_cdp.CdpGeminiClient(700)
+    barrier=threading.Barrier(2)
+    def write(value):
+        client.last_extraction={"job":value}
+        barrier.wait(timeout=3)
+        return client.last_extraction["job"]
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures=[executor.submit(write,value) for value in ("red","blue")]
+        assert sorted(future.result(timeout=4) for future in futures)==["blue","red"]

@@ -587,12 +587,21 @@ class CdpGeminiClient:
         self.user_data_dir = Path(user_data_dir) if user_data_dir else profile_dir(self.account_id)
         self.port = cdp_port(self.account_id)
         self.email: str = ""
-        self.last_extraction: dict = {}
+        self._thread_state = threading.local()   # per-tab diagnostics; never shared across simultaneous jobs
         self._proc: subprocess.Popen | None = None
         self._attached = False          # True once we own a live DevTools endpoint
         self._ua: str | None = None
-        self._lock = threading.RLock()
+        self._browser_lock = threading.RLock()  # process/profile lifecycle only; never held during a render
+        self._download_lock = threading.Lock()  # Browser.setDownloadBehavior is account-context global
         _LIVE.add(self)
+
+    @property
+    def last_extraction(self) -> dict:
+        return getattr(self._thread_state, "last_extraction", {})
+
+    @last_extraction.setter
+    def last_extraction(self, value: dict) -> None:
+        self._thread_state.last_extraction = value
 
     # ---------------------------------------------------------- browser
     def _owned_port(self) -> int | None:
@@ -610,6 +619,10 @@ class CdpGeminiClient:
         return port
 
     def _ensure_browser(self) -> int:
+        with self._browser_lock:
+            return self._ensure_browser_locked()
+
+    def _ensure_browser_locked(self) -> int:
         if self._proc is not None and self._proc.poll() is None and devtools_version(self.port):
             return self.port
         if not self.user_data_dir.exists():
@@ -638,7 +651,7 @@ class CdpGeminiClient:
         return self.port
 
     def close(self) -> None:
-        with self._lock:
+        with self._browser_lock:
             info = devtools_version(self.port) if (self._proc is not None or self._attached) else None
             if info and info.get("webSocketDebuggerUrl"):
                 try:
@@ -687,7 +700,7 @@ class CdpGeminiClient:
 
     def init(self) -> None:
         """Verify the persistent session headlessly (no credentials involved)."""
-        with self._lock:
+        with self._browser_lock:
             port = self._ensure_browser()
             target, s = self._open_tab(port)
             try:
@@ -822,6 +835,13 @@ class CdpGeminiClient:
 
     # ------------------------------------------------ step 6: one image
     def _download_full_size(self, s: CDPSession, port: int, folder: Path) -> bytes | None:
+        # Chrome's default browser context has one download directory. Serialize
+        # just this final extraction step so concurrent tabs cannot steal another
+        # design's download. All navigation/generation/attachment remains parallel.
+        with self._download_lock:
+            return self._download_full_size_locked(s, port, folder)
+
+    def _download_full_size_locked(self, s: CDPSession, port: int, folder: Path) -> bytes | None:
         folder.mkdir(parents=True, exist_ok=True)
         info = devtools_version(port) or {}
         browser = CDPSession(info["webSocketDebuggerUrl"]) if info.get("webSocketDebuggerUrl") else None
@@ -880,40 +900,41 @@ class CdpGeminiClient:
 
     # ---------------------------------------------------------- public
     def generate_image(self, prompt: str, references: list[tuple[bytes, str]]) -> bytes:
-        with self._lock:
-            self.last_extraction = {}
-            workdir = Path(tempfile.mkdtemp(prefix=f"merchflow-cdp-{self.account_id}-"))
+        # This is intentionally NOT protected by a client-wide lock: every
+        # request owns its own tab, CDP socket, temporary inputs and output path.
+        self.last_extraction = {}
+        workdir = Path(tempfile.mkdtemp(prefix=f"merchflow-cdp-{self.account_id}-"))
+        try:
+            paths = []
+            for index, (data, name) in enumerate(references):
+                safe = re.sub(r"[^A-Za-z0-9._-]", "_", name or f"reference_{index + 1}.png")
+                path = workdir / f"{index + 1:02d}_{safe}"
+                path.write_bytes(data)
+                paths.append(str(path))
             try:
-                paths = []
-                for index, (data, name) in enumerate(references):
-                    safe = re.sub(r"[^A-Za-z0-9._-]", "_", name or f"reference_{index + 1}.png")
-                    path = workdir / f"{index + 1:02d}_{safe}"
-                    path.write_bytes(data)
-                    paths.append(str(path))
-                try:
-                    port = self._ensure_browser()
-                except CDPError as exc:
-                    raise GeminiAutomationError(f"{self.label}: {exc}") from exc
-                try:
-                    target, s = self._open_tab(port)
-                except CDPError as exc:
-                    raise GeminiAutomationError(f"{self.label}: CDP tab setup failed — {exc}") from exc
-                try:
-                    self._wait_ready(s)
-                    before = s.evaluate(STATE_JS) or {}
-                    if paths:
-                        self.last_extraction = {"upload": self._attach(s, paths)}
-                    self._type_prompt(s, prompt)
-                    self._submit(s, before, len(paths))
-                    found = self._await_image(s, before)
-                    return self._extract_one(s, port, workdir, found)
-                except CDPError as exc:
-                    raise GeminiAutomationError(f"{self.label}: CDP automation failed — {exc}") from exc
-                finally:
-                    s.close()
-                    close_page(port, target["id"])
+                port = self._ensure_browser()
+            except CDPError as exc:
+                raise GeminiAutomationError(f"{self.label}: {exc}") from exc
+            try:
+                target, session = self._open_tab(port)
+            except CDPError as exc:
+                raise GeminiAutomationError(f"{self.label}: CDP tab setup failed — {exc}") from exc
+            try:
+                self._wait_ready(session)
+                before = session.evaluate(STATE_JS) or {}
+                if paths:
+                    self.last_extraction = {"upload": self._attach(session, paths)}
+                self._type_prompt(session, prompt)
+                self._submit(session, before, len(paths))
+                found = self._await_image(session, before)
+                return self._extract_one(session, port, workdir, found)
+            except CDPError as exc:
+                raise GeminiAutomationError(f"{self.label}: CDP automation failed — {exc}") from exc
             finally:
-                shutil.rmtree(workdir, ignore_errors=True)
+                session.close()
+                close_page(port, target["id"])
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
 
 
 def shutdown_all() -> None:

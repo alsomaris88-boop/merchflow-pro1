@@ -1,6 +1,66 @@
 # Pipeline validation — 2026-10-26
 
-## Current fix: silent in-memory clipboard, exact prompts, originals-only extraction
+## Current fix: 10× dynamic Donepixel workers and concurrent Gemini tabs
+
+Worker identity: `2.5.3-multitab-dynamic-batch`, built atop published
+`b2e236145d3b7b495e7e2fab1071439087cd8ab8` (`2.5.2` silent-paste/original-only
+contracts).
+
+- `MAX_PARALLEL` defaults to 10 and remains bounded 1–32 from
+  `MERCHFLOW_P2P_PARALLEL`. Each P2P batch sizes its executor as
+  `min(MAX_PARALLEL, max(1, ready_pro_count() * SLOTS_PER_ACCOUNT), max(1, queued_jobs))`.
+  Thus a five-item batch starts five, a ten-item batch can start ten, and a
+  one-item batch never launches extras. There is no fixed item-count limit.
+- `SLOTS_PER_ACCOUNT` defaults to 10 (bounded/configurable 1–32 by
+  `MERCHFLOW_GEMINI_SLOTS_PER_ACCOUNT`). The pool tracks lease counts, balances
+  tabs across accounts, and wakes queued workers when a tab lease is released.
+  Account reconnect/removal is still refused while **any** lease is active.
+  Parallel P2P batches do not inherit the legacy 65–85-second per-account jitter
+  between worker waves; the separate legacy sequential scheduler keeps its jitter.
+- Each lease reserves an individual tab and one local rolling-window quota unit;
+  `window_usage + in_flight_leases` cannot overspend the five-hour local cap.
+  Genuine Flash/degradation cooldowns cannot be shortened by late generic errors;
+  sibling success cannot clear quota/auth state, and a concurrent quota signal
+  cannot erase a verified sign-out.
+- Raw CDP no longer locks an account client across a whole render. Each job gets
+  its own Chrome tab, CDP WebSocket, temporary reference files and thread-local
+  diagnostics. Only the final full-size download is serialized per account
+  because Chrome's default download directory is browser-context-global; that
+  prevents cross-job image swaps while reference upload, navigation and
+  multimodal generation across other tabs remain concurrent. The legacy HTTPS
+  client also pipelines independent RPCs; token/cookie/build/request-ID updates
+  alone use its short state lock.
+- Chromium regression tests run three prompt-distinct jobs concurrently in one
+  signed-in fixture profile and verify each original image's actual pixels. Real
+  end-to-end P2P tests send five and ten designs through **one** Pro-account
+  fixture and measure five/ten simultaneous provider calls, respectively. Pool
+  tests cover a 3+3 account burst, no parallel-mode start jitter, rolling-window reservations,
+  cooldown persistence across success/fault, and auth-state persistence across
+  an interleaved quota signal. An HTTP fixture verifies eight concurrent RPCs on
+  one client with unique request IDs and matching responses.
+
+Final automated results:
+
+- **171 Python tests passed, 1 opt-in smoke skipped** (523.98s). This includes
+  the new CDP/HTTP/pool/P2P concurrency regressions and all prior upload, archive,
+  account, failure-policy and Windows-launcher cases.
+- **26 TypeScript tests passed.**
+- **17 Chromium desktop E2E tests passed, 1 opt-in legacy 55-file Prepare smoke
+  skipped** (1.7m). The current static UI/runtime validates live cards, Retry,
+  full-resolution Download, saved History/Prepare, ZIP/Listing, reload, colours,
+  and dynamic input through 101 references.
+- ESLint, TypeScript, Python compileall, whitespace, normal Next production build
+  and desktop static export passed; API route sources were restored afterward.
+  A fixture health probe reported `2.5.3-multitab-dynamic-batch`, ten batch
+  workers, and ten per-account slots; both account-list endpoints returned zero
+  real accounts. One non-blocking Starlette/httpx TestClient deprecation warning
+  remains from the existing test dependency.
+- Google page/provider responses are local fixtures. No live authenticated Gemini,
+  paid render or native-Windows concurrency smoke was performed; run a target
+  machine smoke before depending on simultaneous real provider traffic. Provider
+  concurrency/rate limits are not overridden.
+
+## Published `b2e2361`: silent clipboard, exact prompts and original-only extraction
 
 Based on published `963f530`, with the user's explicit **safe paste → drop
 fallback** choice (not unconditional duplicate dispatch). Worker identity:

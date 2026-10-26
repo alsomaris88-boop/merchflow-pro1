@@ -27,7 +27,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from . import gemini_pool, image_lab, output_store
 
 MAX_UPLOAD_BYTES = 40 * 1024 * 1024
-MAX_PARALLEL = max(1, min(32, int(os.environ.get("MERCHFLOW_P2P_PARALLEL", "8"))))
+MAX_PARALLEL = max(1, min(32, int(os.environ.get("MERCHFLOW_P2P_PARALLEL", "10"))))
 _ACTIVE: dict[tuple[str, str], threading.Thread] = {}
 _START_LOCK = threading.Lock()
 _EXPORT_LOCK = threading.Lock()
@@ -205,7 +205,8 @@ def _run(out_dir: Path, batch_id: str) -> None:
     try:
         batch = snapshot(out_dir, batch_id)
         jobs = [j for j in batch["items"] if j["state"] == "queued"]
-        workers = min(MAX_PARALLEL, max(1, gemini_pool.POOL.ready_pro_count()), max(1, len(jobs)))
+        total_capacity = max(1, gemini_pool.POOL.ready_pro_count() * gemini_pool.SLOTS_PER_ACCOUNT)
+        workers = min(MAX_PARALLEL, total_capacity, max(1, len(jobs)))
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="donepixel") as executor:
             # executor.map is deliberately consumed: unexpected worker failures
             # cannot leave a silently 'running' batch behind.
