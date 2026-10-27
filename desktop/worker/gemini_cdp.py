@@ -221,6 +221,27 @@ def popen(args: list[str], *, visible: bool) -> subprocess.Popen:
     return subprocess.Popen(args, **kwargs)
 
 
+def kill_profile_processes(profile_dir: Path | str) -> None:
+    """Forcefully terminate any lingering Chrome process holding this isolated profile directory."""
+    if not IS_WIN:
+        return
+    norm = str(Path(profile_dir).resolve()).lower()
+    if "desktop" not in norm and "profile" not in norm:
+        return
+    cmd = [
+        "powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+        "-Command",
+        f"$norm = '{norm}'.Replace('\\', '\\\\'); "
+        "Get-CimInstance Win32_Process | "
+        "Where-Object { $_.CommandLine -and $_.CommandLine.ToLower().Contains($norm) } | "
+        "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
+    ]
+    try:
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------- DevTools HTTP
 def devtools_version(port: int, timeout: float = 2.0) -> dict | None:
     try:
@@ -668,6 +689,14 @@ class CdpGeminiClient:
             self.port = owned
             self._attached = True
         else:
+            # Stale processes from an interrupted session must be terminated before launch
+            kill_profile_processes(self.user_data_dir)
+            for lock_name in ("DevToolsActivePort", "SingletonLock", "SingletonCookie", "SingletonSocket"):
+                try:
+                    (self.user_data_dir / lock_name).unlink(missing_ok=True)
+                except Exception:
+                    pass
+            time.sleep(0.3)
             if not port_free(self.port):  # someone else's DevTools on 9222+N → let Chrome pick
                 self.port = 0
             args = chrome_args(resolve_exe(self.provider), self.user_data_dir, self.port, headless=True)
@@ -731,6 +760,7 @@ class CdpGeminiClient:
             finally:
                 self._proc = None
                 self._attached = False
+                kill_profile_processes(self.user_data_dir)
 
     # ------------------------------------------------------------- page
     def _open_tab(self, port: int) -> tuple[dict, CDPSession]:

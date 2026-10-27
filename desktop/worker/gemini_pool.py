@@ -340,10 +340,28 @@ class AccountPool:
                 if folder == root or not folder.is_relative_to(root):
                     raise RuntimeError("Refusing to delete a profile outside the isolated account directory")
                 if folder.exists():
-                    try:
-                        shutil.rmtree(folder)
-                    except OSError as exc:
-                        raise RuntimeError("Could not remove the local account profile; close its browser and retry") from exc
+                    gemini_cdp.kill_profile_processes(folder)
+                    def _on_error(func, path, exc_info):
+                        try:
+                            import stat
+                            os.chmod(path, stat.S_IWRITE)
+                            func(path)
+                        except Exception:
+                            pass
+                    deleted = False
+                    for _ in range(5):
+                        try:
+                            shutil.rmtree(folder, onerror=_on_error)
+                            deleted = True
+                            break
+                        except OSError:
+                            gemini_cdp.kill_profile_processes(folder)
+                            time.sleep(0.4)
+                    if not deleted and folder.exists():
+                        try:
+                            shutil.rmtree(folder)
+                        except OSError as exc:
+                            raise RuntimeError("Could not remove the local account profile; close its browser and retry") from exc
             removed = db.delete_account(account_id)
             self.accounts = [a for a in self.accounts if a.id != account_id]
             _register_client(account_id, None)

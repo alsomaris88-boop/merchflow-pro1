@@ -146,6 +146,7 @@ def _sensor(flow: LoginFlow, proc) -> None:
         try:
             _close_window(flow, proc)
         finally:
+            gemini_cdp.kill_profile_processes(flow.user_data_dir)
             try:
                 if flow.new_profile and flow.state != "authenticated" and flow.user_data_dir.exists():
                     # A cancelled/failed NEW sign-in must not leave a captured
