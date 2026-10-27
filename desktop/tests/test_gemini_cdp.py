@@ -262,6 +262,37 @@ def test_session_detection_requires_app_url_editor_and_no_sign_in_cta():
     assert gemini_cdp.signed_in({**base, "account": None}, [{"name": "__Secure-1PSID", "value": "x"}])
 
 
+def test_wait_ready_requires_editor_even_when_session_auth_is_already_valid(isolated, monkeypatch):
+    first = {"href": "https://gemini.google.com/app", "ready": "complete", "editor": False,
+             "signIn": False, "account": "fixture@example.test"}
+    second = {**first, "editor": True}
+
+    class Session:
+        def __init__(self):
+            self.samples = [first, second]
+            self.session_checks = 0
+
+        def evaluate(self, expression, timeout=10):
+            if expression == gemini_cdp.SESSION_JS:
+                self.session_checks += 1
+                return self.samples.pop(0)
+            if expression == gemini_cdp.DISMISS_JS:
+                return 0
+            raise AssertionError("unexpected session evaluation")
+
+    session = Session()
+    monkeypatch.setattr(gemini_cdp, "READY_TIMEOUT", 3.0)
+    monkeypatch.setattr(gemini_cdp, "session_cookies", lambda _session: [])
+    monkeypatch.setattr(gemini_cdp, "signed_in", lambda _info, _cookies: True)
+    client = gemini_cdp.CdpGeminiClient(99)
+
+    ready = client._wait_ready(session)
+
+    assert session.session_checks == 2
+    assert ready["editor"] is True
+    assert client.email == "fixture@example.test"
+
+
 def test_pending_login_reports_ok_so_the_ui_keeps_polling(tmp_path):
     flow = browser.LoginFlow("chrome", 2, 9502, tmp_path / "account_2")
     assert flow.public()["ok"] is True and flow.public()["state"] == "pending"
@@ -488,6 +519,44 @@ def test_clipboard_contract_has_no_menu_picker_native_file_or_preview_canvas_fal
     assert "navigator.clipboard" not in source and "pyperclip" not in source
 
 
+def test_silent_paste_retries_dispatch_without_retransferring_image_bytes(tmp_path):
+    source = tmp_path / "reference.png"
+    source.write_bytes(png())
+
+    class RetrySession:
+        def __init__(self):
+            self.stage_calls = 0
+            self.dispatch_calls = 0
+            self.cleared = False
+
+        def evaluate(self, script, timeout=30, **_kwargs):
+            if "new DataTransfer()" in script:
+                self.stage_calls += 1
+                assert "new File(" in script and "window.__merchflowClipboard" in script
+                return True
+            if "new ClipboardEvent('paste'" in script:
+                self.dispatch_calls += 1
+                assert script.index("ed.focus") < script.index("new ClipboardEvent('paste'")
+                assert "document.activeElement" in script and "ed.isContentEditable" in script
+                return self.dispatch_calls >= 2  # hydration/focus race; first dispatch probe is not ready
+            if script == gemini_cdp._js("return !!(window.__merchflowClipboard && window.__merchflowClipboard.dispatched);"):
+                return False
+            if script == gemini_cdp.CLEAR_CLIPBOARD_JS:
+                self.cleared = True
+                return True
+            raise AssertionError("unexpected paste evaluation")
+
+    session = RetrySession()
+    started = time.monotonic()
+
+    assert gemini_cdp._paste_image(session, source, timeout=1.0)
+
+    assert session.stage_calls == 1  # Base64 and DataTransfer are created only once
+    assert session.dispatch_calls == 2
+    assert time.monotonic() - started >= 0.3
+    assert not session.cleared  # _attach needs the DataTransfer for Gate 1/drop fallback
+
+
 def test_exact_8k_templates_are_byte_identical_and_colour_is_the_only_substitution():
     assert hashlib.sha256(gemini_pool.FUSION_DIRECTIVE.encode()).hexdigest() == "cd28a8b6c29a84515a4547bb7a5dbe1f7c99bf7f4ff72f695bcd767ef0143d3e"
     assert hashlib.sha256(gemini_pool.DONEPIXEL_PROMPT.encode()).hexdigest() == "297b8e4121d26f1282c671db36029cdcf230c3f04f4b84bf6ceff4088c0f2c96"
@@ -627,6 +696,32 @@ def test_existing_real_draft_attachment_is_rejected_before_new_paste_or_send(liv
 
 
 
+def test_wait_ready_polls_until_the_composer_is_visible(live):
+    _, pool, _ = live
+    client = signed_in_profile(pool)
+    port = client._ensure_browser()
+    target, session = client._open_tab(port)
+    try:
+        client._wait_ready(session)
+        scheduled = session.evaluate(gemini_cdp._js("""
+          const ed = promptEditor();
+          if (!ed) return false;
+          ed.style.display = 'none';
+          setTimeout(() => { ed.style.display = ''; }, 700);
+          return true;
+        """))
+        assert scheduled
+        started = time.monotonic()
+
+        ready = client._wait_ready(session)
+
+        assert ready["editor"] is True
+        assert time.monotonic() - started >= 0.65
+    finally:
+        session.close()
+        gemini_cdp.close_page(port, target["id"])
+
+
 def test_silent_paste_waits_for_editable_composer_dom(live):
     _,pool,root=live
     client=signed_in_profile(pool)
@@ -668,7 +763,7 @@ def test_silent_paste_gives_up_after_timeout_when_composer_stays_unavailable(liv
           return true;
         """))
         assert disabled
-        assert inspect.signature(gemini_cdp._paste_image).parameters["timeout"].default == 12.0
+        assert inspect.signature(gemini_cdp._paste_image).parameters["timeout"].default == 15.0
         started=time.monotonic()
         assert not gemini_cdp._paste_image(session,source,timeout=1.1)
         elapsed=time.monotonic()-started

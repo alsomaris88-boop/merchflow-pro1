@@ -577,12 +577,13 @@ def _hint(text: str, hints: tuple[str, ...]) -> bool:
     return any(h in low for h in hints)
 
 
-def _paste_image(s: CDPSession, path: Path, timeout: float = 12.0) -> bool:
-    """Wait for a live composer, then dispatch one real reference paste.
+def _paste_image(s: CDPSession, path: Path, timeout: float = 15.0) -> bool:
+    """Stage one in-memory DataTransfer, then poll until the composer accepts paste.
 
-    Readiness polls carry only a small script; the image's Base64 payload is
-    sent once after the Angular composer is editable. Dispatch is not
-    acceptance: _attach separately requires a genuine thumbnail.
+    The original bytes are Base64-transferred to the page exactly once. The
+    polling script is small: it waits for the visible editable composer, focuses
+    it, verifies focus, and dispatches at most one ClipboardEvent. Dispatch is
+    not acceptance; _attach separately requires a genuine thumbnail.
     """
     from PIL import Image
 
@@ -591,40 +592,85 @@ def _paste_image(s: CDPSession, path: Path, timeout: float = 12.0) -> bool:
     if not mime.startswith("image/"):
         return False
 
-    deadline = time.monotonic() + max(0.0, float(timeout))
-    readiness = _js("""
-      const ed = promptEditor();
-      return !!(ed && ed.isContentEditable);
-    """)
-    while time.monotonic() < deadline:
-        remaining = deadline - time.monotonic()
-        if bool(s.evaluate(readiness, timeout=min(UPLOAD_TIMEOUT, max(1.0, remaining)))):
-            break
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return False
-        time.sleep(min(0.35, remaining))
-    else:
-        return False
-
     b64 = base64.b64encode(path.read_bytes()).decode("ascii")
-    body = r"""
+    stage = r"""
       try {
-        const ed = promptEditor(); if (!ed || !ed.isContentEditable) return false;
         const bin = atob(%s), arr = new Uint8Array(bin.length);
         for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
-        const file = new File([arr],%s,{type:%s});
-        const dt = new DataTransfer(); dt.items.add(file);
-        const pending = {editor:ed,transfer:dt,handled:false,dropDispatched:false};
-        window.__merchflowClipboard = pending;
-        ed.focus();
-        const event = new ClipboardEvent('paste',{bubbles:true,cancelable:true,clipboardData:dt});
-        ed.dispatchEvent(event);
-        pending.handled = event.defaultPrevented;
+        const file = new File([arr], %s, {type:%s});
+        const transfer = new DataTransfer(); transfer.items.add(file);
+        window.__merchflowClipboard = {
+          editor:null, transfer, handled:false, dropDispatched:false, dispatched:false
+        };
         return true;
       } catch (_) { delete window.__merchflowClipboard; return false; }
     """ % (json.dumps(b64), json.dumps(path.name), json.dumps(mime))
-    return bool(s.evaluate(_js(body), timeout=UPLOAD_TIMEOUT))
+    staged_probe = _js("return !!(window.__merchflowClipboard && window.__merchflowClipboard.transfer);")
+    try:
+        staged = bool(s.evaluate(_js(stage), timeout=UPLOAD_TIMEOUT))
+    except CDPError:
+        # The large one-time transfer may finish even if its CDP reply is lost.
+        try:
+            staged = bool(s.evaluate(staged_probe, timeout=1.0))
+        except CDPError:
+            staged = False
+    if not staged:
+        try:
+            s.evaluate(CLEAR_CLIPBOARD_JS, timeout=1.0)
+        except CDPError:
+            pass
+        return False
+
+    dispatch = _js("""
+      const pending = window.__merchflowClipboard;
+      if (!pending || !pending.transfer) return false;
+      // A timed-out CDP response may follow a completed dispatch; never paste twice.
+      if (pending.dispatched) return true;
+      const ed = promptEditor();
+      if (!ed || !ed.isConnected || !visible(ed) || !ed.isContentEditable) return false;
+      try { ed.focus({preventScroll:true}); }
+      catch (_) { try { ed.focus(); } catch (_) { return false; } }
+      const active = document.activeElement;
+      if (!ed.isContentEditable || !(active === ed || ed.contains(active) || ed.matches(':focus'))) return false;
+      pending.editor = ed;
+      pending.dispatched = true;
+      try {
+        const event = new ClipboardEvent('paste', {
+          bubbles:true, cancelable:true, clipboardData:pending.transfer
+        });
+        ed.dispatchEvent(event);
+        pending.handled = event.defaultPrevented;
+        return true;
+      } catch (_) {
+        pending.editor = null;
+        pending.dispatched = false;
+        return false;
+      }
+    """)
+    dispatched_probe = _js("return !!(window.__merchflowClipboard && window.__merchflowClipboard.dispatched);")
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    while time.monotonic() < deadline:
+        remaining = deadline - time.monotonic()
+        try:
+            dispatched = bool(s.evaluate(dispatch, timeout=min(UPLOAD_TIMEOUT, max(0.1, remaining))))
+        except CDPError:
+            # The event may have run even if its CDP response was interrupted.
+            try:
+                dispatched = bool(s.evaluate(dispatched_probe, timeout=1.0))
+            except CDPError:
+                dispatched = False
+        if dispatched:
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(0.35, remaining))
+
+    try:
+        s.evaluate(CLEAR_CLIPBOARD_JS, timeout=1.0)
+    except CDPError:
+        pass
+    return False
 
 
 # ----------------------------------------------------------- headless client
@@ -785,7 +831,7 @@ class CdpGeminiClient:
             host = urlparse(info.get("href", "")).netloc
             if host.startswith("accounts.google.") or (info.get("ready") == "complete" and info.get("signIn")):
                 raise GeminiAuthError(f"{self.label}: Google session expired — re-add this account in Account Pool")
-            if signed_in(info, session_cookies(s)):
+            if signed_in(info, session_cookies(s)) and info.get("editor") is True:
                 if info.get("account") and "@" in info["account"]:
                     self.email = info["account"]
                 s.evaluate(DISMISS_JS)

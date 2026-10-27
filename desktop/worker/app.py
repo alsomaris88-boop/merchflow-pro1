@@ -38,7 +38,7 @@ from pydantic import BaseModel, Field
 
 from . import browser, db, elite_tools, gemini_cdp, gemini_pool, image_lab, output_store, p2p_batches, trademark_shield, trends_local
 
-WORKER_VERSION = "2.5.8-native-first-halftone"
+WORKER_VERSION = "2.5.9-cdp-composer-poll"
 
 OUT_DIR = Path(os.environ.get("MERCHFLOW_OUT") or (Path(__file__).resolve().parents[2] / "output")).resolve()
 OUT_DIR.mkdir(parents=True, exist_ok=True)

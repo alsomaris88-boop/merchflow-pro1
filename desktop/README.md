@@ -26,7 +26,7 @@ This release changes both the Python worker and the Prepare Lab UI. Pull/replace
 the worker source and rebuild the static UI with `npm ci && npm run build:desktop`;
 copy the generated `out/` to the Windows package, stop its old engine/app window,
 run `run_windows.bat`, and reload. `/api/health` identifies the worker as
-**`2.5.8-native-first-halftone`** and reports the parallel/tab limits.
+**`2.5.9-cdp-composer-poll`** and reports the parallel/tab limits.
 
 `out/` is generated and git-ignored. Do not replace genuine verified Chrome
 profiles, SQLite credentials, or existing output during an update. The end user
@@ -103,12 +103,12 @@ no cookie values are exported into application JSON or frontend JavaScript.
 `desktop/worker/gemini_cdp.py` drives Gemini's normal chat input:
 
 1. Sniff each real reference's actual MIME without converting/recompressing
-   pixels, poll every 350ms for up to twelve seconds until `promptEditor()` is a
-   live `isContentEditable` composer, then read/Base64 the bytes once in memory,
-   reconstruct a `File`/`DataTransfer`, and dispatch `ClipboardEvent('paste')`
-   through `Runtime.evaluate`. No OS clipboard read/write,
-   upload menu, Images pill, file-input setter, native file chooser or visible
-   generation window is used.
+   pixels, then stage its bytes once as an in-memory `File`/`DataTransfer`. The
+   signed-in readiness gate requires a visible composer; `_paste_image()` polls
+   every 350ms for up to 15 seconds, focuses the editable `promptEditor()`,
+   verifies focus, and dispatches at most one `ClipboardEvent('paste')` through
+   `Runtime.evaluate`. No OS clipboard read/write, upload menu, Images pill,
+   file-input setter, native file chooser or visible generation window is used.
 2. **Gate 1** verifies exactly the expected new, loaded reference thumbnails in
    the composer **after each reference**, keeping niche IMAGE 1 before style
    IMAGE 2. Existing draft attachments, duplicates, avatars/history, hidden/broken

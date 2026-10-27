@@ -1,8 +1,8 @@
-# Pipeline validation — 2026-10-26
+# Pipeline validation — 2026-10-27
 
 ## Current integration: native-first archives, Prepare, and CDP
 
-Worker identity: `2.5.8-native-first-halftone`.
+Worker identity: `2.5.9-cdp-composer-poll`.
 
 - Donepixel stores the provider's original render as a lossless RGBA PNG at its
   decoded native dimensions. Generation does not upscale. History records the
@@ -31,6 +31,12 @@ Worker identity: `2.5.8-native-first-halftone`.
   Rendering concurrency remains distinct from queue size: the worker pool is
   configurable at 1–32 (default 10), per-account slots at 1–32 (default 2), and
   same-account launches are staggered by 2.5 seconds.
+- `_wait_ready` requires both verified sign-in and `SESSION_JS.editor === true`
+  (the visible composer selector) before returning. `_paste_image` stages the
+  original bytes once in an in-memory `DataTransfer`, polls the short dispatch
+  script every 350ms for up to 15 seconds, focuses and verifies the editable
+  composer, and marks dispatch idempotently so a lost CDP reply cannot paste
+  twice. Gate 1 thumbnail checks and IMAGE 1 / IMAGE 2 ordering are unchanged.
 - Chrome applies the requested background-timer, occluded-window, renderer, and
   native Win-occlusion flags to both launch modes. Manual sign-in stays visible
   at the normal desktop position; no off-screen `--window-position` flag is
@@ -42,11 +48,11 @@ Worker identity: `2.5.8-native-first-halftone`.
 
 Validation results:
 
-- **182 Python tests passed, 15 skipped** (272.21s; one Starlette/httpx
+- **185 Python tests passed, 15 skipped** (308.20s; one Starlette/httpx
   deprecation warning). `compileall` and `git diff --check` passed.
 - **27 TypeScript unit tests passed.** ESLint, typecheck, normal production
   build, and static desktop build passed.
-- **20 Chromium E2E tests passed** (3.5m), using the isolated local fixture
+- **20 Chromium E2E tests passed** (4.5m), using the isolated local fixture
   provider. Coverage includes pending/success/failure/retry, native-size disk
   archives, History→Prepare without original-image fetch, a 55-file real
   libvips/disk/SQLite/ZIP run, and 101-file dynamic ingestion. No live Gemini,
