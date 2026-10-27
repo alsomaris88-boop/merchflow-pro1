@@ -193,7 +193,7 @@ def test_cdp_profile_deletion_failure_reports_failure_and_keeps_account(linked_s
     pool, _ = linked_store
     flow = observed(pool)
     assert browser._record(flow)["ok"]
-    def refuse_delete(path):
+    def refuse_delete(path, **kwargs):
         raise PermissionError("TEST-ONLY locked profile")
     monkeypatch.setattr(gemini_pool.shutil, "rmtree", refuse_delete)
     with pytest.raises(RuntimeError, match="Could not remove"):

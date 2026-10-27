@@ -48,11 +48,11 @@ Worker identity: `2.5.9-cdp-composer-poll`.
 
 Validation results:
 
-- **185 Python tests passed, 15 skipped** (308.20s; one Starlette/httpx
+- **185 Python tests passed, 15 skipped** (326.80s; one Starlette/httpx
   deprecation warning). `compileall` and `git diff --check` passed.
 - **27 TypeScript unit tests passed.** ESLint, typecheck, normal production
   build, and static desktop build passed.
-- **20 Chromium E2E tests passed** (4.5m), using the isolated local fixture
+- **20 Chromium E2E tests passed** (4.2m), using the isolated local fixture
   provider. Coverage includes pending/success/failure/retry, native-size disk
   archives, History→Prepare without original-image fetch, a 55-file real
   libvips/disk/SQLite/ZIP run, and 101-file dynamic ingestion. No live Gemini,
