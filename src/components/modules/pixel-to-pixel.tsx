@@ -115,6 +115,6 @@ export default function PixelToPixel({ setView }: { setView: (view: ViewKey) => 
       </div>
     </div>
     <DonepixelResults jobs={generation.jobs} busy={generation.running} canRetry={bridge.connected && !bridge.mock}
-      retryErrors={generation.retryErrors} onRetry={(id, file) => void generation.retry(id, file)} setView={setView} />
+      retryErrors={generation.retryErrors} onRetry={(id, file) => void generation.retry(id, file)} onClear={generation.clear} setView={setView} />
   </div>;
 }

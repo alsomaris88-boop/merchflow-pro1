@@ -117,8 +117,20 @@ export function usePixelBatch() {
     catch (e) { setError(message(e, "Could not discard unfinished upload")); }
     finally { operation.current = false; }
   };
+  const clear = () => {
+    if (isBatchActive(latestBatch.current)) return;
+    current.current = null;
+    latestBatch.current = null;
+    setBatch(null);
+    setDrafts([]);
+    setError("");
+    setRetryErrors({});
+    try {
+      localStorage.removeItem(P2P_BATCH_KEY);
+    } catch {}
+  };
   const jobs = (drafts.length ? drafts : batch?.items ?? []).map((job) =>
     job.id === retrying ? { ...job, state: "queued", reason: "" } : job);
-  return { batch, jobs, uploading, uploadProgress, error, retryErrors, run, retry, discard,
+  return { batch, jobs, uploading, uploadProgress, error, retryErrors, run, retry, discard, clear,
     running: uploading || !!retrying || isBatchActive(batch) };
 }

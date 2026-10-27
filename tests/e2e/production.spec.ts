@@ -141,7 +141,7 @@ test("Prepare Lab exposes the three safe defaults, mode/precision choices, and o
   await expect(fourX).toBeVisible();
   await fourX.click();
   await expect(fourX).toHaveAttribute("aria-pressed", "true");
-  await expect(page.getByText(/final 18000 × 21600 px/)).toBeVisible();
+  await expect(page.getByText(/4× detail sharpening/)).toBeVisible();
 });
 
 test("provider authentication errors stay failed; there is no simulated generator output", async ({ page }) => {

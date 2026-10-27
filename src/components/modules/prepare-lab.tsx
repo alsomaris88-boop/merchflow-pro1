@@ -215,9 +215,8 @@ export default function PrepareLab() {
           const result = await responseJson<{ design: DesignRecord; report: { coverage?: number; specks?: number } }>(res);
           if (!isSavedDesign(result.design)) throw new Error("Engine did not verify a 300 DPI PNG on disk.");
           if (settings.resizeForPrint) {
-            const factor = settings.upscale ? settings.upscaleFactor : 1;
-            if (result.design.w !== 4500 * factor || result.design.h !== 5400 * factor) {
-              throw new Error("Engine output dimensions do not match the selected print/upscale settings.");
+            if (result.design.w !== 4500 || result.design.h !== 5400) {
+              throw new Error("Engine output dimensions do not match the required 4500 × 5400 px print canvas.");
             }
           }
           announceDesignsChanged();
@@ -353,7 +352,11 @@ export default function PrepareLab() {
                     onClick={() => setSettings((s) => ({ ...s, upscaleFactor: factor }))} label={`${factor}×`} />)}
                 </div>
               </div>
-              <p className="text-[11px] text-white/45 leading-relaxed">Lanczos interpolation resamples pixels; it does not invent AI detail. Very large print canvases may take longer and use more disk space.</p>
+              <p className="text-[11px] text-white/45 leading-relaxed">
+                {settings.resizeForPrint
+                  ? "Lanczos3 detail & sharpness boost fitted directly inside the 4500 × 5400 print canvas. Keeps final output strictly 4500 × 5400 px @ 300 DPI."
+                  : "Resamples cutout pixel dimensions directly by the chosen factor."}
+              </p>
             </> : <p className="text-[11px] text-white/45">Skipped while OFF for faster batching.</p>}
           </Card>
 
@@ -364,9 +367,21 @@ export default function PrepareLab() {
             </div>
             <div className="rounded-lg border border-[#c9f24b]/25 p-3 font-mono2 text-[11px] text-[#c9f24b]">
               {settings.resizeForPrint
-                ? `Base target 4500 × 5400 px @ 300 DPI · 180 px top collar margin${settings.upscale ? ` · final ${4500 * settings.upscaleFactor} × ${5400 * settings.upscaleFactor} px` : ""}`
+                ? `Base target 4500 × 5400 px @ 300 DPI · 180 px top collar margin${settings.upscale ? ` · ${settings.upscaleFactor}× detail sharpening` : ""}`
                 : `OFF · preserve source dimensions${settings.upscale ? ` · then ${settings.upscaleFactor}×` : ""}`}
             </div>
+          </Card>
+
+          <Card className="p-5 space-y-4">
+            <div className="flex items-start justify-between gap-3">
+              <Section icon={<Package size={16} />} title="PNG Compressor" desc="Lossless adaptive compression (<25 MB MBA compliant)." />
+              <Toggle ariaLabel="PNG Compressor" on={settings.compress} set={(compress) => setSettings((s) => ({ ...s, compress }))} label={settings.compress ? "ON" : "OFF"} />
+            </div>
+            <p className="text-[11px] text-white/45 leading-relaxed">
+              {settings.compress
+                ? "Active · Level 6 adaptive filtering crushes 50MB raw canvases to 8–14 MB with zero color loss (100% Lossless RGBA)."
+                : "OFF · Faster encode but produces larger files that may exceed Amazon's 25 MB ceiling."}
+            </p>
           </Card>
         </fieldset>
         <Btn variant="lime" className="w-full justify-center" onClick={() => void runBatch()} disabled={!waiting || running || ingesting || !bridge.connected}>

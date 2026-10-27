@@ -7,9 +7,9 @@ import { formatBytes, isSavedDesign, sendToPrepare } from "@/lib/designs-store";
 import type { PixelJob } from "@/lib/p2p-client";
 import type { ViewKey } from "@/components/shell";
 
-export function DonepixelResults({ jobs, busy, canRetry, retryErrors, onRetry, setView }: {
+export function DonepixelResults({ jobs, busy, canRetry, retryErrors, onRetry, onClear, setView }: {
   jobs: PixelJob[]; busy: boolean; canRetry: boolean; retryErrors: Record<string, string>;
-  onRetry: (id: string, file?: File) => void; setView: (view: ViewKey) => void;
+  onRetry: (id: string, file?: File) => void; onClear?: () => void; setView: (view: ViewKey) => void;
 }) {
   const replacement = useRef<HTMLInputElement>(null);
   const retryTarget = useRef<string | null>(null);
@@ -18,7 +18,14 @@ export function DonepixelResults({ jobs, busy, canRetry, retryErrors, onRetry, s
     <div className="flex items-center justify-between gap-3 mb-4">
       <div><h2 id="p2p-results-title" className="font-display font-bold text-xl flex items-center gap-2"><Sparkles size={19} className="text-[#c9f24b]" />Live results</h2>
         <p className="mt-1 text-xs text-white/45">Real artwork appears only after the PNG and Designs History commit. Failed designs keep their exact engine error.</p></div>
-      <Chip tone="violet">{jobs.length} {jobs.length === 1 ? "design" : "designs"}</Chip>
+      <div className="flex items-center gap-2">
+        <Chip tone="violet">{jobs.length} {jobs.length === 1 ? "design" : "designs"}</Chip>
+        {onClear && !busy && (
+          <Btn variant="ghost" className="text-xs px-2.5 py-1 text-white/60 hover:text-white" onClick={onClear}>
+            Clear results
+          </Btn>
+        )}
+      </div>
     </div>
     <input ref={replacement} id="p2p-retry-file" aria-label="Original image for failed design retry" type="file" accept="image/*" className="hidden"
       onChange={(event) => {

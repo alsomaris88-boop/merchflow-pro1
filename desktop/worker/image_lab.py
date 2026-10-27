@@ -456,12 +456,17 @@ def _prepare(raw: bytes, settings: dict, out_dir: Path, name: str, metadata: dic
                       .resize(dw / source.width, vscale=dh / source.height, kernel="lanczos3")
                       .unpremultiply().cast("uchar"))
         if resize_for_print:
+            if upscale_factor > 1:
+                try:
+                    source = source.sharpen(sigma=0.5, x1=1.5, y2=8.0, y3=16.0, m1=0.5, m2=1.5)
+                except Exception:
+                    pass
             final = source.embed(x, y, base_w, base_h, extend="background", background=[0, 0, 0, 0])
         else:
             final = source
-        if upscale_factor > 1:
-            final = (final.premultiply().resize(upscale_factor, kernel="lanczos3")
-                     .unpremultiply().cast("uchar"))
+            if upscale_factor > 1:
+                final = (final.premultiply().resize(upscale_factor, kernel="lanczos3")
+                         .unpremultiply().cast("uchar"))
         try:
             if not remove:
                 coverage = _vips_coverage(final)
@@ -490,13 +495,19 @@ def _prepare(raw: bytes, settings: dict, out_dir: Path, name: str, metadata: dic
     else:
         placed = vips_resize(image, dw, dh)
         if resize_for_print:
+            if upscale_factor > 1:
+                try:
+                    from PIL import ImageFilter
+                    placed = placed.filter(ImageFilter.UnsharpMask(radius=1.5, percent=120, threshold=2))
+                except Exception:
+                    pass
             final = Image.new("RGBA", (base_w, base_h))
             final.alpha_composite(placed, (x, y))
         else:
             final = placed
+            if upscale_factor > 1:
+                final = vips_resize(final, final.width * upscale_factor, final.height * upscale_factor)
         del image, placed
-        if upscale_factor > 1:
-            final = vips_resize(final, final.width * upscale_factor, final.height * upscale_factor)
         if settings.get("halftone"):
             final = _halftone(final, int(settings.get("lpi", 48)), settings.get("ink", "#E8E2D2"), final.width, final.height)
         if not remove:
