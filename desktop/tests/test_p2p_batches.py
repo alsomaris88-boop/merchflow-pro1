@@ -7,6 +7,8 @@ import io
 import json
 import os
 from pathlib import Path
+import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -23,6 +25,18 @@ from desktop.worker import gemini_pool, image_lab, output_store, p2p_batches
 def test_slot_default_is_two_and_environment_override_is_bounded():
     expected = max(1, min(32, int(os.environ.get("MERCHFLOW_GEMINI_SLOTS_PER_ACCOUNT", "2"))))
     assert gemini_pool.SLOTS_PER_ACCOUNT == expected
+
+
+def test_jitter_defaults_to_three_to_six_seconds_without_overrides():
+    env = os.environ.copy()
+    env.pop("MERCHFLOW_JITTER_MIN", None)
+    env.pop("MERCHFLOW_JITTER_MAX", None)
+    result = subprocess.run(
+        [sys.executable, "-c", "from desktop.worker.gemini_pool import JITTER; print(','.join(map(str, JITTER)))"],
+        cwd=Path(__file__).resolve().parents[2], env=env,
+        capture_output=True, text=True, check=True,
+    )
+    assert result.stdout.strip() == "3.0,6.0"
 
 
 def reference_png():

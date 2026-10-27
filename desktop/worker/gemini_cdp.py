@@ -414,7 +414,8 @@ SESSION_JS = _js("""
     const v = el.getAttribute('aria-label') || el.getAttribute('alt') || '';
     if (/google account|compte google/i.test(v)) { const m = v.match(rx); if (m) { account = m[0]; break; } account = account || 'signed-in'; }
   }
-  return { href: location.href, ready: document.readyState, editor: !!promptEditor(), signIn, account };
+  const editor = promptEditor();
+  return { href: location.href, ready: document.readyState, editor: !!(editor && editor.isConnected), signIn, account };
 """)
 
 DISMISS_JS = _js("""
@@ -577,7 +578,7 @@ def _hint(text: str, hints: tuple[str, ...]) -> bool:
     return any(h in low for h in hints)
 
 
-def _paste_image(s: CDPSession, path: Path, timeout: float = 15.0) -> bool:
+def _paste_image(s: CDPSession, path: Path, timeout: float = 12.0) -> bool:
     """Stage one in-memory DataTransfer, then poll until the composer accepts paste.
 
     The original bytes are Base64-transferred to the page exactly once. The

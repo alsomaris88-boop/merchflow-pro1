@@ -30,11 +30,13 @@ Worker identity: `2.5.9-cdp-composer-poll`.
 - The P2P input queue has no fixed item-count cap; tests exercise 101 inputs.
   Rendering concurrency remains distinct from queue size: the worker pool is
   configurable at 1–32 (default 10), per-account slots at 1–32 (default 2), and
-  same-account launches are staggered by 2.5 seconds.
-- `_wait_ready` requires both verified sign-in and `SESSION_JS.editor === true`
-  (the visible composer selector) before returning. `_paste_image` stages the
+  same-account tab launches are staggered by 2.5 seconds. The legacy serial
+  scheduler keeps randomized `MERCHFLOW_JITTER_MIN/MAX` pacing (default 3.0–6.0s);
+  parallel Donepixel work bypasses this serial jitter wait.
+- `_wait_ready` requires verified sign-in plus a connected, visible composer
+  (`SESSION_JS.editor === true`) before returning. `_paste_image` stages the
   original bytes once in an in-memory `DataTransfer`, polls the short dispatch
-  script every 350ms for up to 15 seconds, focuses and verifies the editable
+  script every 350ms for up to 12 seconds, focuses and verifies the editable
   composer, and marks dispatch idempotently so a lost CDP reply cannot paste
   twice. Gate 1 thumbnail checks and IMAGE 1 / IMAGE 2 ordering are unchanged.
 - Chrome applies the requested background-timer, occluded-window, renderer, and
@@ -48,11 +50,11 @@ Worker identity: `2.5.9-cdp-composer-poll`.
 
 Validation results:
 
-- **185 Python tests passed, 15 skipped** (326.80s; one Starlette/httpx
+- **188 Python tests passed, 15 skipped** (316.53s; one Starlette/httpx
   deprecation warning). `compileall` and `git diff --check` passed.
 - **27 TypeScript unit tests passed.** ESLint, typecheck, normal production
   build, and static desktop build passed.
-- **20 Chromium E2E tests passed** (4.2m), using the isolated local fixture
+- **20 Chromium E2E tests passed** (3.4m), using the isolated local fixture
   provider. Coverage includes pending/success/failure/retry, native-size disk
   archives, History→Prepare without original-image fetch, a 55-file real
   libvips/disk/SQLite/ZIP run, and 101-file dynamic ingestion. No live Gemini,

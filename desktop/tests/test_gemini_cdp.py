@@ -696,6 +696,32 @@ def test_existing_real_draft_attachment_is_rejected_before_new_paste_or_send(liv
 
 
 
+def test_wait_ready_polls_until_composer_is_mounted_in_dom(live):
+    _, pool, _ = live
+    client = signed_in_profile(pool)
+    port = client._ensure_browser()
+    target, session = client._open_tab(port)
+    try:
+        client._wait_ready(session)
+        detached = session.evaluate(gemini_cdp._js("""
+          const ed = promptEditor();
+          if (!ed || !ed.parentNode) return false;
+          const parent = ed.parentNode, next = ed.nextSibling;
+          ed.remove();
+          setTimeout(() => parent.insertBefore(ed, next && next.parentNode === parent ? next : null), 700);
+          return true;
+        """))
+        assert detached
+        assert session.evaluate(gemini_cdp.SESSION_JS)["editor"] is False
+        started = time.monotonic()
+        ready = client._wait_ready(session)
+        assert ready["editor"] is True
+        assert time.monotonic() - started >= 0.65
+    finally:
+        session.close()
+        gemini_cdp.close_page(port, target["id"])
+
+
 def test_wait_ready_polls_until_the_composer_is_visible(live):
     _, pool, _ = live
     client = signed_in_profile(pool)
@@ -763,7 +789,7 @@ def test_silent_paste_gives_up_after_timeout_when_composer_stays_unavailable(liv
           return true;
         """))
         assert disabled
-        assert inspect.signature(gemini_cdp._paste_image).parameters["timeout"].default == 15.0
+        assert inspect.signature(gemini_cdp._paste_image).parameters["timeout"].default == 12.0
         started=time.monotonic()
         assert not gemini_cdp._paste_image(session,source,timeout=1.1)
         elapsed=time.monotonic()-started

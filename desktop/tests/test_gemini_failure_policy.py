@@ -58,6 +58,26 @@ def run_path(path,original,out):
     return failed[0]["reason"],events
 
 
+def test_parallel_donepixel_bypasses_serial_jitter(policy_pool, monkeypatch):
+    pool, settings, _, original, out = policy_pool
+    settings["empty"] = True  # fixture-only failure; never fabricate a successful render
+    acquire = pool.acquire
+    parallel_modes = []
+    jitter_calls = []
+
+    def tracked_acquire(*args, **kwargs):
+        parallel_modes.append(kwargs.get("parallel"))
+        return acquire(*args, **kwargs)
+
+    monkeypatch.setattr(pool, "acquire", tracked_acquire)
+    monkeypatch.setattr(pool, "_wait_jitter", lambda account: jitter_calls.append(account.id))
+    reason, _ = run_path("donepixel", original, out)
+
+    assert reason == "Provider returned no image"
+    assert parallel_modes == [True]
+    assert jitter_calls == []
+
+
 @pytest.mark.parametrize("path",["donepixel","fusion"])
 @pytest.mark.parametrize("error",[
     GeminiAutomationError("GATE 1 FAILED: no real reference thumbnail"),

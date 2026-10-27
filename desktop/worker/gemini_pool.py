@@ -30,8 +30,8 @@ WINDOW_SECONDS = int(os.environ.get("MERCHFLOW_WINDOW_SECONDS", 5 * 3600))
 WINDOW_CAP = int(os.environ.get("MERCHFLOW_WINDOW_CAP", 60))  # local budget; actual provider limits still apply
 MINI_COOLDOWN_SECONDS = int(os.environ.get("MERCHFLOW_MINI_COOLDOWN", 90))
 JITTER = (
-    float(os.environ.get("MERCHFLOW_JITTER_MIN", 65)),
-    float(os.environ.get("MERCHFLOW_JITTER_MAX", 85)),
+    float(os.environ.get("MERCHFLOW_JITTER_MIN", "3.0")),
+    float(os.environ.get("MERCHFLOW_JITTER_MAX", "6.0")),
 )
 
 # ---------------------------------------------------------------------------
@@ -549,8 +549,8 @@ class AccountPool:
             self.save()
 
     def _wait_jitter(self, a: AccountState) -> None:
-        # All slots acquired in the same concurrent wave share one wait; do not
-        # accidentally serialize multi-tab work with one 65–85s delay per job.
+        # Serial callers share one configured deadline; parallel Donepixel work
+        # bypasses this delay to pick up queued designs immediately.
         with self.condition:
             deadline = self._jitter_deadlines.get(a.id)
         if deadline is None:  # supports standalone callers outside acquire()
@@ -765,7 +765,7 @@ def render_donepixel(reference: bytes, colour: str, dispatch: Callable[[str], No
             account = POOL.acquire(parallel=True, require_pro=True, exclude=tried)
             tried.add(account.id)
             dispatch(account.label)
-            POOL._wait_jitter(account)
+            # Parallel Donepixel leases bypass the legacy serial jitter wait.
             client = client_for(account.id)
             if client is None:
                 raise GeminiAuthError("Provider session expired; reconnect in Account Pool")

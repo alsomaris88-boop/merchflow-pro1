@@ -104,10 +104,11 @@ no cookie values are exported into application JSON or frontend JavaScript.
 
 1. Sniff each real reference's actual MIME without converting/recompressing
    pixels, then stage its bytes once as an in-memory `File`/`DataTransfer`. The
-   signed-in readiness gate requires a visible composer; `_paste_image()` polls
-   every 350ms for up to 15 seconds, focuses the editable `promptEditor()`,
-   verifies focus, and dispatches at most one `ClipboardEvent('paste')` through
-   `Runtime.evaluate`. No OS clipboard read/write, upload menu, Images pill,
+   signed-in readiness gate requires a composer mounted and visible in the DOM.
+   `_paste_image()` polls every 350ms for up to 12 seconds, focuses the editable
+   `promptEditor()`, verifies focus, and dispatches at most one
+   `ClipboardEvent('paste')` using `Runtime.evaluate`. No OS clipboard
+   read/write, upload menu, Images pill,
    file-input setter, native file chooser or visible generation window is used.
 2. **Gate 1** verifies exactly the expected new, loaded reference thumbnails in
    the composer **after each reference**, keeping niche IMAGE 1 before style
@@ -292,9 +293,10 @@ folder is global, so only the final full-size *download/extraction* stage uses a
 per-account lock to prevent two tabs from saving/returning each other's PNG.
 Gemini's HTTP client similarly snapshots token/request IDs under a small state
 lock while the upload and image RPC network requests remain independent.
-The legacy sequential scheduler retains its randomized account jitter; dynamic
-parallel P2P bursts bypass that 65–85-second per-account delay, while same-account
-tab launches retain the 2.5-second stagger. Flash model-degradation failures
+The legacy sequential scheduler retains configurable randomized account jitter
+(default 3–6 seconds via `MERCHFLOW_JITTER_MIN/MAX`). Parallel Donepixel batches
+bypass that serial wait, while same-account tab launches retain the 2.5-second
+stagger. Flash model-degradation failures
 remain real quota signals; no provider quota bypass or throughput guarantee is
 claimed. Up to ten provider calls across sufficiently many accounts can still
 increase local CPU/network use and may expose provider-side rate limits; operators
